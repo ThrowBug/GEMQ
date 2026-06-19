@@ -69,4 +69,12 @@ Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the
 This repository builds upon several excellent open-source projects, including [MC-MoE](https://github.com/Aaronhuang-778/Mixture-Compressor-MoE), [GPTQ](https://github.com/IST-DASLab/gptq), [HQQ](https://github.com/dropbox/hqq), [GemLite](https://github.com/dropbox/gemlite), and [gpt-fast](https://github.com/meta-pytorch/gpt-fast). We sincerely thank the authors and contributors for making their code publicly available.
 
 ## Citation
-If you find GEMQ useful for your research or project, please consider citing our paper.
+If you find GEMQ useful for your research or project, please consider citing:
+```bibtex
+@article{deng2026gemq,
+  title={GEMQ: Global Expert-Level Mixed-Precision Quantization for MoE LLMs},
+  author={Deng, Jianing and Wang, Song and Wang, Dongwei and Liu, Zijie and Chen, Tianlong and Yang, Huanrui and Hu, Jingtong},
+  journal={arXiv preprint arXiv:2605.23078},
+  year={2026}
+}
+```
