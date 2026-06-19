@@ -499,10 +499,6 @@ def parse_args():
         help="Path to save the model statistics computed in `mcmoe_stats` mode"
     )
     parser.add_argument(
-        "--fast_layer_re", action="store_true",
-        help="Whether to use the faster implementation for computing layer reconstruction errors"
-    )
-    parser.add_argument(
         "--layer_grads_path",  type=str, default="",
         help="Path to the layer activation gradients"
     )
