@@ -32,7 +32,8 @@ pip install -e .
 
 ## Usage
 
-> All scripts for Mixtral-8×7B and DeepSeek-V2-Lite are provided in `scripts`.
+> We provide full scripts for the **Mixtral-8×7B** and **DeepSeek-V2-Lite** models in `scripts`, along with allocation and fake-quantization scripts for **OLMoE-1B-7B-0924** and **Qwen3-30B-A3B**.
+
 
 ### 1. Bit Allocation
 
