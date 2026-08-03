@@ -20,9 +20,9 @@ GEMQ is a post-training quantization framework for Mixture-of-Experts (MoE) LLMs
 
 ## Updates
 
-**2026-08** — Verified that real quantization matches fake quantization end to end (0.06% perplexity gap on DeepSeek-V2-Lite); see `tests/` and `scripts/test_real_quant.sh`.
-
-**2026-08** — Fixed a ~15% perplexity regression on DeepSeek-V2 caused by a missing YaRN `mscale` in HF's built-in implementation ([transformers#47435](https://github.com/huggingface/transformers/pull/47435)); see `gemq/utils/hf_loading.py`.
+- [2026/08] Real quantized inference now covers **OLMoE-1B-7B-0924** and **Qwen3-30B-A3B**, alongside Mixtral-8x7B and DeepSeek-V2-Lite. Run it with `scripts/bench_generate_<model>.sh`.
+- [2026/08] Real quantization is verified to match fake quantization end to end (0.06% perplexity gap on DeepSeek-V2-Lite and 0.03% on OLMoE-1B-7B-0924).
+- [2026/08] Fixed a ~15% perplexity regression on DeepSeek-V2 caused by a missing YaRN `mscale` in HF's built-in implementation ([transformers#47435](https://github.com/huggingface/transformers/pull/47435)).
 
 
 ## Installation
@@ -43,7 +43,7 @@ pip install -e .
 
 ## Usage
 
-> We provide full scripts for the **Mixtral-8×7B** and **DeepSeek-V2-Lite** models in `scripts`, along with allocation and fake-quantization scripts for **OLMoE-1B-7B-0924** and **Qwen3-30B-A3B**.
+> `scripts` provides the full pipeline -- bit allocation, quantization and real quantized inference -- for **Mixtral-8×7B**, **DeepSeek-V2-Lite**, **OLMoE-1B-7B-0924** and **Qwen3-30B-A3B**.
 
 
 ### 1. Bit Allocation
@@ -74,7 +74,11 @@ Quantized models will be saved under `results`.
 
 ### 3. Inference
 
-Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the real quantized models.
+Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the real quantized models. Set `bpe` and `finetune_routers` there to match the quantization run, since the checkpoint path is derived from them.
+
+> [!NOTE]
+>
+> Decoding is fully fused; prefill still loops over hit experts in Python, so its throughput is dominated by kernel launch overhead and scales with depth and expert count rather than with prompt length.
 
 
 ## Acknowledgements

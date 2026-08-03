@@ -89,6 +89,39 @@ def _assert_finite_parameters(module, label):
         )
 
 
+def _olmoe_config():
+    from transformers.models.olmoe.configuration_olmoe import OlmoeConfig
+
+    return OlmoeConfig(
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=MOE_INTERMEDIATE,
+        num_experts=NUM_EXPERTS,
+        num_experts_per_tok=TOP_K,
+        norm_topk_prob=False,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=128,
+    )
+
+
+def _qwen3moe_config():
+    from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+
+    return Qwen3MoeConfig(
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=MOE_INTERMEDIATE,
+        moe_intermediate_size=MOE_INTERMEDIATE,
+        num_experts=NUM_EXPERTS,
+        num_experts_per_tok=TOP_K,
+        norm_topk_prob=True,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=128,
+    )
+
+
 def _quantize_linear_in_place(hf_module, ref_module, attr, nbits, device):
     """
     Quantize `hf_module.<attr>`, write the dequantized fp16 weight into the
@@ -159,6 +192,47 @@ def build_mixtral_blocks(device):
     replace_linear_recursive(hf_block)
     quant_block = QuantFusedMixtralMoEBlock.from_hf(config, hf_block)
     return quant_block, ref_block, config
+
+
+def _build_gated_expert_blocks(device, config, hf_cls, quant_cls):
+    """
+    Shared by OLMoE and Qwen3-MoE: both are Mixtral-shaped blocks whose sub-linears are
+    named gate_proj/up_proj/down_proj.
+    """
+    from gemq.inference.patch import replace_linear_recursive
+
+    torch.manual_seed(0)
+    hf_block = hf_cls(config).to(device).half().eval()
+    _assert_finite_parameters(hf_block, f"{hf_cls.__name__} reference block")
+    ref_block = copy.deepcopy(hf_block)
+
+    for e, expert in enumerate(hf_block.experts):
+        for attr in ("gate_proj", "up_proj", "down_proj"):
+            _quantize_linear_in_place(expert, ref_block.experts[e], attr, EXPERT_BITS[e], device)
+
+    replace_linear_recursive(hf_block)
+    quant_block = quant_cls.from_hf(config, hf_block)
+    return quant_block, ref_block, config
+
+
+def build_olmoe_blocks(device):
+    """Returns (quant_fused_block, reference_block_with_dequantized_weights, config)."""
+    from transformers.models.olmoe.modeling_olmoe import OlmoeSparseMoeBlock
+    from gemq.inference.moe_block import QuantFusedOlmoeMoEBlock
+
+    return _build_gated_expert_blocks(
+        device, _olmoe_config(), OlmoeSparseMoeBlock, QuantFusedOlmoeMoEBlock
+    )
+
+
+def build_qwen3moe_blocks(device):
+    """Returns (quant_fused_block, reference_block_with_dequantized_weights, config)."""
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+    from gemq.inference.moe_block import QuantFusedQwen3MoeMoEBlock
+
+    return _build_gated_expert_blocks(
+        device, _qwen3moe_config(), Qwen3MoeSparseMoeBlock, QuantFusedQwen3MoeMoEBlock
+    )
 
 
 def _as_tensor(out):
@@ -241,8 +315,11 @@ def test_deepseek_gate_guard_matches_reference_semantics(
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("builder", [build_deepseek_blocks, build_mixtral_blocks],
-                         ids=["deepseek", "mixtral"])
+@pytest.mark.parametrize(
+    "builder",
+    [build_deepseek_blocks, build_mixtral_blocks, build_olmoe_blocks, build_qwen3moe_blocks],
+    ids=["deepseek", "mixtral", "olmoe", "qwen3moe"],
+)
 def test_one_token_path_bitwidth_invariant(device, builder):
     """
     forward_one_token passes only w1's nbits/strides and reuses them for w3, which
@@ -257,8 +334,11 @@ def test_one_token_path_bitwidth_invariant(device, builder):
 
 # --------------------------------------------------------------------------- equivalence
 @pytest.mark.cuda
-@pytest.mark.parametrize("builder", [build_deepseek_blocks, build_mixtral_blocks],
-                         ids=["deepseek", "mixtral"])
+@pytest.mark.parametrize(
+    "builder",
+    [build_deepseek_blocks, build_mixtral_blocks, build_olmoe_blocks, build_qwen3moe_blocks],
+    ids=["deepseek", "mixtral", "olmoe", "qwen3moe"],
+)
 def test_prefill_path_matches_reference(device, builder):
     """forward_n_tokens (group-GEMM kernels) -- the path a perplexity run exercises."""
     quant_block, ref_block, _ = builder(device)
@@ -279,8 +359,11 @@ def test_prefill_path_matches_reference(device, builder):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("builder", [build_deepseek_blocks, build_mixtral_blocks],
-                         ids=["deepseek", "mixtral"])
+@pytest.mark.parametrize(
+    "builder",
+    [build_deepseek_blocks, build_mixtral_blocks, build_olmoe_blocks, build_qwen3moe_blocks],
+    ids=["deepseek", "mixtral", "olmoe", "qwen3moe"],
+)
 def test_decode_path_matches_reference(device, builder):
     """
     forward_one_token (fused bmm / splitk gemv kernels) -- the path benchmark_generate
@@ -304,8 +387,11 @@ def test_decode_path_matches_reference(device, builder):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("builder", [build_deepseek_blocks, build_mixtral_blocks],
-                         ids=["deepseek", "mixtral"])
+@pytest.mark.parametrize(
+    "builder",
+    [build_deepseek_blocks, build_mixtral_blocks, build_olmoe_blocks, build_qwen3moe_blocks],
+    ids=["deepseek", "mixtral", "olmoe", "qwen3moe"],
+)
 def test_decode_path_agrees_with_prefill_path(device, builder):
     """
     Feeding the same single token through both dispatch branches must give the same

@@ -22,7 +22,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from test_moe_block_equiv import build_deepseek_blocks, build_mixtral_blocks, HIDDEN_SIZE
+from test_moe_block_equiv import (
+    build_deepseek_blocks, build_mixtral_blocks, build_olmoe_blocks,
+    build_qwen3moe_blocks, HIDDEN_SIZE,
+)
 
 
 REPEATS = 5
@@ -48,8 +51,11 @@ def nan_report(name, tensor):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("builder", [build_deepseek_blocks, build_mixtral_blocks],
-                         ids=["deepseek", "mixtral"])
+@pytest.mark.parametrize(
+    "builder",
+    [build_deepseek_blocks, build_mixtral_blocks, build_olmoe_blocks, build_qwen3moe_blocks],
+    ids=["deepseek", "mixtral", "olmoe", "qwen3moe"],
+)
 def test_decode_output_is_deterministic(device, builder):
     """
     Same block, same input, repeated. A kernel that reads uninitialized memory gives
@@ -81,8 +87,11 @@ def test_decode_output_is_deterministic(device, builder):
     # DeepSeek is expected to be non-bit-identical: its shared experts go through the
     # split-K GEMV, whose atomic accumulation order varies. Mixtral has no shared
     # experts and must be exactly reproducible.
-    if builder is build_mixtral_blocks:
-        assert identical, "Mixtral decode should be bit-reproducible; it touches no split-K kernel"
+    if builder is not build_deepseek_blocks:
+        assert identical, (
+            f"{builder.__name__} decode should be bit-reproducible; only DeepSeek's shared "
+            f"experts touch the split-K kernel"
+        )
     assert spread <= 1e-2, (
         f"decode output varies by {spread:.3e} between identical calls -- larger than "
         f"accumulation-order rounding explains"

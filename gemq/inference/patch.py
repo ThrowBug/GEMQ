@@ -7,10 +7,14 @@ from hqq.core.quantize import HQQLinear
 import gemlite
 from gemlite.core import GemLiteLinearTriton, TORCH_TO_DTYPE
 
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+
 from gemq.utils.model_utils import NAME_TO_MODEL, ModelType, get_blocks
 from gemq.inference.moe_block import(
     FusedMixtralMoEBlock, QuantFusedMixtralMoEBlock,
-    FusedDeepseekV2MoEBlock, QuantFusedDeepseekV2MoEBlock
+    FusedDeepseekV2MoEBlock, QuantFusedDeepseekV2MoEBlock,
+    FusedOlmoeMoEBlock, QuantFusedOlmoeMoEBlock,
+    FusedQwen3MoeMoEBlock, QuantFusedQwen3MoeMoEBlock,
 )
 
 # monkey-patch to support 3-bit quantization
@@ -104,7 +108,33 @@ def replace_moe_blocks(model, model_name, config, is_fp=False):
             layer.mlp = FusedDeepseekV2MoEBlock.from_hf(config, org_block)
         else:
             layer.mlp = QuantFusedDeepseekV2MoEBlock.from_hf(config, org_block)
-        
+
+        if del_orig:
+            del org_block
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def _replace_olmoe(layer, del_orig=True):
+        org_block = layer.mlp
+
+        if is_fp:
+            layer.mlp = FusedOlmoeMoEBlock.from_hf(config, org_block)
+        else:
+            layer.mlp = QuantFusedOlmoeMoEBlock.from_hf(config, org_block)
+
+        if del_orig:
+            del org_block
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def _replace_qwen3moe(layer, del_orig=True):
+        org_block = layer.mlp
+
+        if is_fp:
+            layer.mlp = FusedQwen3MoeMoEBlock.from_hf(config, org_block)
+        else:
+            layer.mlp = QuantFusedQwen3MoeMoEBlock.from_hf(config, org_block)
+
         if del_orig:
             del org_block
             gc.collect()
@@ -121,6 +151,13 @@ def replace_moe_blocks(model, model_name, config, is_fp=False):
         elif model_type == ModelType.DEEPSEEKV2:
             if i > 0: # NOTE: the first layer of this model is a dense layer instead of MoE
                 _replace_deepseekv2(layer, del_orig=True)
+        elif model_type == ModelType.OLMOE:
+            _replace_olmoe(layer, del_orig=True)
+        elif model_type == ModelType.QWEN3MOE:
+            # NOTE: `mlp_only_layers` / `decoder_sparse_step` can make individual layers
+            # dense, so check the block type rather than assuming every layer is MoE
+            if isinstance(layer.mlp, Qwen3MoeSparseMoeBlock):
+                _replace_qwen3moe(layer, del_orig=True)
         else:
             raise NotImplementedError
 

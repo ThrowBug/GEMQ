@@ -39,8 +39,8 @@ downstream_tasks="piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande,mathqa,
 # ===============================
 #  I/O settings
 # ===============================
-real_quant=false           # whether to pack + save INT weights (set false for pseudo quantization)
-save_model=false           # whether to save the quantized model
+real_quant=true           # whether to pack + save INT weights (set false for pseudo quantization)
+save_model=true           # whether to save the quantized model
 
 
 
@@ -67,7 +67,7 @@ fi
 
 rft_tag=""
 if [[ "${finetune_routers}" == "true" ]]; then
-    rft_tag="-RFT"
+    rft_tag="_RFT"
     quant_args+=(--finetune_routers --rft_epochs "$rft_epochs" --rft_lr "$rft_lr")
 fi
 
@@ -78,7 +78,7 @@ fi
 
 fname="${bit_cfg##*/}"
 alloc_prefix="${fname%%_*}"
-prefix="${alloc_prefix}_WT2"
+prefix="${alloc_prefix}-WT2"
 if [[ "${save_model}" == "true" ]]; then
     if [[ "${real_quant}" == "true" ]]; then
         save_path="results/real_quant_models/${model_name}/${qtype}/${prefix}_A4-G16-D4-E${bpe}${rft_tag}"

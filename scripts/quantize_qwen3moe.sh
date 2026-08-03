@@ -27,7 +27,7 @@ bit_cfg="configs/${model_name}/GEMQ/C4-Seed0_E${bpe}_B1,2,3_c2c3.pkl"
 # ===============================
 # NOTE: Router fine-tuning for Mixtral-8x7B requires 3×80GB GPUs.
 # Set this option to false if you do not have sufficient resources.
-finetune_routers=true      # whether to finetune the routers after quantization
+finetune_routers=false      # whether to finetune the routers after quantization
 rft_epochs=1
 rft_lr=1e-4
 
@@ -41,8 +41,8 @@ downstream_tasks="piqa,arc_easy,arc_challenge,hellaswag,winogrande,mathqa,mmlu"
 # ===============================
 #  I/O settings
 # ===============================
-real_quant=false            # whether to pack + save INT weights (set false for pseudo quantization)
-save_model=false            # whether to save the quantized model
+real_quant=true            # whether to pack + save INT weights (set false for pseudo quantization)
+save_model=true            # whether to save the quantized model
 
 
 

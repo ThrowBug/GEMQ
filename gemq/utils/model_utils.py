@@ -72,6 +72,7 @@ def dispatch_model_to_all_devices(model):
             "Qwen3DecoderLayer",
             "MixtralDecoderLayer",
             "DeepseekV2DecoderLayer",
+            "OlmoeDecoderLayer",
             "Qwen3MoeDecoderLayer",
         ],
         max_memory=get_balanced_memory(model),

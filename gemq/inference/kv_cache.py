@@ -2,9 +2,10 @@ from typing import Any, Optional
 
 import torch
 from transformers.cache_utils import (
-    StaticLayer, CacheLayerMixin, Cache, PretrainedConfig, StaticSlidingWindowLayer, 
+    StaticLayer, CacheLayerMixin, Cache, PretrainedConfig, StaticSlidingWindowLayer,
     is_torchdynamo_compiling
 )
+from transformers.cache_utils import StaticCache as HFStaticCache
 
 
 class StaticLayer(CacheLayerMixin):
@@ -76,7 +77,19 @@ class StaticLayer(CacheLayerMixin):
         return self.max_cache_len
 
 
-class StaticCache(Cache):
+class StaticCache(HFStaticCache):
+    """
+    NOTE: subclasses transformers' StaticCache purely so `isinstance(cache, StaticCache)`
+    holds. Models still on the legacy `_update_causal_mask` (OLMoE, unlike Mixtral /
+    DeepSeek-V2 / Qwen3-MoE which use `create_causal_mask`) branch on that check; when it
+    fails they derive the mask length from `get_seq_length()`, which is a tensor here, and
+    `torch.full` on a tensor size breaks torch.compile with fullgraph=True. Taking the
+    static-cache branch instead uses `get_max_cache_shape()`, a plain int.
+
+    HF's StaticCache only defines __init__, so inheriting changes nothing else; __init__
+    below deliberately calls Cache.__init__ rather than super() to skip its signature.
+    """
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -111,7 +124,7 @@ class StaticCache(Cache):
                 layer = StaticLayer(max_cache_len=max_cache_len)
             layers.append(layer)
 
-        super().__init__(layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
+        Cache.__init__(self, layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
 
     # NOTE: follows the transformers >= 4.5x convention (Cache layers + `cache_position`).
     # DeepSeek-V2's official modeling_deepseek.py predates it, so it cannot drive this
