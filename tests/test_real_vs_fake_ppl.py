@@ -50,7 +50,13 @@ def _load_real(model_path, trust_remote_code=True, device="cuda", compute_dtype=
 
 
 def _hqq_to_dense(module):
-    """Recursively swap every HQQLinear for an fp16 nn.Linear holding its dequantized weight."""
+    """
+    Recursively swap every HQQLinear for an fp16 nn.Linear holding its dequantized weight.
+
+    NOTE: the twin is the full unquantized size (~31 GB for DeepSeek-V2-Lite, ~93 GB for
+    Mixtral-8x7B). Models that do not fit on one card need CPU staging plus
+    dispatch_model_to_all_devices; not implemented.
+    """
     from hqq.core.quantize import HQQLinear
 
     for name, child in module.named_children():
@@ -110,12 +116,18 @@ def ppl_table(model_path, model_name, seqlen, nseq, trust_remote_code, mscale_fi
     # 1) fake twin: dequantize everything back to fp16
     model = _load_real(model_path, trust_remote_code, mscale_fix=mscale_fix)
     print(f"\n[modeling] implementation: {describe_model_impl(model)}")
+    ships_remote_code = bool(getattr(model.config, "auto_map", None))
+
     if not uses_remote_code(model):
         from gemq.utils.hf_loading import deepseek_mscale_correction
         factor = deepseek_mscale_correction(model.config)
-        state = "applied" if mscale_fix else "skipped"
-        print(f"[modeling] YaRN mscale^2 = {factor:.4f} ({state})")
-    if trust_remote_code and not uses_remote_code(model):
+        if factor != 1.0:
+            state = "applied" if mscale_fix else "skipped"
+            print(f"[modeling] YaRN mscale^2 = {factor:.4f} ({state})")
+
+    # only meaningful for checkpoints that actually ship their own modeling code;
+    # Mixtral is natively supported and has no auto_map
+    if ships_remote_code and trust_remote_code and not uses_remote_code(model):
         pytest.fail(
             f"asked for the checkpoint's own modeling code but got "
             f"{describe_model_impl(model)}. These numbers would not correspond to the "
