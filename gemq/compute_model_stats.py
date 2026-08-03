@@ -17,6 +17,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, logging
 from gemq.utils.data_utils import get_calib_loader
 from gemq.utils.model_utils import *
 from gemq.quantizers.rtn import MCMoeRTNWeightQuantizer
+from gemq.utils.hf_loading import align_deepseek_softmax_scale
 
 logging.set_verbosity_error()
 
@@ -519,8 +520,14 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=args.use_fast)
     model = AutoModelForCausalLM.from_pretrained(
         args.model, device_map=("auto" if args.mode == "layer_grads" else "cpu"),
+        # NOTE: hardcoded True, unlike quantize.py which exposes it as a flag. Either way
+        # align_deepseek_softmax_scale below keeps the two implementations equivalent.
         torch_dtype=args.model_dtype, attn_implementation=args.attn_impl, trust_remote_code=True,
     )
+    # HF's built-in DeepSeek-V2 omits the YaRN mscale on the attention scale; no-op on
+    # the official implementation, which already applies it.
+    align_deepseek_softmax_scale(model)
+
     model.seqlen = args.seqlen
     
     if args.mode == "layer_grads":

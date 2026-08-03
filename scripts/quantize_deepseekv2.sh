@@ -1,9 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# NOTE: There are two implementations of DeepSeek-V2-Lite: the one in HuggingFace Transformers and the one in the official DeepSeek repo.
-# The former yields significantly higher eval perplexity, while the latter might not be compatible with latest Transformers versions.
-# We can use the `use_official_impl` flag to switch between the two implementations.
+# NOTE: DeepSeek-V2-Lite has two implementations: HuggingFace Transformers' built-in one
+# and the official one shipped with the weights (trust_remote_code).
+#
+# The built-in one used to score ~15% worse (10.80 vs 9.39 wikitext2 ppl). Cause: it omits
+# the YaRN mscale that the official code folds into the attention softmax scale. Both
+# entry points now call gemq.utils.hf_loading.align_deepseek_softmax_scale, which restores
+# it, so the two agree to within ~0.1% and either flag setting is fine here.
+#
+# The official implementation predates `cache_position` and the transformers 4.5x Cache
+# API, so it cannot be used for generation -- see scripts/bench_generate_deepseekv2.sh.
 
 # ===============================
 #  Model settings

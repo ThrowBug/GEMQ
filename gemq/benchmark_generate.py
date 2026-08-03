@@ -2,16 +2,18 @@ import argparse
 import time
 import json
 import contextlib
+import inspect
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from hqq.models.hf.base import AutoHQQHFModel
-
 from gemq.inference.kv_cache import StaticCache
 from gemq.inference.patch import prepare_for_inference
+from gemq.utils.hf_loading import (
+    load_quantized_model, describe_model_impl, align_deepseek_softmax_scale,
+)
 
 
 def device_sync(device="cuda"):
@@ -74,10 +76,30 @@ def load_model(args, compute_dtype=torch.float16, device="cuda"):
             trust_remote_code=args.trust_remote_code
         )
     else:
-        model = AutoHQQHFModel.from_quantized(
+        # NOTE: routed through load_quantized_model rather than calling
+        # AutoHQQHFModel.from_quantized directly. hqq loads the config and builds the
+        # model itself and drops trust_remote_code on the way, which would silently run
+        # HF's built-in implementation instead of the modeling code the checkpoint was
+        # quantized with. See gemq/utils/hf_loading.py.
+        model = load_quantized_model(
             args.model_path, compute_dtype=compute_dtype, device=device,
-            trust_remote_code=args.trust_remote_code
+            trust_remote_code=args.trust_remote_code,
         )
+    print(f"Modeling implementation: {describe_model_impl(model)}")
+
+    # The decode loop drives a StaticCache via `cache_position`. Modeling code predating
+    # that convention cannot generate; fail here rather than inside the first forward.
+    if "cache_position" not in inspect.signature(model.forward).parameters:
+        raise RuntimeError(
+            f"{describe_model_impl(model)} does not accept `cache_position` and cannot "
+            f"drive StaticCache. Drop --trust_remote_code."
+        )
+
+    # Generation must run on HF's built-in implementation (see above), which omits the
+    # YaRN mscale that the official code applies to the attention scale. Restoring it
+    # brings wikitext2 ppl from 10.80 back to 9.38, i.e. within 0.1% of the official
+    # implementation gemq.quantize evaluates on.
+    align_deepseek_softmax_scale(model)
 
     # patch model for inference
     if args.compile:

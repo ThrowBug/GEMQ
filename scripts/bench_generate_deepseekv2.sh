@@ -23,13 +23,19 @@ if [ "$mode" == "FP" ]; then
 else
     model_path="results/real_quant_models/${model_name}/GEMQ/C4-Seed0-WT2_A4-G16-D4-E2.0_RFT"
 
-    # NOTE: if `trust_remote_code` is used, make sure `modeling_deepseek.py` is present in the local model folder.
+    # Keep the official modeling code next to the weights so the accuracy tests, which
+    # load with trust_remote_code, can compare against it.
     hf download deepseek-ai/DeepSeek-V2-Lite modeling_deepseek.py --local-dir $model_path
+
+    # NOTE: --trust_remote_code is deliberately NOT passed. The official modeling code has
+    # no `cache_position` parameter and calls the removed Cache.get_usable_length, so it
+    # cannot drive StaticCache. Generation runs on HF's built-in implementation, whose
+    # missing YaRN mscale benchmark_generate restores at load time -- accuracy therefore
+    # matches what gemq.quantize reports to within ~0.1%.
 
     CUDA_VISIBLE_DEVICES=0 TORCH_LOGS="graph_breaks,recompiles" python -m gemq.benchmark_generate \
         --model_path $model_path \
         --model_name $model_name \
-        --trust_remote_code \
         --attn_impl eager \
         --prompt "$prompt" \
         --num_samples 10 \

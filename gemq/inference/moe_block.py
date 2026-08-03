@@ -13,6 +13,71 @@ from gemq.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
 from gemq.triton_kernels.fused_dequant_bmm import fused_dequant_up_proj_triton, fused_dequant_down_proj_triton
 
 
+def check_deepseek_routing_supported(config):
+    """Expert-selection features the fused DeepSeek forward does not implement."""
+    # only the official configuration_deepseek.py carries scoring_func; HF's built-in
+    # gate hardcodes softmax, so a missing field means softmax
+    scoring_func = getattr(config, "scoring_func", "softmax")
+    assert scoring_func == "softmax", (
+        f"fused block always uses softmax scoring, config asks for '{scoring_func}'"
+    )
+    assert config.topk_method == "greedy", (
+        f"fused block only implements topk_method='greedy', got '{config.topk_method}'"
+    )
+
+
+def check_deepseek_gate_matches(config, hf_block):
+    """
+    Check the fused block combines routing weights like the block it replaces. The two
+    reference implementations differ, so the applicable check depends on which is loaded:
+
+        official modeling_deepseek.py:
+            w /= w.sum()  if top_k > 1 and norm_topk_prob else  w *= routed_scaling_factor
+        HF built-in:
+            w *= routed_scaling_factor          # norm_topk_prob never consulted
+        fused block here:
+            w /= w.sum()  if norm_topk_prob     # routed_scaling_factor never applied
+    """
+    is_builtin = type(hf_block).__module__.startswith("transformers.models.deepseek_v2")
+    normalizes = bool(config.norm_topk_prob)
+    top_k = config.num_experts_per_tok
+
+    if is_builtin:
+        assert not normalizes, (
+            "HF's built-in gate ignores norm_topk_prob while the fused block honours it; "
+            "they agree only while it is False"
+        )
+        assert config.routed_scaling_factor == 1.0, (
+            f"built-in gate always scales by routed_scaling_factor "
+            f"({config.routed_scaling_factor}), which the fused block never applies"
+        )
+        return
+
+    assert not (normalizes and top_k == 1), (
+        "at top_k=1 the official gate scales, while the fused block would normalize the "
+        "single weight to 1.0"
+    )
+    if not (normalizes and top_k > 1):
+        assert config.routed_scaling_factor == 1.0, (
+            f"the official gate scales by routed_scaling_factor "
+            f"({config.routed_scaling_factor}) whenever it does not normalize"
+        )
+
+
+def check_w1_w3_aligned(fused_block):
+    """
+    `forward_one_token` passes only w1's nbits/strides and reuses them for w3, valid
+    because bit allocation is per-expert. Pin the invariant so a future quantizer that
+    allocates per sub-linear fails at load time instead of reading w3 at wrong offsets.
+    """
+    assert torch.equal(fused_block.w1_nbits, fused_block.w3_nbits), (
+        "w1 and w3 must share bit-widths: forward_one_token indexes w3 with w1's nbits"
+    )
+    assert torch.equal(fused_block.w1_wq_strides, fused_block.w3_wq_strides), (
+        "w1 and w3 must share packed strides: forward_one_token reads w3 at w1's offsets"
+    )
+
+
 class FusedMixtralMoEBlock(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
@@ -141,6 +206,8 @@ class QuantFusedMixtralMoEBlock(nn.Module):
         fused_block.w3_wq_strides = cumsum(torch.tensor([0] + [expert.w3.W_q.numel() for expert in hf_block.experts], dtype=torch.int32, device=fused_block.w3_wq.device))
         fused_block.w3_zs_strides = cumsum(torch.tensor([0] + [expert.w3.scales.numel() for expert in hf_block.experts], dtype=torch.int32, device=fused_block.w3_wq.device))
 
+        check_w1_w3_aligned(fused_block)
+
         return fused_block
 
     def forward_single_expert(self, expert_idx: Tensor, hidden_states) -> Tensor:
@@ -243,6 +310,8 @@ class QuantFusedMixtralMoEBlock(nn.Module):
 class FusedDeepseekV2MoEBlock(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
+        check_deepseek_routing_supported(config)
+
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.moe_intermediate_size
         self.num_experts = config.n_routed_experts
@@ -265,6 +334,8 @@ class FusedDeepseekV2MoEBlock(nn.Module):
 
     @classmethod
     def from_hf(cls, config, hf_block: DeepseekV2MoE):
+        check_deepseek_gate_matches(config, hf_block)
+
         device = next(hf_block.parameters()).device
         dtype = next(hf_block.parameters()).dtype
 
@@ -321,6 +392,8 @@ class FusedDeepseekV2MoEBlock(nn.Module):
 class QuantFusedDeepseekV2MoEBlock(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
+        check_deepseek_routing_supported(config)
+
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.moe_intermediate_size
         self.num_experts = config.n_routed_experts
@@ -353,6 +426,8 @@ class QuantFusedDeepseekV2MoEBlock(nn.Module):
 
     @classmethod
     def from_hf(cls, config, hf_block: DeepseekV2MoE):
+        check_deepseek_gate_matches(config, hf_block)
+
         # create fused block
         fused_block = cls(config)
 
@@ -410,6 +485,21 @@ class QuantFusedDeepseekV2MoEBlock(nn.Module):
         # NOTE: assume w1, w2, w3 have the same nbits and group_size for shared experts
         fused_block.shared_nbits = hf_block.shared_experts.gate_proj.W_nbits
         fused_block.shared_group_size = hf_block.shared_experts.gate_proj.group_size
+
+        check_w1_w3_aligned(fused_block)
+
+        # the shared-expert path reuses gate_proj's nbits/group_size for all three
+        # projections, so they have to agree as well
+        for name in ("up_proj", "down_proj"):
+            shared_linear = getattr(hf_block.shared_experts, name)
+            assert shared_linear.W_nbits == fused_block.shared_nbits, (
+                f"shared expert {name} uses {shared_linear.W_nbits} bits but gate_proj uses "
+                f"{fused_block.shared_nbits}; the shared-expert kernels assume one bit-width"
+            )
+            assert shared_linear.group_size == fused_block.shared_group_size, (
+                f"shared expert {name} uses group_size {shared_linear.group_size} but gate_proj "
+                f"uses {fused_block.shared_group_size}; the shared-expert kernels assume one group size"
+            )
 
         return fused_block
 

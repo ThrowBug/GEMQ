@@ -16,6 +16,7 @@ from gemq.utils.data_utils import get_calib_loader
 from gemq.utils.model_utils import *
 from gemq.utils.quant_utils import *
 from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
+from gemq.utils.hf_loading import align_deepseek_softmax_scale
 
 logging.set_verbosity_error()
 
@@ -447,6 +448,10 @@ if __name__ == "__main__":
         args.model, device_map="cpu", torch_dtype=args.model_dtype,
         attn_implementation=args.attn_impl, trust_remote_code=args.trust_remote_code,
     )
+    # HF's built-in DeepSeek-V2 omits the YaRN mscale on the attention scale; no-op on
+    # the official implementation, which already applies it.
+    align_deepseek_softmax_scale(model)
+
     model.seqlen = 2048
     model.eval()
 

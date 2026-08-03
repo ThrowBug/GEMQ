@@ -14,6 +14,13 @@ GEMQ is a post-training quantization framework for Mixture-of-Experts (MoE) LLMs
 * Efficient low-bit MoE triton kernels for **real** quantized inference
 
 
+## Updates
+
+**2026-08** — Verified that real quantization matches fake quantization end to end (0.06% perplexity gap on DeepSeek-V2-Lite); see `tests/` and `scripts/test_real_quant.sh`.
+
+**2026-08** — Fixed a ~15% perplexity regression on DeepSeek-V2 caused by a missing YaRN `mscale` in HF's built-in implementation ([transformers#47435](https://github.com/huggingface/transformers/pull/47435)); see `gemq/utils/hf_loading.py`.
+
+
 ## Installation
 
 ```bash

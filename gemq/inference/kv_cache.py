@@ -112,3 +112,7 @@ class StaticCache(Cache):
             layers.append(layer)
 
         super().__init__(layers=layers, offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
+
+    # NOTE: follows the transformers >= 4.5x convention (Cache layers + `cache_position`).
+    # DeepSeek-V2's official modeling_deepseek.py predates it, so it cannot drive this
+    # cache and generation must run on HF's built-in implementation.

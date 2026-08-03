@@ -23,5 +23,15 @@ dependencies = [
     "gurobipy>=12.0.3"
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
 [tool.setuptools.packages.find]
 include = ["gemq*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cuda: requires a CUDA device",
+    "checkpoint: requires --model-path",
+]
