@@ -6,7 +6,7 @@ import pickle
 import re
 
 from gemq.utils.model_utils import get_model_info
-from gemq.allocation.ilp_solvers import GEMQSolver
+from gemq.allocation.ilp_solvers import AVAILABLE_BACKENDS, GEMQSolver
 
 
 def auto_parse_filename(layer_re_path):
@@ -34,21 +34,29 @@ def auto_parse_filename(layer_re_path):
     return calib_str, model_str
 
 
+def compute_total_bits(model_name, bpe, bit_cands):
+    """
+    Auto compute the total bit budget for global ilp.
+
+    We assume the shared experts will get the highest bit;
+    all shared experts are merged to one single FFN, we need to consider this in bpl calculation;
+    NOTE: this is not the actual bpl because the shared experts are merged to one single expert
+    """
+    m = get_model_info(model_name)
+    bpl = (
+        bpe * (m.num_routed_experts_per_layer + m.num_shared_experts_per_layer) -
+        (max(0, m.num_shared_experts_per_layer - 1)) * max(bit_cands)
+    )
+    return bpl * (m.num_layers - m.first_k_dense_layers)
+
+
 def run_gemq_solver(args):
     # parse info
     m = get_model_info(args.model_name)
     bpe = args.bit_budget
     bit_cands = list(map(int, args.bit_candidates.split(",")))
 
-    # auto compute the total bit budget for global ilp
-    # we assume the shared experts will get the highest bit;
-    # all shared experts are merged to one single FFN, we need to consider this in bpl calculation;
-    # NOTE: this is not the actual bpl because the shared experts are merged to one single expert
-    bpl = (
-        bpe * (m.num_routed_experts_per_layer + m.num_shared_experts_per_layer) -
-        (max(0, m.num_shared_experts_per_layer - 1)) * max(bit_cands)
-    )
-    total_bits = bpl * (m.num_layers - m.first_k_dense_layers)
+    total_bits = compute_total_bits(args.model_name, bpe, bit_cands)
 
     # build a solver and solve
     global_solver = GEMQSolver(
@@ -56,6 +64,7 @@ def run_gemq_solver(args):
         x_space=bit_cands,
         extra_constr=args.extra_constr, # NOTE: this args is valid only when using x_space=(1,2,3)
         start_layer_idx=m.first_k_dense_layers,
+        backend=args.ilp_backend,
     )
     opt_set = global_solver.solve_all(total_bits=total_bits)
 
@@ -94,7 +103,12 @@ def parse_args():
     )
     parser.add_argument(
         "--ilp_solver", type=str, required=True, choices=["gemq"],
-        help="Solver to use for bit allocation",
+        help="Bit allocation method (which ILP to formulate), not the numerical solver",
+    )
+    parser.add_argument(
+        "--ilp_backend", type=str, default="highs", choices=list(AVAILABLE_BACKENDS),
+        help="Numerical solver used to solve that ILP. 'highs' ships with SciPy and "
+             "needs no license; 'gurobi' requires the optional gurobipy extra",
     )
     parser.add_argument(
         "--extra_constr", type=str, default="none",

@@ -20,8 +20,9 @@ GEMQ is a post-training quantization framework for Mixture-of-Experts (MoE) LLMs
 
 ## Updates
 
+- [2026/08] Bit allocation now runs on **HiGHS**, the ILP solver bundled with SciPy, so regenerating the bit configs no longer needs a Gurobi license. Gurobi stays available as an optional backend.
 - [2026/08] Real quantized inference now covers **OLMoE-1B-7B-0924** and **Qwen3-30B-A3B**, alongside Mixtral-8x7B and DeepSeek-V2-Lite. Run it with `scripts/bench_generate_<model>.sh`.
-- [2026/08] Real quantization is verified to match fake quantization end to end (0.06% perplexity gap on DeepSeek-V2-Lite and 0.03% on OLMoE-1B-7B-0924).
+- [2026/08] Real quantization is verified to match fake quantization end to end -- a 0.06% perplexity gap on DeepSeek-V2-Lite and 0.03% on OLMoE-1B-7B-0924. Run the checks with `scripts/test_real_quant.sh`.
 - [2026/08] Fixed a ~15% perplexity regression on DeepSeek-V2 caused by a missing YaRN `mscale` in HF's built-in implementation ([transformers#47435](https://github.com/huggingface/transformers/pull/47435)).
 
 
@@ -33,12 +34,17 @@ conda activate gemq
 git clone https://github.com/jndeng/GEMQ
 cd GEMQ
 pip install -e .
+
+# (Optional) Only if you want to solve the bit allocation with Gurobi
+# instead of the default HiGHS solver -- requires a Gurobi license.
+# pip install -e ".[gurobi]"
 ```
 
 > [!NOTE]
 >
-> This project currently uses **gurobipy** as the integer linear programming (ILP) solver for bit allocation. A Gurobi license may be required for certain MoE models with a large number of experts, such as the DeepSeek and Qwen series.
-
+> By default, bit allocation is solved with **HiGHS**, which does not require a commercial license.
+> In our experiments, however, we used **Gurobi** to produce the configs under `configs/`.
+> Gurobi remains available as an optional backend -- install it as shown above, then set `ilp_backend="gurobi"` in `scripts/allocate_<model>.sh`.
 
 
 ## Usage
@@ -51,6 +57,10 @@ pip install -e .
 > [!NOTE]
 >
 > We provide pre-generated bit allocation configs under `configs`, which can be used directly for quantization. You may skip this section if you do not want to regenerate them.
+
+> [!IMPORTANT]
+>
+> **All provided configs and results reported in the paper were produced with the Gurobi backend.** HiGHS was added later solely to remove the Gurobi license requirement. Both backends solve the same ILP, but because the optimum may not be unique, HiGHS can return a different allocation. To reproduce the paper exactly, use the provided configs or set `ilp_backend="gurobi"` in the allocation script.
 
 To generate the configs from scratch, follow the steps below.
 
@@ -80,6 +90,10 @@ Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the
 >
 > Decoding is fully fused; prefill still loops over hit experts in Python, so its throughput is dominated by kernel launch overhead and scales with depth and expert count rather than with prompt length.
 
+
+## License
+
+Released under the [MIT License](LICENSE).
 
 ## Acknowledgements
 This repository builds upon several excellent open-source projects, including [MC-MoE](https://github.com/Aaronhuang-778/Mixture-Compressor-MoE), [GPTQ](https://github.com/IST-DASLab/gptq), [HQQ](https://github.com/dropbox/hqq), [GemLite](https://github.com/dropbox/gemlite), and [gpt-fast](https://github.com/meta-pytorch/gpt-fast). We sincerely thank the authors and contributors for making their code publicly available.
