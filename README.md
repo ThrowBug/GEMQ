@@ -35,8 +35,8 @@ git clone https://github.com/jndeng/GEMQ
 cd GEMQ
 pip install -e .
 
-# (Optional) Only if you want to solve the bit allocation with Gurobi
-# instead of the default HiGHS solver -- requires a Gurobi license.
+# (Optional) only needed if you want to solve the bit allocation with Gurobi
+# instead of the default HiGHS solver (and thus requires a Gurobi license):
 # pip install -e ".[gurobi]"
 ```
 
