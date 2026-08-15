@@ -39,6 +39,7 @@ class ServerSettings:
     device: str = "cuda"
     trust_remote_code: bool = False
     eos_check_interval: int = 8
+    prompt_format: str = "auto"
 
 
 class ChatCompletionRequest(BaseModel):
@@ -62,6 +63,8 @@ class GEMQOpenAIService:
     def __init__(self, settings: ServerSettings):
         if settings.eos_check_interval < 1:
             raise ValueError("eos_check_interval must be at least 1")
+        if settings.prompt_format not in {"auto", "raw", "chat"}:
+            raise ValueError("prompt_format must be one of: auto, raw, chat")
         if not settings.device.startswith("cuda"):
             raise ValueError("GEMQ real-quant API serving currently requires a CUDA device")
         if not torch.cuda.is_available():
@@ -72,6 +75,7 @@ class GEMQOpenAIService:
             torch.cuda.set_device(requested_device)
 
         self.settings = settings
+        self.prompt_format = self._resolve_prompt_format(settings)
         self._generate_lock = threading.Lock()
 
         print(f"Loading tokenizer from {settings.model_path}")
@@ -79,6 +83,11 @@ class GEMQOpenAIService:
             settings.model_path,
             trust_remote_code=settings.trust_remote_code,
         )
+        if self.prompt_format == "chat" and not getattr(self.tokenizer, "chat_template", None):
+            raise ValueError(
+                "prompt_format=chat requires a tokenizer with a chat_template; "
+                "use --prompt-format raw for a base completion model"
+            )
 
         print(f"Loading GEMQ real-quant model from {settings.model_path}")
         self.model = load_quantized_model(
@@ -102,8 +111,23 @@ class GEMQOpenAIService:
         self.model.eval()
         print(
             "GEMQ API model is ready "
-            f"(served model: {settings.served_model_name}, dtype: torch.float16)"
+            f"(served model: {settings.served_model_name}, dtype: torch.float16, "
+            f"prompt format: {self.prompt_format})"
         )
+
+    @staticmethod
+    def _resolve_prompt_format(settings: ServerSettings) -> str:
+        if settings.prompt_format != "auto":
+            return settings.prompt_format
+
+        # GEMQ's committed checkpoints are base completion models. Only opt into a
+        # chat template when the requested model identity explicitly says that it is
+        # instruction/chat tuned; the presence of tokenizer.chat_template alone is
+        # not sufficient because base and chat checkpoints can share tokenizer files.
+        model_identity = f"{settings.model_name} {settings.model_path}".lower()
+        if "chat" in model_identity or "instruct" in model_identity:
+            return "chat"
+        return "raw"
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -126,7 +150,7 @@ class GEMQOpenAIService:
             for message in messages
         ]
 
-        if getattr(self.tokenizer, "chat_template", None):
+        if self.prompt_format == "chat":
             return (
                 self.tokenizer.apply_chat_template(
                     normalized,
@@ -136,9 +160,9 @@ class GEMQOpenAIService:
                 False,
             )
 
-        # DeepSeek-V2-Lite is a base model and may not define a chat template. Most
-        # EvalScope benchmark calls contain one user message, for which this preserves
-        # the raw benchmark prompt.
+        # EvalScope sends a benchmark prompt as a single user message. Base models
+        # should continue that text directly rather than seeing User:/Assistant:
+        # wrappers from a tokenizer template.
         return "\n".join(message["content"] for message in normalized), True
 
     def _get_eos_token_ids(self) -> set[int]:
@@ -208,17 +232,12 @@ class GEMQOpenAIService:
         top_k = request.top_k
         if top_k is not None and top_k <= 0:
             top_k = None
-        # The GEMQ demo sampler always samples. Restricting the candidate set to one
-        # token makes temperature=0 deterministic greedy decoding.
-        if request.temperature == 0:
-            top_k = 1
-
         cache = StaticCache(
             self.model.config,
             max_cache_len=prompt_tokens + max_new_tokens,
         )
         sampling_args = {
-            "temperature": max(request.temperature, 1e-5),
+            "temperature": request.temperature,
             "top_k": top_k,
         }
         eos_token_ids = self._get_eos_token_ids()
@@ -326,6 +345,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--prompt-format",
+        choices=("auto", "raw", "chat"),
+        default="auto",
+        help=(
+            "Prompt formatting mode. auto uses raw completion prompts for base models "
+            "and chat templates for model names containing 'chat' or 'instruct'."
+        ),
+    )
+    parser.add_argument(
         "--eos-check-interval",
         type=int,
         default=8,
@@ -354,6 +382,7 @@ def main() -> None:
         device=args.device,
         trust_remote_code=args.trust_remote_code,
         eos_check_interval=args.eos_check_interval,
+        prompt_format=args.prompt_format,
     )
 
     import uvicorn

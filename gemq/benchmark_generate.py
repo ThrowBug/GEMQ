@@ -40,7 +40,15 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
 
 
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    probs = logits_to_probs(logits[0, -1], temperature, top_k)
+    last_token_logits = logits[0, -1]
+    if temperature <= 0:
+        # Greedy decoding must bypass temperature scaling entirely. Replacing zero
+        # with a tiny value overflows FP16 logits before top-k filtering and turns the
+        # softmax into NaN (which commonly collapses generation to token id 0).
+        idx_next = torch.argmax(last_token_logits, dim=-1, keepdim=True).to(dtype=torch.int)
+        return idx_next, None
+
+    probs = logits_to_probs(last_token_logits, temperature, top_k)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 

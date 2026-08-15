@@ -15,6 +15,19 @@ def _scripted_decoder(monkeypatch, token_ids):
     return calls
 
 
+def test_zero_temperature_uses_direct_greedy_decoding(monkeypatch):
+    def fail_probability_path(*args, **kwargs):
+        raise AssertionError("temperature=0 must not scale logits or run softmax")
+
+    monkeypatch.setattr(benchmark_generate, "logits_to_probs", fail_probability_path)
+    logits = torch.tensor([[[1.0, 7.0, 3.0]]], dtype=torch.float16)
+
+    token, probabilities = benchmark_generate.sample(logits, temperature=0, top_k=1)
+
+    assert token.tolist() == [1]
+    assert probabilities is None
+
+
 def test_decode_stops_at_first_eos_with_chunked_checks(monkeypatch):
     calls = _scripted_decoder(monkeypatch, [11, 12, 2, 99, 100])
 
