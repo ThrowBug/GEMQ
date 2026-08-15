@@ -91,6 +91,46 @@ Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the
 > Decoding is fully fused; prefill still loops over hit experts in Python, so its throughput is dominated by kernel launch overhead and scales with depth and expert count rather than with prompt length.
 
 
+### 4. OpenAI-Compatible API
+
+Install the optional API dependencies:
+
+```bash
+pip install -e ".[api]"
+```
+
+Serve a real-quantized DeepSeek-V2-Lite checkpoint (one process, one GPU):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m gemq.openai_server \
+    --model-path results/real_quant_models/deepseek-ai/DeepSeek-V2-Lite/GEMQ/C4-Seed0-WT2_A4-G16-D4-E2.0_RFT \
+    --model-name deepseek-ai/DeepSeek-V2-Lite \
+    --served-model-name gemq-deepseek-v2-lite \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+The server exposes `GET /health`, `GET /v1/models`, and `POST /v1/chat/completions`.
+Streaming and concurrent GPU generation are not currently supported; requests are
+serialized inside the server. For EvalScope, use API mode and disable streaming:
+
+```bash
+evalscope eval \
+    --model gemq-deepseek-v2-lite \
+    --api-url http://127.0.0.1:8000/v1 \
+    --api-key EMPTY \
+    --eval-type openai_api \
+    --datasets gsm8k arc \
+    --eval-batch-size 1 \
+    --generation-config '{"max_tokens": 512, "temperature": 0, "top_p": 1, "stream": false}'
+```
+
+The service loads the HQQ checkpoint through GEMQ's `load_quantized_model`, enables
+the GEMQ/GemLite inference path, and uses FP16 as the compute dtype. Do not pass
+`--trust-remote-code` for DeepSeek-V2-Lite generation: its bundled modeling code does
+not support the StaticCache interface used by GEMQ.
+
+
 ## License
 
 Released under the [MIT License](LICENSE).
