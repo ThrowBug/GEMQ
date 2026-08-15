@@ -38,6 +38,7 @@ class ServerSettings:
     served_model_name: str
     device: str = "cuda"
     trust_remote_code: bool = False
+    eos_check_interval: int = 8
 
 
 class ChatCompletionRequest(BaseModel):
@@ -59,6 +60,8 @@ class ChatCompletionRequest(BaseModel):
 class GEMQOpenAIService:
 
     def __init__(self, settings: ServerSettings):
+        if settings.eos_check_interval < 1:
+            raise ValueError("eos_check_interval must be at least 1")
         if not settings.device.startswith("cuda"):
             raise ValueError("GEMQ real-quant API serving currently requires a CUDA device")
         if not torch.cuda.is_available():
@@ -138,7 +141,7 @@ class GEMQOpenAIService:
         # the raw benchmark prompt.
         return "\n".join(message["content"] for message in normalized), True
 
-    def _truncate_at_eos(self, token_ids: list[int]) -> tuple[list[int], bool]:
+    def _get_eos_token_ids(self) -> set[int]:
         eos_ids: set[int] = set()
         tokenizer_eos = self.tokenizer.eos_token_id
         if isinstance(tokenizer_eos, int):
@@ -151,6 +154,10 @@ class GEMQOpenAIService:
         elif isinstance(config_eos, (list, tuple, set)):
             eos_ids.update(int(item) for item in config_eos)
 
+        return eos_ids
+
+    @staticmethod
+    def _truncate_at_eos(token_ids: list[int], eos_ids: set[int]) -> tuple[list[int], bool]:
         for index, token_id in enumerate(token_ids):
             if token_id in eos_ids:
                 return token_ids[:index], True
@@ -214,32 +221,36 @@ class GEMQOpenAIService:
             "temperature": max(request.temperature, 1e-5),
             "top_k": top_k,
         }
+        eos_token_ids = self._get_eos_token_ids()
 
         with self._generate_lock:
-            if max_new_tokens == 1:
-                input_pos = torch.arange(prompt_tokens, device=self.settings.device)
-                next_token = benchmark_generate.prefill(
-                    self.model,
-                    input_ids.view(1, -1),
-                    cache,
-                    input_pos,
-                    **sampling_args,
-                )
-                output = torch.cat((input_ids, next_token.reshape(-1)))
-            else:
-                output, _ = benchmark_generate.generate(
-                    self.model,
-                    input_ids,
-                    max_new_tokens=max_new_tokens,
-                    kv_cache=cache,
-                    **sampling_args,
-                )
+            output, generation_stats = benchmark_generate.generate(
+                self.model,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                kv_cache=cache,
+                eos_token_ids=eos_token_ids,
+                eos_check_interval=self.settings.eos_check_interval,
+                **sampling_args,
+            )
 
-        generated_ids, hit_eos = self._truncate_at_eos(output[prompt_tokens:].tolist())
+        generated_ids, hit_eos = self._truncate_at_eos(
+            output[prompt_tokens:].tolist(),
+            eos_token_ids,
+        )
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         text, hit_stop_sequence = self._apply_stop_sequences(text, request.stop)
         stopped = hit_eos or hit_stop_sequence
         completion_tokens = len(self.tokenizer.encode(text, add_special_tokens=False))
+        print(
+            "Completed request: "
+            f"prompt_tokens={prompt_tokens}, "
+            f"generated_tokens={generation_stats['generated_tokens']}, "
+            f"stopped_on_eos={generation_stats['stopped_on_eos']}, "
+            f"prefill={generation_stats['prefill_latency']:.3f}s, "
+            f"decode={generation_stats['decode_latency']:.3f}s, "
+            f"decode_tps={generation_stats['decode_throughput']:.2f}"
+        )
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -315,6 +326,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--eos-check-interval",
+        type=int,
+        default=8,
+        help=(
+            "Check generated tokens for EOS every N decode steps. Smaller values stop "
+            "sooner but force more CUDA synchronizations."
+        ),
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help=(
@@ -333,6 +353,7 @@ def main() -> None:
         served_model_name=args.served_model_name,
         device=args.device,
         trust_remote_code=args.trust_remote_code,
+        eos_check_interval=args.eos_check_interval,
     )
 
     import uvicorn

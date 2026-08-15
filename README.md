@@ -106,6 +106,7 @@ CUDA_VISIBLE_DEVICES=0 python -m gemq.openai_server \
     --model-path results/real_quant_models/deepseek-ai/DeepSeek-V2-Lite/GEMQ/C4-Seed0-WT2_A4-G16-D4-E2.0_RFT \
     --model-name deepseek-ai/DeepSeek-V2-Lite \
     --served-model-name gemq-deepseek-v2-lite \
+    --eos-check-interval 8 \
     --host 0.0.0.0 \
     --port 8000
 ```
@@ -128,7 +129,10 @@ evalscope eval \
 The service loads the HQQ checkpoint through GEMQ's `load_quantized_model`, enables
 the GEMQ/GemLite inference path, and uses FP16 as the compute dtype. Do not pass
 `--trust-remote-code` for DeepSeek-V2-Lite generation: its bundled modeling code does
-not support the StaticCache interface used by GEMQ.
+not support the StaticCache interface used by GEMQ. Generation checks for EOS every
+eight decode steps by default, so it stops close to the model's natural end instead of
+always computing the full `max_tokens` budget. Lower `--eos-check-interval` for more
+immediate stopping, or increase it to reduce CUDA synchronization frequency.
 
 
 ## License

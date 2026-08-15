@@ -3,7 +3,7 @@ import time
 import json
 import contextlib
 import inspect
-from typing import Optional
+from typing import Any, Collection, Optional
 
 import torch
 import torch.nn.functional as F
@@ -55,13 +55,55 @@ def decode_one_token(model, x, kv_cache, input_pos, **sampling_kwargs):
     return sample(outputs.logits, **sampling_kwargs)[0]
 
 
-def decode_n_tokens(model, cur_token, kv_cache, input_pos, num_new_tokens, **sampling_kwargs):
+def decode_n_tokens(
+    model,
+    cur_token,
+    kv_cache,
+    input_pos,
+    num_new_tokens,
+    eos_token_ids: Optional[Collection[int]] = None,
+    eos_check_interval: int = 8,
+    **sampling_kwargs,
+):
+    """Decode up to ``num_new_tokens`` and stop after the first EOS token.
+
+    EOS is checked in small chunks rather than after every token. Reading a CUDA token
+    on the host forces synchronization; checking every ``eos_check_interval`` tokens
+    amortizes that cost while wasting at most ``eos_check_interval - 1`` decode steps.
+    Returned tokens are always trimmed at the first EOS (inclusive).
+    """
+    if eos_check_interval < 1:
+        raise ValueError("eos_check_interval must be at least 1")
+
     new_tokens = []
+    eos_ids = sorted(set(int(token_id) for token_id in (eos_token_ids or [])))
+    eos_tensor = None
+    if eos_ids:
+        eos_tensor = torch.tensor(eos_ids, device=cur_token.device, dtype=cur_token.dtype)
+
+    unchecked_start = 0
     for i in range(num_new_tokens):
         next_token = decode_one_token(model, cur_token, kv_cache, input_pos, **sampling_kwargs)
         input_pos += 1
         new_tokens.append(next_token.clone())
         cur_token = next_token.clone().view(1, -1)
+
+        should_check_eos = eos_tensor is not None and (
+            len(new_tokens) - unchecked_start >= eos_check_interval
+            or i == num_new_tokens - 1
+        )
+        if not should_check_eos:
+            continue
+
+        recent_tokens = torch.cat(new_tokens[unchecked_start:]).reshape(-1)
+        matches = torch.isin(recent_tokens, eos_tensor)
+        match_positions = torch.nonzero(matches, as_tuple=False).reshape(-1)
+        if match_positions.numel() > 0:
+            first_match = int(match_positions[0].item())
+            new_tokens = new_tokens[:unchecked_start + first_match + 1]
+            break
+        unchecked_start = len(new_tokens)
+
     return new_tokens
 
 
@@ -112,20 +154,27 @@ def load_model(args, compute_dtype=torch.float16, device="cuda"):
 
 @torch.no_grad()
 def generate(
-    model, prompt: torch.Tensor, max_new_tokens: int, kv_cache: StaticCache,
-    **sampling_kwargs
-) -> torch.Tensor:
+    model,
+    prompt: torch.Tensor,
+    max_new_tokens: int,
+    kv_cache: StaticCache,
+    eos_token_ids: Optional[Collection[int]] = None,
+    eos_check_interval: int = 8,
+    **sampling_kwargs,
+) -> tuple[torch.Tensor, dict[str, Any]]:
     """
-    Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+    Generate at most ``max_new_tokens``, stopping early when EOS is produced.
+
+    When ``eos_token_ids`` is omitted, behavior remains compatible with the original
+    fixed-length benchmark path.
     """
-    device, dtype = prompt.device, prompt.dtype
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be at least 1")
+
+    device = prompt.device
     stats = {}
 
-    # create an empty tensor of the expected final shape and fill in the current tokens
     T = prompt.size(0)
-    empty = torch.empty(T + max_new_tokens, dtype=dtype, device=device)
-    empty[:T] = prompt
-    seq = empty
     input_pos = torch.arange(0, T, device=device)
 
     t0 = time.perf_counter()
@@ -138,20 +187,41 @@ def generate(
     stats["prefill_latency"] = elapsed_time # in seconds
     stats["prefill_throughput"] = T / stats["prefill_latency"] # tokens per second
 
-    seq[T] = next_token
+    eos_ids = set(int(token_id) for token_id in (eos_token_ids or []))
+    stopped_on_eos = bool(eos_ids) and int(next_token.item()) in eos_ids
+    generated_tokens = [next_token.clone()]
     input_pos = torch.tensor([T], device=device, dtype=torch.long)
 
-    t0 = time.perf_counter()
-    device_sync()
-    generated_tokens = decode_n_tokens(
-        model, next_token.view(1, -1), kv_cache, input_pos, max_new_tokens - 1, **sampling_kwargs
-    )
-    device_sync()
-    elapsed_time = time.perf_counter() - t0
-    stats["decode_latency"] = elapsed_time # in seconds
-    stats["decode_throughput"] = (max_new_tokens - 1) / stats["decode_latency"] # tokens per second
+    decoded_tokens = []
+    decode_latency = 0.0
+    if max_new_tokens > 1 and not stopped_on_eos:
+        t0 = time.perf_counter()
+        device_sync()
+        decoded_tokens = decode_n_tokens(
+            model,
+            next_token.view(1, -1),
+            kv_cache,
+            input_pos,
+            max_new_tokens - 1,
+            eos_token_ids=eos_ids,
+            eos_check_interval=eos_check_interval,
+            **sampling_kwargs,
+        )
+        device_sync()
+        decode_latency = time.perf_counter() - t0
+        generated_tokens.extend(decoded_tokens)
+        if eos_ids and decoded_tokens:
+            stopped_on_eos = int(decoded_tokens[-1].item()) in eos_ids
 
-    seq[T + 1:] = torch.cat(generated_tokens)
+    stats["decode_latency"] = decode_latency
+    stats["decode_throughput"] = (
+        len(decoded_tokens) / decode_latency if decode_latency > 0 else 0.0
+    )
+    stats["generated_tokens"] = len(generated_tokens)
+    stats["stopped_on_eos"] = stopped_on_eos
+
+    generated = torch.cat([token.reshape(-1) for token in generated_tokens])
+    seq = torch.cat((prompt.reshape(-1), generated))
 
     return seq, stats
 
