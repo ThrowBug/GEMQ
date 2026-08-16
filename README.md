@@ -127,11 +127,47 @@ CUDA_VISIBLE_DEVICES=0 evalscope eval \
     }'
 ```
 
-`--eval-batch-size` controls both EvalScope's producer threads and GEMQ's maximum
-physical model batch. Compatible calls are collected for up to `batch_wait_ms`, left
-padded, and sent through one batched KV cache. Set it to `1` to use the original
-single-token fused decode path. The first batched implementation uses
-`forward_n_tokens`; benchmark batch sizes `1`, `2`, `4`, and `8` on the target GPU.
+With one device, `--eval-batch-size` controls both EvalScope's producer threads and
+GEMQ's maximum physical model batch. Compatible calls are collected for up to
+`batch_wait_ms`, left padded, and sent through one batched KV cache. Set it to `1` to
+use the original single-token fused decode path. The first batched implementation
+uses `forward_n_tokens`; benchmark batch sizes `1`, `2`, `4`, and `8` on the target
+GPU.
+
+For data-parallel evaluation on multiple GPUs, each device loads a complete model
+replica and owns an independent queue, KV cache, and batch worker. The adapter routes
+each request to the healthy worker with the fewest unfinished jobs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 evalscope eval \
+    --model results/real_quant_models/deepseek-ai/DeepSeek-V2-Lite/GEMQ/C4-Seed0-WT2_A4-G16-D4-E2.0_RFT \
+    --model-id gemq-deepseek-v2-lite \
+    --eval-type gemq \
+    --datasets gsm8k \
+    --eval-batch-size 8 \
+    --judge-strategy rule \
+    --model-args '{
+        "base_model_name": "deepseek-ai/DeepSeek-V2-Lite",
+        "devices": ["cuda:0", "cuda:1"],
+        "per_device_batch_size": 2,
+        "prompt_format": "raw",
+        "eos_check_interval": 8,
+        "batch_wait_ms": 20,
+        "max_batch_padding_tokens": 256
+    }' \
+    --generation-config '{
+        "max_tokens": 128,
+        "temperature": 0,
+        "top_p": 1
+    }'
+```
+
+`--eval-batch-size` is the total number of in-flight EvalScope calls, while
+`per_device_batch_size` is the physical batch limit on each GPU. Keep the former at
+least as large as `number_of_devices * per_device_batch_size`; a larger value can keep
+the queues fed when prompt lengths and generation times differ. Do not pass `device`
+and `devices` together. Every listed GPU must be able to hold the complete checkpoint.
+The result metadata records the selected `device`, `worker_id`, and actual batch size.
 
 
 ### 5. OpenAI-Compatible API

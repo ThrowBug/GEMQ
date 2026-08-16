@@ -1,8 +1,9 @@
 """EvalScope local-model adapter for GEMQ real-quant checkpoints.
 
 EvalScope invokes ``ModelAPI.generate`` concurrently from its evaluation thread pool.
-This adapter turns those independent calls into static GPU micro-batches, so no HTTP
-server or OpenAI-compatible serialization layer is required.
+This adapter routes those calls to one or more independent GPU model replicas and
+turns compatible calls on each device into static micro-batches. No HTTP server or
+OpenAI-compatible serialization layer is required.
 """
 
 from __future__ import annotations
@@ -48,13 +49,27 @@ class _GenerationJob:
     submitted_at: float
     enqueued_at: float
     future: concurrent.futures.Future[ModelOutput]
+    assigned_worker_id: Optional[int] = None
+    assignment_finished: bool = False
+
+
+@dataclass
+class _DeviceWorker:
+    worker_id: int
+    device: str
+    model: Any
+    request_queue: queue.Queue[Any]
+    thread: Optional[threading.Thread] = None
+    outstanding_jobs: int = 0
+    healthy: bool = True
+    failure: Optional[str] = None
 
 
 _STOP_WORKER = object()
 
 
 class GEMQEvalScopeAPI(ModelAPI):
-    """Run a GEMQ checkpoint directly inside EvalScope with static batching."""
+    """Run a GEMQ checkpoint directly inside EvalScope with per-GPU batching."""
 
     def __init__(
         self,
@@ -64,13 +79,15 @@ class GEMQEvalScopeAPI(ModelAPI):
         config: GenerateConfig = GenerateConfig(),
         model_path: Optional[str] = None,
         base_model_name: str = "deepseek-ai/DeepSeek-V2-Lite",
-        device: str = "cuda",
+        device: Optional[str] = None,
+        devices: Optional[list[str]] = None,
         precision: str = "torch.float16",
         trust_remote_code: bool = False,
         prompt_format: str = "auto",
         eos_check_interval: int = 8,
         batch_wait_ms: float = 20.0,
         max_batch_padding_tokens: int = 256,
+        per_device_batch_size: Optional[int] = None,
         max_batch_size: Optional[int] = None,
         max_queue_size: int = 128,
         **model_args: Any,
@@ -89,29 +106,45 @@ class GEMQEvalScopeAPI(ModelAPI):
             raise ValueError("batch_wait_ms must be non-negative")
         if max_batch_padding_tokens < 0:
             raise ValueError("max_batch_padding_tokens must be non-negative")
+        if per_device_batch_size is not None and per_device_batch_size < 1:
+            raise ValueError("per_device_batch_size must be at least 1 when provided")
         if max_batch_size is not None and max_batch_size < 1:
             raise ValueError("max_batch_size must be at least 1 when provided")
+        if (
+            per_device_batch_size is not None
+            and max_batch_size is not None
+            and per_device_batch_size != max_batch_size
+        ):
+            raise ValueError(
+                "per_device_batch_size and the legacy max_batch_size alias must match"
+            )
         if max_queue_size < 1:
             raise ValueError("max_queue_size must be at least 1")
-        if not device.startswith("cuda"):
-            raise ValueError("GEMQ real-quant inference currently requires a CUDA device")
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available")
 
-        requested_device = torch.device(device)
-        if requested_device.index is not None:
-            torch.cuda.set_device(requested_device)
-
         self.model_path = model_path or model_name
         self.base_model_name = base_model_name
-        self.device = device
+        self.devices = self._normalize_devices(device=device, devices=devices)
+        self.device = self.devices[0]
         self.trust_remote_code = trust_remote_code
         self.prompt_format = self._resolve_prompt_format(prompt_format)
         self.eos_check_interval = eos_check_interval
         self.batch_wait_ms = batch_wait_ms
         self.max_batch_padding_tokens = max_batch_padding_tokens
-        self.max_batch_size_cap = max_batch_size
+        self.per_device_batch_size_cap = (
+            per_device_batch_size if per_device_batch_size is not None else max_batch_size
+        )
+        # Preserve the old internal name for code that inspects the adapter directly.
+        self.max_batch_size_cap = self.per_device_batch_size_cap
+        self.max_queue_size = max_queue_size
+
         self._tokenizer_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._dispatch_lock = threading.RLock()
+        self._next_worker_index = 0
+        self._workers: list[_DeviceWorker] = []
 
         print(f"Loading EvalScope tokenizer from {self.model_path}")
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -124,35 +157,96 @@ class GEMQEvalScopeAPI(ModelAPI):
                 "use prompt_format=raw for a base completion model"
             )
 
-        print(f"Loading GEMQ checkpoint for EvalScope from {self.model_path}")
-        self.model = load_quantized_model(
-            self.model_path,
-            compute_dtype=torch.float16,
-            device=self.device,
-            trust_remote_code=self.trust_remote_code,
-        )
-        align_deepseek_softmax_scale(self.model)
-        prepare_for_inference(
-            self.model,
-            self.base_model_name,
-            is_fp=False,
-        )
-        self.model.eval()
+        try:
+            for worker_id, worker_device in enumerate(self.devices):
+                model = self._load_model(worker_device)
+                self._workers.append(
+                    _DeviceWorker(
+                        worker_id=worker_id,
+                        device=worker_device,
+                        model=model,
+                        request_queue=queue.Queue(maxsize=max_queue_size),
+                    )
+                )
 
-        self._request_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
-        self._shutdown_event = threading.Event()
-        self._lifecycle_lock = threading.Lock()
-        self._worker_thread = threading.Thread(
-            target=self._batch_worker,
-            name="gemq-evalscope-batch-worker",
-            daemon=True,
-        )
-        self._worker_thread.start()
+            self._model_config = self._workers[0].model.config
+            self._generation_config = getattr(
+                self._workers[0].model,
+                "generation_config",
+                None,
+            )
+            for worker in self._workers:
+                worker.thread = threading.Thread(
+                    target=self._batch_worker,
+                    args=(worker,),
+                    name=f"gemq-evalscope-{worker.device}-worker",
+                    daemon=True,
+                )
+                worker.thread.start()
+        except Exception:
+            self._shutdown_event.set()
+            for worker in self._workers:
+                if worker.thread is not None and worker.thread.is_alive():
+                    worker.request_queue.put_nowait(_STOP_WORKER)
+                    worker.thread.join(timeout=5.0)
+            self._workers.clear()
+            raise
+
         atexit.register(self.close)
         print(
             "GEMQ EvalScope adapter is ready "
-            f"(model={self.model_name}, dtype=torch.float16, prompt_format={self.prompt_format})"
+            f"(model={self.model_name}, devices={self.devices}, dtype=torch.float16, "
+            f"prompt_format={self.prompt_format}, "
+            f"per_device_batch_size={self.per_device_batch_size_cap or 'auto'})"
         )
+
+    @staticmethod
+    def _normalize_devices(
+        device: Optional[str],
+        devices: Optional[list[str]],
+    ) -> list[str]:
+        if device is not None and devices is not None:
+            raise ValueError("Specify either device or devices, not both")
+        requested = list(devices) if devices is not None else [device or "cuda"]
+        if not requested:
+            raise ValueError("devices must contain at least one CUDA device")
+
+        device_count = torch.cuda.device_count()
+        normalized: list[str] = []
+        for value in requested:
+            parsed = torch.device(value)
+            if parsed.type != "cuda":
+                raise ValueError("GEMQ real-quant inference currently requires CUDA devices")
+            index = parsed.index
+            if index is None:
+                index = torch.cuda.current_device()
+            if index < 0 or index >= device_count:
+                raise ValueError(
+                    f"CUDA device index {index} is unavailable; visible device count is {device_count}"
+                )
+            canonical = f"cuda:{index}"
+            if canonical in normalized:
+                raise ValueError(f"Duplicate CUDA device: {canonical}")
+            normalized.append(canonical)
+        return normalized
+
+    def _load_model(self, device: str) -> Any:
+        requested_device = torch.device(device)
+        torch.cuda.set_device(requested_device)
+        print(f"Loading GEMQ checkpoint for EvalScope from {self.model_path} on {device}")
+        model = load_quantized_model(
+            self.model_path,
+            compute_dtype=torch.float16,
+            device=device,
+            trust_remote_code=self.trust_remote_code,
+        )
+        align_deepseek_softmax_scale(model)
+        prepare_for_inference(
+            model,
+            self.base_model_name,
+            is_fp=False,
+        )
+        return model.eval()
 
     def _resolve_prompt_format(self, prompt_format: str) -> str:
         if prompt_format != "auto":
@@ -192,6 +286,16 @@ class GEMQEvalScopeAPI(ModelAPI):
             return None
         normalized = [item for item in stop_sequences if item]
         return normalized or None
+
+    def _worker_batch_size(self, global_batch_size: int) -> int:
+        if global_batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        if self.per_device_batch_size_cap is not None:
+            return min(global_batch_size, self.per_device_batch_size_cap)
+        return max(
+            1,
+            (global_batch_size + len(self.devices) - 1) // len(self.devices),
+        )
 
     def _prepare_job(
         self,
@@ -236,24 +340,20 @@ class GEMQEvalScopeAPI(ModelAPI):
             )
         input_ids = encoded.input_ids[0]
         prompt_tokens = int(input_ids.numel())
-        max_position = int(
-            getattr(
-                self.model.config,
-                "max_position_embeddings",
-                prompt_tokens + max_tokens,
-            )
+        configured_max_position = getattr(
+            self._model_config,
+            "max_position_embeddings",
+            None,
         )
+        max_position = int(configured_max_position or (prompt_tokens + max_tokens))
         max_new_tokens = min(int(max_tokens), max_position - prompt_tokens)
         if max_new_tokens < 1:
             raise ValueError(
                 f"Prompt has {prompt_tokens} tokens and exceeds the model context window"
             )
 
-        requested_batch_size = config.batch_size or 1
-        if requested_batch_size < 1:
-            raise ValueError("batch_size must be at least 1")
-        if self.max_batch_size_cap is not None:
-            requested_batch_size = min(requested_batch_size, self.max_batch_size_cap)
+        global_batch_size = int(config.batch_size or 1)
+        worker_batch_size = self._worker_batch_size(global_batch_size)
         return _GenerationJob(
             input_ids=input_ids,
             prompt_tokens=prompt_tokens,
@@ -261,7 +361,7 @@ class GEMQEvalScopeAPI(ModelAPI):
             temperature=temperature,
             top_k=top_k,
             stop_sequences=self._normalize_stop_sequences(config.stop_seqs),
-            max_batch_size=max(1, int(requested_batch_size)),
+            max_batch_size=worker_batch_size,
             submitted_at=submitted_at,
             enqueued_at=time.perf_counter(),
             future=concurrent.futures.Future(),
@@ -274,22 +374,19 @@ class GEMQEvalScopeAPI(ModelAPI):
         tool_choice: ToolChoice,
         config: GenerateConfig,
     ) -> ModelOutput:
-        """Enqueue one EvalScope sample and return its local GEMQ output."""
+        """Route one EvalScope sample to a local GEMQ device worker."""
         if tools:
             raise ValueError("GEMQ local evaluation does not support tool calls")
         if tool_choice not in (None, "none", "auto"):
             raise ValueError("GEMQ local evaluation does not support tool_choice")
+
         submitted_at = time.perf_counter()
         job = self._prepare_job(input, config, submitted_at)
         with self._lifecycle_lock:
             if self._shutdown_event.is_set():
-                raise RuntimeError("GEMQ EvalScope worker is shutting down")
-            if not self._worker_thread.is_alive():
-                raise RuntimeError("GEMQ EvalScope worker stopped unexpectedly")
-            try:
-                self._request_queue.put_nowait(job)
-            except queue.Full as exc:
-                raise RuntimeError("GEMQ EvalScope generation queue is full") from exc
+                raise RuntimeError("GEMQ EvalScope workers are shutting down")
+            self._enqueue_job(job)
+
         timeout = None
         if config.timeout is not None:
             timeout = max(0.0, config.timeout - (time.perf_counter() - submitted_at))
@@ -302,6 +399,55 @@ class GEMQEvalScopeAPI(ModelAPI):
             raise TimeoutError(
                 f"GEMQ generation exceeded the configured timeout of {config.timeout} seconds"
             ) from exc
+
+    def _enqueue_job(self, job: _GenerationJob) -> _DeviceWorker:
+        with self._dispatch_lock:
+            available: list[_DeviceWorker] = []
+            for worker in self._workers:
+                thread_alive = worker.thread is not None and worker.thread.is_alive()
+                if worker.healthy and thread_alive:
+                    available.append(worker)
+                elif worker.healthy and worker.thread is not None:
+                    worker.healthy = False
+                    worker.failure = "worker thread stopped unexpectedly"
+
+            if not available:
+                failures = "; ".join(
+                    f"{worker.device}: {worker.failure or 'unavailable'}"
+                    for worker in self._workers
+                )
+                raise RuntimeError(f"No healthy GEMQ device workers are available ({failures})")
+
+            worker_count = len(self._workers)
+            candidates = sorted(
+                available,
+                key=lambda worker: (
+                    worker.outstanding_jobs,
+                    (worker.worker_id - self._next_worker_index) % worker_count,
+                ),
+            )
+            for worker in candidates:
+                job.assigned_worker_id = worker.worker_id
+                job.assignment_finished = False
+                worker.outstanding_jobs += 1
+                try:
+                    worker.request_queue.put_nowait(job)
+                except queue.Full:
+                    worker.outstanding_jobs -= 1
+                    job.assigned_worker_id = None
+                    continue
+                self._next_worker_index = (worker.worker_id + 1) % worker_count
+                return worker
+
+        raise RuntimeError("All GEMQ device generation queues are full")
+
+    def _complete_assignment(self, worker: _DeviceWorker, job: _GenerationJob) -> None:
+        with self._dispatch_lock:
+            if job.assignment_finished:
+                return
+            job.assignment_finished = True
+            if job.assigned_worker_id == worker.worker_id:
+                worker.outstanding_jobs = max(0, worker.outstanding_jobs - 1)
 
     @staticmethod
     def _batch_key(job: _GenerationJob) -> tuple[float, Optional[int], int]:
@@ -320,105 +466,147 @@ class GEMQEvalScopeAPI(ModelAPI):
         new_max = max(max_prompt_tokens, candidate.prompt_tokens)
         return new_max - new_min <= self.max_batch_padding_tokens
 
-    def _batch_worker(self) -> None:
-        requested_device = torch.device(self.device)
-        if requested_device.index is not None:
+    def _batch_worker(self, worker: _DeviceWorker) -> None:
+        requested_device = torch.device(worker.device)
+        if requested_device.type == "cuda":
             torch.cuda.set_device(requested_device)
 
         pending: collections.deque[_GenerationJob] = collections.deque()
-        while True:
-            if self._shutdown_event.is_set():
-                self._fail_pending(pending)
-                break
-            if pending:
-                first_job = pending.popleft()
-            else:
-                item = self._request_queue.get()
-                if item is _STOP_WORKER:
+        active_jobs: list[_GenerationJob] = []
+        try:
+            while True:
+                if self._shutdown_event.is_set():
+                    self._fail_pending(worker, pending)
                     break
-                first_job = item
-            if first_job.future.cancelled():
-                continue
-
-            jobs = [first_job]
-            batch_key = self._batch_key(first_job)
-            max_batch_size = first_job.max_batch_size
-            min_prompt_tokens = first_job.prompt_tokens
-            max_prompt_tokens = first_job.prompt_tokens
-            deadline = time.monotonic() + self.batch_wait_ms / 1000.0
-
-            for _ in range(len(pending)):
-                candidate = pending.popleft()
-                if candidate.future.cancelled():
-                    continue
-                if len(jobs) < max_batch_size and self._can_join_batch(
-                    candidate,
-                    batch_key,
-                    min_prompt_tokens,
-                    max_prompt_tokens,
-                ):
-                    jobs.append(candidate)
-                    min_prompt_tokens = min(min_prompt_tokens, candidate.prompt_tokens)
-                    max_prompt_tokens = max(max_prompt_tokens, candidate.prompt_tokens)
+                if pending:
+                    first_job = pending.popleft()
                 else:
-                    pending.append(candidate)
+                    item = worker.request_queue.get()
+                    if item is _STOP_WORKER:
+                        break
+                    first_job = item
+                if first_job.future.cancelled():
+                    self._complete_assignment(worker, first_job)
+                    continue
 
-            while len(jobs) < max_batch_size:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+                active_jobs = [first_job]
+                batch_key = self._batch_key(first_job)
+                max_batch_size = first_job.max_batch_size
+                min_prompt_tokens = first_job.prompt_tokens
+                max_prompt_tokens = first_job.prompt_tokens
+                deadline = time.monotonic() + self.batch_wait_ms / 1000.0
+
+                for _ in range(len(pending)):
+                    candidate = pending.popleft()
+                    if candidate.future.cancelled():
+                        self._complete_assignment(worker, candidate)
+                        continue
+                    if len(active_jobs) < max_batch_size and self._can_join_batch(
+                        candidate,
+                        batch_key,
+                        min_prompt_tokens,
+                        max_prompt_tokens,
+                    ):
+                        active_jobs.append(candidate)
+                        min_prompt_tokens = min(min_prompt_tokens, candidate.prompt_tokens)
+                        max_prompt_tokens = max(max_prompt_tokens, candidate.prompt_tokens)
+                    else:
+                        pending.append(candidate)
+
+                while len(active_jobs) < max_batch_size:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = worker.request_queue.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    if item is _STOP_WORKER:
+                        self._shutdown_event.set()
+                        break
+                    if item.future.cancelled():
+                        self._complete_assignment(worker, item)
+                        continue
+                    if self._can_join_batch(
+                        item,
+                        batch_key,
+                        min_prompt_tokens,
+                        max_prompt_tokens,
+                    ):
+                        active_jobs.append(item)
+                        min_prompt_tokens = min(min_prompt_tokens, item.prompt_tokens)
+                        max_prompt_tokens = max(max_prompt_tokens, item.prompt_tokens)
+                    else:
+                        pending.append(item)
+
                 try:
-                    item = self._request_queue.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if item is _STOP_WORKER:
-                    self._shutdown_event.set()
-                    break
-                if item.future.cancelled():
-                    continue
-                if self._can_join_batch(
-                    item,
-                    batch_key,
-                    min_prompt_tokens,
-                    max_prompt_tokens,
-                ):
-                    jobs.append(item)
-                    min_prompt_tokens = min(min_prompt_tokens, item.prompt_tokens)
-                    max_prompt_tokens = max(max_prompt_tokens, item.prompt_tokens)
-                else:
-                    pending.append(item)
+                    outputs = self._run_jobs(worker, active_jobs)
+                    if len(outputs) != len(active_jobs):
+                        raise RuntimeError(
+                            "GEMQ batch returned a different number of outputs than requests"
+                        )
+                    for job, output in zip(active_jobs, outputs):
+                        if not job.future.done():
+                            job.future.set_result(output)
+                except Exception as exc:
+                    for job in active_jobs:
+                        if not job.future.done():
+                            job.future.set_exception(exc)
+                    if isinstance(exc, torch.cuda.OutOfMemoryError):
+                        torch.cuda.empty_cache()
+                finally:
+                    for job in active_jobs:
+                        self._complete_assignment(worker, job)
+                    active_jobs = []
+        except Exception as exc:
+            error = RuntimeError(
+                f"GEMQ device worker {worker.device} stopped unexpectedly: {exc}"
+            )
+            error.__cause__ = exc
+            with self._dispatch_lock:
+                worker.healthy = False
+                worker.failure = str(exc)
+            for job in active_jobs:
+                if not job.future.done():
+                    job.future.set_exception(error)
+                self._complete_assignment(worker, job)
+            self._fail_pending(worker, pending, error)
+            print(error)
 
-            try:
-                outputs = self._run_jobs(jobs)
-                if len(outputs) != len(jobs):
-                    raise RuntimeError("GEMQ batch returned a different number of outputs than requests")
-                for job, output in zip(jobs, outputs):
-                    if not job.future.done():
-                        job.future.set_result(output)
-            except Exception as exc:
-                for job in jobs:
-                    if not job.future.done():
-                        job.future.set_exception(exc)
-
-    def _fail_pending(self, pending: collections.deque[_GenerationJob]) -> None:
-        error = RuntimeError("GEMQ EvalScope worker is shutting down")
-        for job in pending:
+    def _fail_pending(
+        self,
+        worker: _DeviceWorker,
+        pending: collections.deque[_GenerationJob],
+        error: Optional[RuntimeError] = None,
+    ) -> None:
+        failure = error or RuntimeError("GEMQ EvalScope workers are shutting down")
+        while pending:
+            job = pending.popleft()
             if not job.future.done():
-                job.future.set_exception(error)
+                job.future.set_exception(failure)
+            self._complete_assignment(worker, job)
         while True:
             try:
-                item = self._request_queue.get_nowait()
+                item = worker.request_queue.get_nowait()
             except queue.Empty:
                 break
-            if item is not _STOP_WORKER and not item.future.done():
-                item.future.set_exception(error)
+            if item is _STOP_WORKER:
+                continue
+            if not item.future.done():
+                item.future.set_exception(failure)
+            self._complete_assignment(worker, item)
 
-    def _run_jobs(self, jobs: list[_GenerationJob]) -> list[ModelOutput]:
+    def _run_jobs(
+        self,
+        worker: _DeviceWorker,
+        jobs: list[_GenerationJob],
+    ) -> list[ModelOutput]:
         batch_started_at = time.perf_counter()
         if len(jobs) == 1:
-            token_ids, stats = self._generate_one(jobs[0])
+            token_ids, stats = self._generate_one(worker, jobs[0])
             return [
                 self._build_output(
+                    worker,
                     jobs[0],
                     token_ids,
                     stats,
@@ -429,8 +617,8 @@ class GEMQEvalScopeAPI(ModelAPI):
 
         eos_token_ids = self._get_eos_token_ids()
         result = batched_generate.generate_batch(
-            self.model,
-            prompts=[job.input_ids.to(self.device) for job in jobs],
+            worker.model,
+            prompts=[job.input_ids.to(worker.device) for job in jobs],
             max_new_tokens=[job.max_new_tokens for job in jobs],
             pad_token_id=self._pad_token_id(eos_token_ids),
             eos_token_ids=eos_token_ids,
@@ -449,6 +637,7 @@ class GEMQEvalScopeAPI(ModelAPI):
             }
             outputs.append(
                 self._build_output(
+                    worker,
                     job,
                     result.token_ids[index],
                     stats,
@@ -459,14 +648,18 @@ class GEMQEvalScopeAPI(ModelAPI):
         return outputs
 
     @torch.inference_mode()
-    def _generate_one(self, job: _GenerationJob) -> tuple[list[int], dict[str, Any]]:
-        input_ids = job.input_ids.to(self.device)
+    def _generate_one(
+        self,
+        worker: _DeviceWorker,
+        job: _GenerationJob,
+    ) -> tuple[list[int], dict[str, Any]]:
+        input_ids = job.input_ids.to(worker.device)
         cache = StaticCache(
-            self.model.config,
+            worker.model.config,
             max_cache_len=job.prompt_tokens + job.max_new_tokens,
         )
         output, stats = benchmark_generate.generate(
-            self.model,
+            worker.model,
             input_ids,
             max_new_tokens=job.max_new_tokens,
             kv_cache=cache,
@@ -483,8 +676,7 @@ class GEMQEvalScopeAPI(ModelAPI):
         if isinstance(tokenizer_eos, int):
             eos_ids.add(tokenizer_eos)
 
-        generation_config = getattr(self.model, "generation_config", None)
-        config_eos = getattr(generation_config, "eos_token_id", None)
+        config_eos = getattr(self._generation_config, "eos_token_id", None)
         if isinstance(config_eos, int):
             eos_ids.add(config_eos)
         elif isinstance(config_eos, (list, tuple, set)):
@@ -518,6 +710,7 @@ class GEMQEvalScopeAPI(ModelAPI):
 
     def _build_output(
         self,
+        worker: _DeviceWorker,
         job: _GenerationJob,
         token_ids: list[int],
         stats: dict[str, Any],
@@ -560,6 +753,8 @@ class GEMQEvalScopeAPI(ModelAPI):
             time=latency,
             metadata={
                 "gemq": {
+                    "device": worker.device,
+                    "worker_id": worker.worker_id,
                     "batch_size": batch_size,
                     "queue_wait": max(0.0, batch_started_at - job.enqueued_at),
                     "generated_tokens": int(stats["generated_tokens"]),
@@ -576,22 +771,36 @@ class GEMQEvalScopeAPI(ModelAPI):
         return 2048
 
     def max_connections(self) -> int:
-        """Return a conservative default batch size when EvalScope provides none."""
-        return self.max_batch_size_cap or 1
+        """Return the default total number of in-flight EvalScope requests."""
+        per_device = self.per_device_batch_size_cap or 1
+        return max(1, len(self.devices) * per_device)
 
     async def aclose(self) -> None:
-        """Stop the local batch worker."""
+        """Stop all local device workers."""
         self.close()
 
     def close(self) -> None:
-        """Stop accepting work and wake the batch worker."""
-        worker = getattr(self, "_worker_thread", None)
-        if worker is None or not worker.is_alive():
+        """Stop accepting work and wake every device worker."""
+        workers = getattr(self, "_workers", [])
+        shutdown_event = getattr(self, "_shutdown_event", None)
+        lifecycle_lock = getattr(self, "_lifecycle_lock", None)
+        if not workers or shutdown_event is None or lifecycle_lock is None:
             return
-        with self._lifecycle_lock:
-            if self._shutdown_event.is_set():
-                return
-            self._shutdown_event.set()
-            self._fail_pending(collections.deque())
-            self._request_queue.put_nowait(_STOP_WORKER)
-        worker.join(timeout=5.0)
+
+        with lifecycle_lock:
+            if not shutdown_event.is_set():
+                shutdown_event.set()
+                for worker in workers:
+                    self._fail_pending(worker, collections.deque())
+                for worker in workers:
+                    if worker.thread is not None and worker.thread.is_alive():
+                        worker.request_queue.put_nowait(_STOP_WORKER)
+
+        current_thread = threading.current_thread()
+        for worker in workers:
+            if (
+                worker.thread is not None
+                and worker.thread is not current_thread
+                and worker.thread.is_alive()
+            ):
+                worker.thread.join(timeout=5.0)
