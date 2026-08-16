@@ -1,4 +1,4 @@
-"""Static micro-batch generation for GEMQ's OpenAI-compatible server.
+"""Static micro-batch generation for GEMQ's local inference paths.
 
 The implementation intentionally starts with the existing multi-token MoE path for
 ``batch_size > 1``.  It establishes correct padding, cache, sampling, and per-request

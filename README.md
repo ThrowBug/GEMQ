@@ -91,7 +91,50 @@ Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the
 > Decoding is fully fused; prefill still loops over hit experts in Python, so its throughput is dominated by kernel launch overhead and scales with depth and expert count rather than with prompt length.
 
 
-### 4. OpenAI-Compatible API
+### 4. Local EvalScope Evaluation
+
+For evaluation on the same machine, use the local EvalScope adapter instead of
+starting an HTTP server. Install both checkouts in the inference environment:
+
+```bash
+pip install -e ../evalscope
+pip install -e ".[evalscope]"
+```
+
+The local EvalScope checkout registers `--eval-type gemq` and lazily imports the
+adapter from this package. Evaluate a checkpoint directly with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 evalscope eval \
+    --model results/real_quant_models/deepseek-ai/DeepSeek-V2-Lite/GEMQ/C4-Seed0-WT2_A4-G16-D4-E2.0_RFT \
+    --model-id gemq-deepseek-v2-lite \
+    --eval-type gemq \
+    --datasets gsm8k \
+    --eval-batch-size 4 \
+    --judge-strategy rule \
+    --model-args '{
+        "base_model_name": "deepseek-ai/DeepSeek-V2-Lite",
+        "device": "cuda",
+        "prompt_format": "raw",
+        "eos_check_interval": 8,
+        "batch_wait_ms": 20,
+        "max_batch_padding_tokens": 256
+    }' \
+    --generation-config '{
+        "max_tokens": 128,
+        "temperature": 0,
+        "top_p": 1
+    }'
+```
+
+`--eval-batch-size` controls both EvalScope's producer threads and GEMQ's maximum
+physical model batch. Compatible calls are collected for up to `batch_wait_ms`, left
+padded, and sent through one batched KV cache. Set it to `1` to use the original
+single-token fused decode path. The first batched implementation uses
+`forward_n_tokens`; benchmark batch sizes `1`, `2`, `4`, and `8` on the target GPU.
+
+
+### 5. OpenAI-Compatible API
 
 Install the optional API dependencies:
 
