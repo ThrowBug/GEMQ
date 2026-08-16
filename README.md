@@ -108,13 +108,17 @@ CUDA_VISIBLE_DEVICES=0 python -m gemq.openai_server \
     --served-model-name gemq-deepseek-v2-lite \
     --prompt-format raw \
     --eos-check-interval 8 \
+    --max-batch-size 4 \
+    --batch-wait-ms 20 \
+    --max-batch-padding-tokens 256 \
     --host 0.0.0.0 \
     --port 8000
 ```
 
 The server exposes `GET /health`, `GET /v1/models`, and `POST /v1/chat/completions`.
-Streaming and concurrent GPU generation are not currently supported; requests are
-serialized inside the server. For EvalScope, use API mode and disable streaming:
+Streaming is not supported. The background generation worker can combine compatible
+concurrent requests into a static model batch. For EvalScope, use API mode, disable
+streaming, and provide enough client workers to fill the server batch:
 
 ```bash
 evalscope eval \
@@ -123,7 +127,7 @@ evalscope eval \
     --api-key EMPTY \
     --eval-type openai_api \
     --datasets gsm8k arc \
-    --eval-batch-size 1 \
+    --eval-batch-size 8 \
     --generation-config '{"max_tokens": 512, "temperature": 0, "top_p": 1, "stream": false}'
 ```
 
@@ -138,6 +142,16 @@ DeepSeek-V2-Lite checkpoint is a base completion model, so `--prompt-format raw`
 EvalScope's benchmark prompt to it without adding `User:` / `Assistant:` wrappers. Use
 `--prompt-format chat` only for a Chat/Instruct checkpoint. Temperature zero performs
 true greedy decoding directly on the logits and does not pass through softmax.
+
+`--max-batch-size 1` restores the original serial path. For batch sizes above one,
+prompts are left padded and use one batched KV cache; EOS and `max_tokens` are tracked
+per request. Requests whose prompt lengths differ by more than
+`--max-batch-padding-tokens` are split to avoid excessive padding and KV-cache memory.
+The initial implementation deliberately reuses GEMQ's existing
+`forward_n_tokens` MoE path for batched decode. Benchmark `1`, `2`, `4`, and `8` on the
+target GPU before choosing a production value: a larger batch raises memory usage and
+may touch more experts, so throughput is not guaranteed to scale linearly. Requests
+with different temperature or top-k settings are placed in separate batches.
 
 
 ## License
