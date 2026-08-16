@@ -2,6 +2,7 @@ import collections
 import concurrent.futures
 import queue
 import threading
+import time
 
 import pytest
 
@@ -10,6 +11,7 @@ pytest.importorskip("evalscope")
 from evalscope.api.messages import ChatMessageUser
 from evalscope.api.model import GenerateConfig, ModelOutput
 
+import gemq.evalscope_adapter as evalscope_adapter
 from gemq.evalscope_adapter import GEMQEvalScopeAPI, _DeviceWorker, _GenerationJob
 
 
@@ -111,6 +113,38 @@ def test_device_normalization_rejects_conflicts_and_duplicate_devices(monkeypatc
         GEMQEvalScopeAPI._normalize_devices("cuda:0", ["cuda:1"])
     with pytest.raises(ValueError, match="Duplicate CUDA device"):
         GEMQEvalScopeAPI._normalize_devices(None, ["cuda", "cuda:0"])
+
+
+def test_triton_autotuner_calls_are_serialized_across_worker_threads(monkeypatch):
+    state_lock = threading.Lock()
+    active_calls = 0
+    peak_active_calls = 0
+
+    class FakeAutotuner:
+        def run(self):
+            nonlocal active_calls, peak_active_calls
+            with state_lock:
+                active_calls += 1
+                peak_active_calls = max(peak_active_calls, active_calls)
+            time.sleep(0.02)
+            with state_lock:
+                active_calls -= 1
+
+    monkeypatch.setattr("triton.runtime.autotuner.Autotuner", FakeAutotuner)
+    monkeypatch.setattr(evalscope_adapter, "_TRITON_AUTOTUNER_PATCHED", False)
+
+    evalscope_adapter._install_thread_safe_triton_autotuner()
+    installed_run = FakeAutotuner.run
+    evalscope_adapter._install_thread_safe_triton_autotuner()
+    assert FakeAutotuner.run is installed_run
+
+    autotuner = FakeAutotuner()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(autotuner.run) for _ in range(2)]
+        for future in futures:
+            future.result()
+
+    assert peak_active_calls == 1
 
 
 def test_batch_compatibility_checks_sampling_batch_size_and_padding():

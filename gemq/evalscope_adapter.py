@@ -11,6 +11,7 @@ from __future__ import annotations
 import atexit
 import collections
 import concurrent.futures
+import functools
 import queue
 import threading
 import time
@@ -66,6 +67,44 @@ class _DeviceWorker:
 
 
 _STOP_WORKER = object()
+
+# Triton's Autotuner stores the arguments for the current invocation on the
+# Autotuner instance (``self.nargs``).  A decorated kernel is a process-global
+# object, so two device worker threads can overwrite that field while either
+# invocation is still benchmarking or launching a config.  This manifests as
+# ``TypeError: 'NoneType' object is not a mapping`` inside Autotuner.run.
+#
+# Serializing Autotuner.run fixes the shared Python state without serializing a
+# complete model forward.  Cached calls only hold this lock while submitting a
+# kernel; CUDA execution on separate devices remains asynchronous.
+_TRITON_AUTOTUNER_RUN_LOCK = threading.RLock()
+_TRITON_AUTOTUNER_PATCH_LOCK = threading.Lock()
+_TRITON_AUTOTUNER_PATCHED = False
+
+
+def _install_thread_safe_triton_autotuner() -> None:
+    """Serialize process-global Triton autotuners used by GPU worker threads."""
+
+    global _TRITON_AUTOTUNER_PATCHED
+    with _TRITON_AUTOTUNER_PATCH_LOCK:
+        if _TRITON_AUTOTUNER_PATCHED:
+            return
+
+        from triton.runtime.autotuner import Autotuner
+
+        current_run = Autotuner.run
+        if getattr(current_run, "_gemq_thread_serialized", False):
+            _TRITON_AUTOTUNER_PATCHED = True
+            return
+
+        @functools.wraps(current_run)
+        def serialized_run(self: Any, *args: Any, **kwargs: Any) -> Any:
+            with _TRITON_AUTOTUNER_RUN_LOCK:
+                return current_run(self, *args, **kwargs)
+
+        serialized_run._gemq_thread_serialized = True  # type: ignore[attr-defined]
+        Autotuner.run = serialized_run
+        _TRITON_AUTOTUNER_PATCHED = True
 
 
 class GEMQEvalScopeAPI(ModelAPI):
@@ -126,6 +165,8 @@ class GEMQEvalScopeAPI(ModelAPI):
         self.model_path = model_path or model_name
         self.base_model_name = base_model_name
         self.devices = self._normalize_devices(device=device, devices=devices)
+        if len(self.devices) > 1:
+            _install_thread_safe_triton_autotuner()
         self.device = self.devices[0]
         self.trust_remote_code = trust_remote_code
         self.prompt_format = self._resolve_prompt_format(prompt_format)
