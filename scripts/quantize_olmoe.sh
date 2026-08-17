@@ -39,7 +39,7 @@ downstream_tasks="piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande,mathqa,
 # ===============================
 #  I/O settings
 # ===============================
-real_quant=true           # whether to pack + save INT weights (set false for pseudo quantization)
+real_quant=false          # whether to pack + save INT weights (false saves pseudo-quantized FP weights)
 save_model=true           # whether to save the quantized model
 
 

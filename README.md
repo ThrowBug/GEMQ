@@ -91,6 +91,56 @@ Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the
 > Decoding is fully fused; prefill still loops over hit experts in Python, so its throughput is dominated by kernel launch overhead and scales with depth and expert count rather than with prompt length.
 
 
+### OLMoE-1B-7B-0125-Instruct: BF16 fake quantization and vLLM
+
+The OLMoE-0125 workflow intentionally uses `real_quant=false`. GEMQ performs
+quantize-dequantize once and saves the approximate weights as a standard BF16
+Hugging Face checkpoint. vLLM then loads those weights directly; it does not
+enable a vLLM quantizer, unpack weights, or call GEMQ inference patches.
+
+Generate the model-specific allocation and fake-quant checkpoint in the GEMQ
+environment:
+
+```bash
+bash scripts/compute_stats_olmoe_0125_instruct.sh
+bash scripts/allocate_olmoe_0125_instruct.sh
+bash scripts/quantize_olmoe_0125_instruct.sh
+```
+
+Start the fake-quant model in the separate vLLM environment. The default is one
+GPU with BF16 weights and a BF16 KV cache (`kv-cache-dtype=auto` follows the
+model dtype):
+
+```bash
+MODEL_VARIANT=FQ CUDA_VISIBLE_DEVICES=0 \
+    bash scripts/serve_vllm_olmoe_0125_instruct.sh
+```
+
+Set `MODEL_VARIANT=FP` to serve the original Hugging Face checkpoint. Two data
+parallel replicas can be requested with
+`CUDA_VISIBLE_DEVICES=0,1 DATA_PARALLEL_SIZE=2`; tensor parallelism is controlled
+independently by `TENSOR_PARALLEL_SIZE`.
+
+With the server running, measure API throughput and latency from the vLLM
+environment:
+
+```bash
+MODEL_VARIANT=FQ bash scripts/bench_vllm_olmoe_0125_instruct.sh
+```
+
+Run GSM8K accuracy evaluation from the GEMQ/EvalScope environment. Omitting
+`LIMIT` evaluates the full dataset:
+
+```bash
+MODEL_VARIANT=FQ LIMIT=10 bash scripts/eval_vllm_olmoe_0125_instruct.sh
+```
+
+The service, performance benchmark, and EvalScope scripts share `VLLM_HOST`,
+`VLLM_PORT`, `VLLM_API_KEY`, `MODEL_VARIANT`, and `SERVED_MODEL_NAME`. See the
+scripts for the additional path, concurrency, sequence-length, and generation
+overrides.
+
+
 ## License
 
 Released under the [MIT License](LICENSE).
