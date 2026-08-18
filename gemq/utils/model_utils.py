@@ -333,6 +333,35 @@ def get_router_params(model, model_name):
     return router_params
 
 
+def get_router_module(layer, model_name):
+    """Return the single router module in a decoder layer."""
+    routers = []
+    for name, module in get_named_linears(layer).items():
+        if get_module_type(name, model_name) == LinearModuleType.GATE:
+            routers.append((name, module))
+    if len(routers) != 1:
+        raise ValueError(f"Expected exactly one router in a decoder layer, found {len(routers)}.")
+    return routers[0]
+
+
+def get_router_modules(model, model_name):
+    """Return one ``(qualified_name, module)`` pair per decoder layer."""
+    routers = []
+    for layer_idx, layer in enumerate(get_blocks(model, model_name)):
+        name, module = get_router_module(layer, model_name)
+        routers.append((f"{layer_idx}.{name}", module))
+    return routers
+
+
+def extract_router_logits(router_output):
+    """Normalize router outputs across HF implementations."""
+    if torch.is_tensor(router_output):
+        return router_output
+    if isinstance(router_output, (tuple, list)) and router_output and torch.is_tensor(router_output[0]):
+        return router_output[0]
+    raise TypeError(f"Could not extract router logits from output type {type(router_output)!r}.")
+
+
 def compute_decoder_inputs(model, dataloader, model_name, device="cuda"):
     """
     Prepare input data for the first decoder block, and shared kwargs for all blocks.

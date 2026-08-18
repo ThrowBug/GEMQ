@@ -17,6 +17,20 @@ from gemq.utils.model_utils import *
 from gemq.utils.quant_utils import *
 from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
 from gemq.utils.hf_loading import align_deepseek_softmax_scale
+from gemq.router_finetune.config import (
+    RFT_TIMINGS,
+    RFT_TRAINERS,
+    ROUTER_LOSS_TYPES,
+    RouterFinetuneConfig,
+)
+from gemq.router_finetune.targets import (
+    get_or_collect_teacher_targets,
+    materialize_calibration_inputs,
+)
+from gemq.router_finetune.trainer import (
+    finetune_router_after_layer_quantization,
+    finetune_routers_after_all_quantization,
+)
 
 logging.set_verbosity_error()
 
@@ -112,7 +126,9 @@ def finetune_routers(model, dataloader, args):
 
 
 @torch.no_grad()
-def quantize_weights_gptq(model, dataloader, args):
+def quantize_weights_gptq(
+    model, dataloader, args, router_ft_config=None, teacher_targets=None
+):
     """
     Perform mixed-precision weight-only quantization with GPTQ quantizer.
     At the end of this function, the model weights are replaced with dequantized weights in fp16.
@@ -193,7 +209,7 @@ def quantize_weights_gptq(model, dataloader, args):
                     partial(update_hessian_hook, quantizer=quantizers[name])
                 )
             )
-        for j in range(args.nsamples):
+        for j in range(inps.shape[0]):
             outs[j] = layer(inps[j: j+1], **layer_kwargs)[0]
         for h in handles:
             h.remove()
@@ -226,10 +242,26 @@ def quantize_weights_gptq(model, dataloader, args):
             if args.verbose:
                 print(f"| {name:<30} | {quantizers[name].nbits:<3} | {quantizers[name].groupsize:>4} | {elapse:>9.2f} |")
 
+        if (
+            router_ft_config is not None
+            and router_ft_config.timing == "after_each_layer_quantization"
+        ):
+            print(f"Fine-tuning router immediately after quantizing layer {i} ...")
+            finetune_router_after_layer_quantization(
+                layer,
+                i,
+                inps,
+                outs,
+                layer_kwargs,
+                teacher_targets,
+                args.model_name,
+                router_ft_config,
+            )
+
         # compute layer outputs using quantized weights
         start = time.time()
 
-        for j in range(args.nsamples):
+        for j in range(inps.shape[0]):
             outs[j] = layer(inps[j: j+1], **layer_kwargs)[0]
 
         elapse = time.time() - start
@@ -383,6 +415,33 @@ def parse_args():
         help="Whether to finetune the router modules after quantization"
     )
     parser.add_argument(
+        "--rft_trainer", type=str, default="legacy_ce",
+        choices=RFT_TRAINERS,
+        help="Use the unchanged CE baseline or teacher-guided layer-wise router fine-tuning"
+    )
+    parser.add_argument(
+        "--rft_timing", type=str, default="after_all_quantization",
+        choices=RFT_TIMINGS,
+        help="Fine-tune routers after all layers are quantized or immediately after each layer"
+    )
+    parser.add_argument(
+        "--rft_router_loss", type=str, default="kd",
+        choices=ROUTER_LOSS_TYPES,
+        help="Teacher-guided layer-wise router loss"
+    )
+    parser.add_argument(
+        "--rft_router_alpha", type=float, default=0.0,
+        help="Fraction of non-top-k teacher experts included in the router loss"
+    )
+    parser.add_argument(
+        "--rft_router_loss_weight", type=float, default=1.0,
+        help="Weight of the layer-wise router loss"
+    )
+    parser.add_argument(
+        "--rft_output_kl_weight", type=float, default=0.0,
+        help="Weight of the full-vocabulary teacher/student output KL"
+    )
+    parser.add_argument(
         "--rft_epochs", type=int, default=1,
         help="Number of epochs for the router fine-tuning"
     )
@@ -397,6 +456,14 @@ def parse_args():
     parser.add_argument(
         "--rft_wd", type=float, default=0.0001,
         help="Weight decay for the router fine-tuning"
+    )
+    parser.add_argument(
+        "--rft_teacher_cache_dir", type=str, default="cache/router_finetune",
+        help="Base directory for validated full-precision teacher targets"
+    )
+    parser.add_argument(
+        "--rft_rebuild_teacher_cache", action="store_true",
+        help="Recompute teacher targets even when a matching cache exists"
     )
 
     # evaluation args
@@ -459,25 +526,63 @@ if __name__ == "__main__":
     print("Loading calibration data ...")
     dataloader = get_calib_loader(tokenizer, args)
 
+    router_ft_config = None
+    teacher_targets = None
+    if args.finetune_routers and args.rft_trainer == "layerwise_teacher":
+        if args.eval_fp:
+            raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
+        router_ft_config = RouterFinetuneConfig.from_args(args)
+        calibration_input_ids, calibration_attention_mask = materialize_calibration_inputs(dataloader)
+        teacher_targets = get_or_collect_teacher_targets(
+            model,
+            tokenizer,
+            dataloader,
+            calibration_input_ids,
+            calibration_attention_mask,
+            args,
+            router_ft_config,
+        )
+
     # quantize model weights
     if not args.eval_fp:
         # quantize and get a name-module mapping of quantized modules
         print(f"Start quantizing model weights ...")
         quantizer = args.quantizer.lower().split("-")[0]
         if quantizer == "gptq":
-            quant_modules = quantize_weights_gptq(model, dataloader, args)
+            quant_modules = quantize_weights_gptq(
+                model, dataloader, args, router_ft_config, teacher_targets
+            )
         else:
             raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
     
     # finetune routers
     if args.finetune_routers:
-        model = dispatch_model_to_all_devices(model)
-        
-        print("Evaluating quantized model before fine-tuning ...")
-        evaluate_perplexity(model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False)
+        if args.rft_trainer == "legacy_ce":
+            model = dispatch_model_to_all_devices(model)
 
-        print("Fine-tuning routers ...")
-        finetune_routers(model, dataloader, args)
+            print("Evaluating quantized model before fine-tuning ...")
+            evaluate_perplexity(
+                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
+            )
+
+            print("Fine-tuning routers with legacy autoregressive CE ...")
+            finetune_routers(model, dataloader, args)
+        elif router_ft_config.timing == "after_all_quantization":
+            print("Evaluating quantized model before layer-wise fine-tuning ...")
+            evaluate_perplexity(
+                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=True
+            )
+            if router_ft_config.needs_output_targets:
+                model = dispatch_model_to_all_devices(model)
+            print("Fine-tuning routers layer by layer ...")
+            finetune_routers_after_all_quantization(
+                model, dataloader, teacher_targets, args, router_ft_config
+            )
+            if router_ft_config.is_router_only:
+                model = dispatch_model_to_all_devices(model)
+        else:
+            # Interleaved fine-tuning already happened inside quantize_weights_gptq.
+            model = dispatch_model_to_all_devices(model)
 
     # evaluate model
     print("Evaluating model ...")
@@ -506,6 +611,11 @@ if __name__ == "__main__":
     if args.save_path:
         print("Saving model ...")
         os.makedirs(args.save_path, exist_ok=True)
+        if router_ft_config is not None:
+            with open(
+                os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(vars(router_ft_config), f, indent=4)
 
         if args.real_quant:
             # for real quant, replace nn.Linear to HQQLinear for weight packing and saving

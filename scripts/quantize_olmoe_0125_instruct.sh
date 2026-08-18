@@ -34,8 +34,18 @@ reproduce_mcmoe=true
 #  Router fine-tuning
 # ===============================
 finetune_routers=true
+rft_trainer="layerwise_teacher" # legacy_ce | layerwise_teacher
+rft_timing="after_each_layer_quantization" # after_all_quantization | after_each_layer_quantization
+rft_router_loss="l2" # kd | kd_tail | l2 | l2_center
+rft_router_alpha=0.0
+rft_router_loss_weight=1.0
+rft_output_kl_weight=0.0
 rft_epochs=1
+rft_batch_size=1
 rft_lr=1e-4
+rft_wd=0.0
+rft_teacher_cache_dir="cache/router_finetune"
+rft_rebuild_teacher_cache=false
 
 # ===============================
 #  Evaluation settings
@@ -89,8 +99,33 @@ fi
 
 rft_tag=""
 if [[ "${finetune_routers}" == "true" ]]; then
-    rft_tag="_RFT"
-    quant_args+=(--finetune_routers --rft_epochs "${rft_epochs}" --rft_lr "${rft_lr}")
+    if [[ "${rft_trainer}" == "legacy_ce" ]]; then
+        # Keep the historical checkpoint path for the unchanged CE baseline.
+        rft_tag="_RFT"
+    else
+        timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"
+        alpha_tag="${rft_router_alpha//./p}"
+        router_weight_tag="${rft_router_loss_weight//./p}"
+        output_weight_tag="${rft_output_kl_weight//./p}"
+        rft_tag="_RFT-${timing_tag}-${rft_router_loss}-a${alpha_tag}-rw${router_weight_tag}-ow${output_weight_tag}"
+    fi
+    quant_args+=(
+        --finetune_routers
+        --rft_trainer "${rft_trainer}"
+        --rft_timing "${rft_timing}"
+        --rft_router_loss "${rft_router_loss}"
+        --rft_router_alpha "${rft_router_alpha}"
+        --rft_router_loss_weight "${rft_router_loss_weight}"
+        --rft_output_kl_weight "${rft_output_kl_weight}"
+        --rft_epochs "${rft_epochs}"
+        --rft_batch_size "${rft_batch_size}"
+        --rft_lr "${rft_lr}"
+        --rft_wd "${rft_wd}"
+        --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
+    )
+    if [[ "${rft_rebuild_teacher_cache}" == "true" ]]; then
+        quant_args+=(--rft_rebuild_teacher_cache)
+    fi
 fi
 
 eval_args=()
@@ -120,7 +155,10 @@ echo " Dataset:          ${calib_dataset} (nsamples=${nsamples}, seqlen=${seqlen
 echo " Quantizer:        ${quantizer}"
 echo " Expert bits:      ${bpe} (mixed: ${mixed_prec})"
 echo " Bit config:       ${bit_cfg}"
-echo " Finetune routers: ${finetune_routers} (epochs=${rft_epochs}, lr=${rft_lr})"
+echo " Finetune routers: ${finetune_routers} (trainer=${rft_trainer}, timing=${rft_timing})"
+echo " Router objective: ${rft_router_loss} (alpha=${rft_router_alpha}, weight=${rft_router_loss_weight})"
+echo " Output KL weight: ${rft_output_kl_weight}"
+echo " RFT optimizer:    epochs=${rft_epochs}, batch=${rft_batch_size}, lr=${rft_lr}, wd=${rft_wd}"
 echo " Real quant:       ${real_quant}"
 echo " Save dtype:       ${save_dtype}"
 echo " Save path:        ${save_path}"
