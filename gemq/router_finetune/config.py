@@ -3,7 +3,50 @@ from dataclasses import dataclass
 
 ROUTER_LOSS_TYPES = ("kd", "kd_tail", "l2", "l2_center")
 RFT_TIMINGS = ("after_all_quantization", "after_each_layer_quantization")
-RFT_TRAINERS = ("legacy_ce", "layerwise_teacher")
+RFT_TRAINERS = ("legacy_ce", "distill_ce", "layerwise_teacher")
+
+
+@dataclass(frozen=True)
+class DistillCEConfig:
+    """Configuration for joint router fine-tuning with teacher soft labels."""
+
+    epochs: int
+    batch_size: int
+    learning_rate: float
+    weight_decay: float
+    teacher_cache_dir: str
+    rebuild_teacher_cache: bool
+
+    @classmethod
+    def from_args(cls, args):
+        config = cls(
+            epochs=args.rft_epochs,
+            batch_size=args.rft_batch_size,
+            learning_rate=args.rft_lr,
+            weight_decay=args.rft_wd,
+            teacher_cache_dir=args.rft_teacher_cache_dir,
+            rebuild_teacher_cache=args.rft_rebuild_teacher_cache,
+        )
+        config.validate()
+        return config
+
+    def validate(self):
+        if self.epochs <= 0:
+            raise ValueError("--rft_epochs must be positive.")
+        if self.batch_size <= 0:
+            raise ValueError("--rft_batch_size must be positive.")
+        if self.learning_rate <= 0.0:
+            raise ValueError("--rft_lr must be positive.")
+        if self.weight_decay < 0.0:
+            raise ValueError("--rft_wd must be non-negative.")
+
+    @property
+    def needs_router_targets(self):
+        return False
+
+    @property
+    def needs_output_targets(self):
+        return True
 
 
 @dataclass(frozen=True)

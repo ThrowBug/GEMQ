@@ -3,7 +3,7 @@ import time
 
 import torch
 
-from gemq.router_finetune.losses import compute_output_kl, compute_router_loss
+from gemq.router_finetune.losses import compute_causal_output_kl, compute_router_loss
 from gemq.utils.model_utils import (
     compute_decoder_inputs,
     extract_router_logits,
@@ -231,8 +231,8 @@ def _finetune_after_all_with_output(model, teacher_targets, args, config):
                     teacher_hidden = teacher_targets.final_hidden_states[start:end].to(head_device)
                     teacher_output_logits = model.lm_head(teacher_hidden)
                 batch_token_mask = attention_mask[start:end] if attention_mask is not None else None
-                output_loss = compute_output_kl(
-                    outputs.logits, teacher_output_logits, token_mask=batch_token_mask
+                output_loss = compute_causal_output_kl(
+                    outputs.logits, teacher_output_logits, attention_mask=batch_token_mask
                 )
                 total_loss = config.output_kl_weight * output_loss
 

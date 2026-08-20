@@ -18,11 +18,13 @@ from gemq.utils.quant_utils import *
 from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
 from gemq.utils.hf_loading import align_deepseek_softmax_scale
 from gemq.router_finetune.config import (
+    DistillCEConfig,
     RFT_TIMINGS,
     RFT_TRAINERS,
     ROUTER_LOSS_TYPES,
     RouterFinetuneConfig,
 )
+from gemq.router_finetune.losses import compute_causal_output_distill_ce
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
@@ -121,6 +123,92 @@ def finetune_routers(model, dataloader, args):
                 print("Sum of routers params after finetuning:", gmean)
 
     # restore
+    model = model.to(org_dtype)
+    model.config.use_cache = use_cache
+
+
+def finetune_routers_distill_ce(model, teacher_targets, args):
+    """Fine-tune all routers jointly using full-precision teacher soft labels."""
+    if teacher_targets.final_hidden_states is None:
+        raise RuntimeError("Distilled CE requires cached teacher final hidden states.")
+
+    # Keep the optimizer, model mode, dtype, batching, and trainable parameters aligned
+    # with finetune_routers(); only the hard-label CE objective changes.
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    org_dtype = next(model.parameters()).dtype
+
+    model.train()
+    model = model.to(torch.bfloat16)
+    input_ids = teacher_targets.input_ids
+    if input_ids.shape[0] < args.nsamples:
+        raise ValueError(
+            f"Teacher cache has {input_ids.shape[0]} samples, but --nsamples={args.nsamples}."
+        )
+
+    router_params = get_router_params(model, args.model_name)
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in router_params:
+        p.requires_grad = True
+
+    org_pmean, org_gmean = 0.0, 0.0
+    for name, param in model.named_parameters():
+        if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+            org_gmean += param.mean().item()
+        else:
+            org_pmean += param.mean().item()
+    if args.verbose:
+        print("Router stats before fine-tuning:", org_gmean)
+
+    head_parameter = next(model.lm_head.parameters())
+    head_device = head_parameter.device
+    optimizer = torch.optim.AdamW(router_params, lr=args.rft_lr, weight_decay=args.rft_wd)
+    for epoch in range(args.rft_epochs):
+        loss_sum = 0.0
+        start_time = time.time()
+        for i in range(args.nsamples // args.rft_batch_size):
+            idx = i * args.rft_batch_size
+            end = idx + args.rft_batch_size
+            data = input_ids[idx:end].to("cuda")
+            outputs = model(input_ids=data)
+
+            with torch.no_grad():
+                teacher_hidden = teacher_targets.final_hidden_states[idx:end].to(
+                    device=head_device, dtype=head_parameter.dtype
+                )
+                teacher_output_logits = model.lm_head(teacher_hidden)
+            loss = compute_causal_output_distill_ce(outputs.logits, teacher_output_logits)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_sum += loss.item()
+            if i % 32 == 0:
+                print(f"[epoch {epoch} | iter {i:>3d}] loss: {loss_sum / (i+1):.6f}")
+        elapsed = time.time() - start_time
+        print(
+            f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, "
+            f"elapse: {elapsed:.2f} seconds"
+        )
+
+        if epoch == 0:
+            pmean, gmean = 0.0, 0.0
+            for name, param in model.named_parameters():
+                if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+                    gmean += param.mean().item()
+                else:
+                    pmean += param.mean().item()
+
+            assert math.fabs(org_pmean - pmean) < 1e-8, \
+                "Other parameters are changing during router fine-tuning!"
+            assert math.fabs(org_gmean - gmean) > 1e-10, \
+                "Routers are not changing during fine-tuning!"
+            print("Sanity check passed!")
+            if args.verbose:
+                print("Sum of routers params after finetuning:", gmean)
+
     model = model.to(org_dtype)
     model.config.use_cache = use_cache
 
@@ -417,7 +505,10 @@ def parse_args():
     parser.add_argument(
         "--rft_trainer", type=str, default="legacy_ce",
         choices=RFT_TRAINERS,
-        help="Use the unchanged CE baseline or teacher-guided layer-wise router fine-tuning"
+        help=(
+            "Use hard-label joint CE, teacher soft-label joint CE, or teacher-guided "
+            "layer-wise router fine-tuning"
+        )
     )
     parser.add_argument(
         "--rft_timing", type=str, default="after_all_quantization",
@@ -528,10 +619,13 @@ if __name__ == "__main__":
 
     router_ft_config = None
     teacher_targets = None
-    if args.finetune_routers and args.rft_trainer == "layerwise_teacher":
+    if args.finetune_routers and args.rft_trainer in {"distill_ce", "layerwise_teacher"}:
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
-        router_ft_config = RouterFinetuneConfig.from_args(args)
+        if args.rft_trainer == "distill_ce":
+            router_ft_config = DistillCEConfig.from_args(args)
+        else:
+            router_ft_config = RouterFinetuneConfig.from_args(args)
         calibration_input_ids, calibration_attention_mask = materialize_calibration_inputs(dataloader)
         teacher_targets = get_or_collect_teacher_targets(
             model,
@@ -549,8 +643,11 @@ if __name__ == "__main__":
         print(f"Start quantizing model weights ...")
         quantizer = args.quantizer.lower().split("-")[0]
         if quantizer == "gptq":
+            layerwise_config = (
+                router_ft_config if args.rft_trainer == "layerwise_teacher" else None
+            )
             quant_modules = quantize_weights_gptq(
-                model, dataloader, args, router_ft_config, teacher_targets
+                model, dataloader, args, layerwise_config, teacher_targets
             )
         else:
             raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
@@ -567,6 +664,16 @@ if __name__ == "__main__":
 
             print("Fine-tuning routers with legacy autoregressive CE ...")
             finetune_routers(model, dataloader, args)
+        elif args.rft_trainer == "distill_ce":
+            model = dispatch_model_to_all_devices(model)
+
+            print("Evaluating quantized model before fine-tuning ...")
+            evaluate_perplexity(
+                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
+            )
+
+            print("Fine-tuning routers jointly with distilled autoregressive CE ...")
+            finetune_routers_distill_ce(model, teacher_targets, args)
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
             evaluate_perplexity(
@@ -615,7 +722,7 @@ if __name__ == "__main__":
             with open(
                 os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"
             ) as f:
-                json.dump(vars(router_ft_config), f, indent=4)
+                json.dump({"trainer": args.rft_trainer, **vars(router_ft_config)}, f, indent=4)
 
         if args.real_quant:
             # for real quant, replace nn.Linear to HQQLinear for weight packing and saving

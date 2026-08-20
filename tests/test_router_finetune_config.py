@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gemq.router_finetune.config import RouterFinetuneConfig
+from gemq.router_finetune.config import DistillCEConfig, RFT_TRAINERS, RouterFinetuneConfig
 
 
 def _args(**overrides):
@@ -60,3 +60,22 @@ def test_target_requirements_follow_nonzero_weights():
     assert router_only.needs_router_targets
     assert not router_only.needs_output_targets
     assert router_only.is_router_only
+
+
+def test_distill_ce_has_independent_target_requirements():
+    config = DistillCEConfig.from_args(_args())
+    assert "distill_ce" in RFT_TRAINERS
+    assert not config.needs_router_targets
+    assert config.needs_output_targets
+
+
+def test_distill_ce_does_not_validate_layerwise_loss_arguments():
+    config = DistillCEConfig.from_args(
+        _args(
+            rft_timing="after_each_layer_quantization",
+            rft_router_alpha=99.0,
+            rft_router_loss_weight=0.0,
+            rft_output_kl_weight=0.0,
+        )
+    )
+    assert config.needs_output_targets

@@ -3,6 +3,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from gemq.router_finetune.losses import (  # noqa: E402
+    compute_causal_output_distill_ce,
+    compute_causal_output_kl,
     compute_output_kl,
     compute_router_loss,
 )
@@ -74,3 +76,65 @@ def test_output_kl_is_zero_for_identical_logits_and_honors_mask():
     mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool)
     loss = compute_output_kl(student, teacher, token_mask=mask)
     assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_causal_output_losses_ignore_the_last_position():
+    torch.manual_seed(1)
+    teacher = torch.randn(2, 4, 7)
+    baseline = teacher.clone()
+    changed_last = baseline.clone()
+    changed_last[:, -1, 0] += 100.0
+
+    baseline_ce = compute_causal_output_distill_ce(baseline, teacher)
+    changed_ce = compute_causal_output_distill_ce(changed_last, teacher)
+    changed_kl = compute_causal_output_kl(changed_last, teacher)
+
+    assert torch.allclose(changed_ce, baseline_ce)
+    assert changed_kl.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_causal_output_mask_requires_both_adjacent_tokens():
+    teacher = torch.zeros(1, 4, 3)
+    student = teacher.clone()
+    student[0, 0, 0] = 50.0
+    student[0, 2, 0] = 50.0
+    attention_mask = torch.tensor([[0, 1, 1, 0]], dtype=torch.bool)
+
+    # Only prediction position 1 has both its current and next token unmasked.
+    loss = compute_causal_output_kl(student, teacher, attention_mask)
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    student[0, 1, 0] = 50.0
+    loss = compute_causal_output_kl(student, teacher, attention_mask)
+    assert loss.item() > 1.0
+
+
+def test_distill_ce_and_kl_have_identical_student_gradients():
+    torch.manual_seed(2)
+    teacher = torch.randn(2, 4, 9)
+    student_ce = torch.randn(2, 4, 9, requires_grad=True)
+    student_kl = student_ce.detach().clone().requires_grad_(True)
+
+    ce = compute_causal_output_distill_ce(student_ce, teacher)
+    kl = compute_causal_output_kl(student_kl, teacher)
+    ce_grad = torch.autograd.grad(ce, student_ce)[0]
+    kl_grad = torch.autograd.grad(kl, student_kl)[0]
+
+    assert torch.allclose(ce_grad, kl_grad, atol=1e-7, rtol=1e-6)
+
+
+def test_distill_ce_reduces_to_hard_ce_for_one_hot_teacher():
+    student = torch.tensor(
+        [[[2.0, 0.0, -1.0], [0.0, 3.0, -2.0], [4.0, -1.0, 0.0]]]
+    )
+    teacher = torch.full_like(student, -100.0)
+    teacher[0, 0, 1] = 100.0
+    teacher[0, 1, 2] = 100.0
+    teacher[0, 2, 0] = 100.0
+
+    soft_ce = compute_causal_output_distill_ce(student, teacher)
+    hard_targets = torch.tensor([[1, 2]])
+    hard_ce = torch.nn.functional.cross_entropy(
+        student[:, :-1, :].reshape(-1, student.shape[-1]), hard_targets.reshape(-1)
+    )
+    assert torch.allclose(soft_ce, hard_ce)
