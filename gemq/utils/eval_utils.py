@@ -132,7 +132,7 @@ def compute_perplexity_offload(model, model_name, input_ids, dataset_name):
     return ppl
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def evaluate_perplexity(model, tokenizer, datasets, model_name, offload=True):
     """
     Evaluate the model on a given dataset.
