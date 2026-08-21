@@ -13,6 +13,7 @@ model="${model_name}"
 model_str=""  # Empty means statistics are computed from the original model.
 model_dtype="bfloat16"
 gpus="${CUDA_VISIBLE_DEVICES:-0}"
+wbits="${WBITS:-1,2,3}"
 
 # ===============================
 #  Dataset settings
@@ -43,7 +44,6 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_model_stats \
 # =============================================================================
 #  Step 2: Compute weighted layer reconstruction errors
 # =============================================================================
-wbits="1,2,3"
 layer_re_path="cache/${model_name}/LayerRE_${dataset}-N${nsamples}-L${seqlen}-Seed${seed}_B${wbits}${model_str}_fast.pkl"
 CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_model_stats \
     --mode "layer_re" \

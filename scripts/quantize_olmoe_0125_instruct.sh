@@ -24,26 +24,30 @@ seqlen=2048
 #  Quantization settings
 # ===============================
 quantizer="gptq"
-bpe=2.0
+bpe="${BPE:-2.0}"
+wbits="${WBITS:-1,2,3}"
+extra_constr=${EXTRA_CONSTR:-"c2c3"}
 mixed_prec=true
 allocation_tag="C4-Seed0"
-bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_E${bpe}_B1,2,3_c2c3.pkl"
+bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_E${bpe}_B${wbits}_${extra_constr}.pkl"
 reproduce_mcmoe=true
+attn_wbits=${ATTN_WBITS:-4}
+dense_wbits=${DENSE_WBITS:-4}
 
 # ===============================
 #  Router fine-tuning
 # ===============================
 finetune_routers=true
-rft_trainer="layerwise_teacher" # legacy_ce | distill_ce | layerwise_teacher
-rft_timing="after_each_layer_quantization" # after_all_quantization | after_each_layer_quantization
-rft_router_loss="l2" # kd | kd_tail | l2 | l2_center
-rft_router_alpha=0.0
+rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | layerwise_teacher
+rft_timing="${RFT_TIMING:-after_each_layer_quantization}" # after_all_quantization | after_each_layer_quantization
+rft_router_loss="${RFT_ROUTER_LOSS:-kd_tail}" # kd | kd_tail | l2 | l2_center
+rft_router_alpha=${RFT_ROUTER_ALPHA:-1.0}
 rft_router_loss_weight=1.0
 rft_output_kl_weight=0.0
 rft_epochs=1
 rft_batch_size=1
-rft_lr=1e-4
-rft_wd=0.0
+rft_lr="${RFT_LR:-1e-4}"
+rft_wd="${RFT_WD:-0.0}"
 rft_teacher_cache_dir="cache/router_finetune"
 rft_rebuild_teacher_cache=false
 
@@ -86,7 +90,7 @@ model_args=(
 data_args=(--calib_dataset "${calib_dataset}" --nsamples "${nsamples}" --seqlen "${seqlen}")
 
 bpe_int=$(printf "%.0f" "${bpe}")
-quant_args=(--quantizer "${quantizer}" --expert_wbits "${bpe_int}" --groupsize 128 --mse)
+quant_args=(--quantizer "${quantizer}" --expert_wbits "${bpe_int}" --groupsize 128 --mse --attn_wbits "${attn_wbits}" --dense_wbits "${dense_wbits}")
 if [[ "${reproduce_mcmoe}" == "true" ]]; then
     quant_args+=(--reproduce_mcmoe)
 fi
@@ -110,7 +114,7 @@ if [[ "${finetune_routers}" == "true" ]]; then
     case "${rft_trainer}" in
         legacy_ce)
             # Keep the historical checkpoint path for the unchanged CE baseline.
-            rft_tag="_RFT"
+            rft_tag="_RFT-legacy_ce"
             ;;
         distill_ce)
             rft_tag="_RFT-distill_ce"
@@ -148,7 +152,7 @@ fi
 
 prefix="${allocation_tag}-WT2"
 if [[ "${save_model}" == "true" ]]; then
-    save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A4-G16-D4-E${bpe}${rft_tag}"
+    save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
     io_args=(--save_path "${save_path}" --save_dtype "${save_dtype}")
 else
     save_path="None"
@@ -168,6 +172,8 @@ echo " Dataset:          ${calib_dataset} (nsamples=${nsamples}, seqlen=${seqlen
 echo " Quantizer:        ${quantizer}"
 echo " Expert bits:      ${bpe} (mixed: ${mixed_prec})"
 echo " Bit config:       ${bit_cfg}"
+echo " Attn wbits:       ${attn_wbits}"
+echo " Dense wbits:      ${dense_wbits}"
 echo " Finetune routers: ${finetune_routers} (trainer=${rft_trainer})"
 if [[ "${rft_trainer}" == "legacy_ce" ]]; then
     echo " Router objective: hard-label autoregressive CE"

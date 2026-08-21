@@ -9,12 +9,13 @@ cd "${repo_root}"
 #  Allocation settings
 # ===============================
 model_name="allenai/OLMoE-1B-7B-0125-Instruct"
-bits_per_expert=2.0
-wbits="1,2,3"
+bits_per_expert="${BITS_PER_EXPERT:-2.0}"
+wbits="${WBITS:-1,2,3}"
 ilp_solver="gemq"
 ilp_backend="highs"
-extra_constr="c2c3"
-layer_re_path="cache/${model_name}/LayerRE_c4-N128-L2048-Seed0_B1,2,3_fast.pkl"
+extra_constr=${EXTRA_CONSTR:-"c2c3"}
+default_layer_re_path="cache/${model_name}/LayerRE_c4-N128-L2048-Seed0_B${wbits}_fast.pkl"
+layer_re_path="${LAYER_RE_PATH:-${default_layer_re_path}}"
 
 if [[ ! -f "${layer_re_path}" ]]; then
     echo "Layer reconstruction statistics not found: ${layer_re_path}" >&2
