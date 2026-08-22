@@ -230,6 +230,9 @@ def _finetune_after_all_with_output(model, teacher_targets, args, config):
                 with torch.no_grad():
                     teacher_hidden = teacher_targets.final_hidden_states[start:end].to(head_device)
                     teacher_output_logits = model.lm_head(teacher_hidden)
+                    teacher_output_logits = teacher_output_logits.to(
+                        device=outputs.logits.device, non_blocking=True
+                    )
                 batch_token_mask = attention_mask[start:end] if attention_mask is not None else None
                 output_loss = compute_causal_output_kl(
                     outputs.logits, teacher_output_logits, attention_mask=batch_token_mask
@@ -267,7 +270,7 @@ def _finetune_after_all_with_output(model, teacher_targets, args, config):
                     loss_sums["router"] += router_loss.detach().item()
                 step_count += 1
 
-                del outputs, teacher_output_logits, total_loss
+                del outputs, teacher_hidden, teacher_output_logits, output_loss, router_loss, total_loss
             print(
                 f"[router layer {layer_idx:>2} | epoch {epoch:>2}] "
                 f"total={loss_sums['total'] / max(step_count, 1):.6f}, "

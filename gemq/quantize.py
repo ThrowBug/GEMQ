@@ -178,6 +178,9 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
                     device=head_device, dtype=head_parameter.dtype
                 )
                 teacher_output_logits = model.lm_head(teacher_hidden)
+                teacher_output_logits = teacher_output_logits.to(
+                    device=outputs.logits.device, non_blocking=True
+                )
             loss = compute_causal_output_distill_ce(outputs.logits, teacher_output_logits)
 
             optimizer.zero_grad()
@@ -187,6 +190,7 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
             loss_sum += loss.item()
             if i % 32 == 0:
                 print(f"[epoch {epoch} | iter {i:>3d}] loss: {loss_sum / (i+1):.6f}")
+            del outputs, teacher_hidden, teacher_output_logits, loss
         elapsed = time.time() - start_time
         print(
             f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, "

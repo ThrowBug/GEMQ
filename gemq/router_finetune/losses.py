@@ -99,6 +99,11 @@ def compute_output_kl(student_logits, teacher_logits, token_mask=None):
         raise ValueError(
             f"Student/teacher output shapes differ: {student_logits.shape} vs {teacher_logits.shape}."
         )
+    if student_logits.device != teacher_logits.device:
+        raise ValueError(
+            "Student/teacher output logits must be on the same device, got "
+            f"{student_logits.device} and {teacher_logits.device}."
+        )
     vocab_size = student_logits.shape[-1]
     student = student_logits.reshape(-1, vocab_size).float()
     teacher = teacher_logits.reshape(-1, vocab_size).float()
@@ -114,6 +119,11 @@ def compute_output_distill_ce(student_logits, teacher_logits, token_mask=None):
     if student_logits.shape != teacher_logits.shape:
         raise ValueError(
             f"Student/teacher output shapes differ: {student_logits.shape} vs {teacher_logits.shape}."
+        )
+    if student_logits.device != teacher_logits.device:
+        raise ValueError(
+            "Student/teacher output logits must be on the same device, got "
+            f"{student_logits.device} and {teacher_logits.device}."
         )
     vocab_size = student_logits.shape[-1]
     student = student_logits.reshape(-1, vocab_size).float()
