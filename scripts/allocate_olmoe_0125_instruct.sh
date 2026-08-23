@@ -14,7 +14,11 @@ wbits="${WBITS:-1,2,3}"
 ilp_solver="gemq"
 ilp_backend="highs"
 extra_constr=${EXTRA_CONSTR:-"c2c3"}
-default_layer_re_path="cache/${model_name}/LayerRE_c4-N128-L2048-Seed0_B${wbits}_fast.pkl"
+calib_dataset="${CALIB_DATASET:-mixed_chat_en}"
+nsamples="${NSAMPLES:-128}"
+seqlen="${SEQLEN:-2048}"
+seed="${SEED:-0}"
+default_layer_re_path="cache/${model_name}/LayerRE_${calib_dataset}-N${nsamples}-L${seqlen}-Seed${seed}_B${wbits}_fast.pkl"
 layer_re_path="${LAYER_RE_PATH:-${default_layer_re_path}}"
 
 if [[ ! -f "${layer_re_path}" ]]; then

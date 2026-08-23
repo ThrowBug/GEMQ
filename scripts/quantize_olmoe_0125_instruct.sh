@@ -16,9 +16,13 @@ gpus="${CUDA_VISIBLE_DEVICES:-0}"
 # ===============================
 #  Dataset settings
 # ===============================
-calib_dataset="wikitext2"
-nsamples=128
-seqlen=2048
+calib_dataset="${CALIB_DATASET:-mixed_chat_en}"
+nsamples="${NSAMPLES:-128}"
+seqlen="${SEQLEN:-2048}"
+seed="${SEED:-0}"
+default_calib_data_path="cache/calibration/${model_name}/mixed_chat_en-N${nsamples}-L${seqlen}-Seed${seed}.pt"
+calib_data_path="${CALIB_DATA_PATH:-${default_calib_data_path}}"
+calib_path_args=()
 
 # ===============================
 #  Quantization settings
@@ -28,7 +32,20 @@ bpe="${BPE:-2.0}"
 wbits="${WBITS:-1,2,3}"
 extra_constr=${EXTRA_CONSTR:-"c2c3"}
 mixed_prec=true
-allocation_tag="C4-Seed0"
+allocation_tag="${ALLOCATION_TAG:-}"
+if [[ -z "${allocation_tag}" ]]; then
+    case "${calib_dataset}" in
+        mixed_chat_en) allocation_tag="MixedChatEn-Seed${seed}" ;;
+        c4) allocation_tag="C4-Seed${seed}" ;;
+        math) allocation_tag="MATH-Seed${seed}" ;;
+        math+c4) allocation_tag="MATH+C4-Seed${seed}" ;;
+        *)
+            echo "Cannot infer the allocation config tag for CALIB_DATASET=${calib_dataset}." >&2
+            echo "Set ALLOCATION_TAG explicitly, for example ALLOCATION_TAG=C4-Seed0." >&2
+            exit 1
+            ;;
+    esac
+fi
 bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_E${bpe}_B${wbits}_${extra_constr}.pkl"
 reproduce_mcmoe=true
 attn_wbits=${ATTN_WBITS:-4}
@@ -70,6 +87,14 @@ if [[ "${real_quant}" != "false" ]]; then
     echo "OLMoE-0125 vLLM workflow only supports real_quant=false." >&2
     exit 1
 fi
+if [[ "${calib_dataset}" == "mixed_chat_en" ]]; then
+    if [[ ! -f "${calib_data_path}" ]]; then
+        echo "Prepared calibration data not found: ${calib_data_path}" >&2
+        echo "Run scripts/prepare_calib_olmoe_0125_instruct.sh first." >&2
+        exit 1
+    fi
+    calib_path_args=(--calib_data_path "${calib_data_path}")
+fi
 if [[ "${mixed_prec}" == "true" && ! -f "${bit_cfg}" ]]; then
     echo "Bit allocation config not found: ${bit_cfg}" >&2
     echo "Run scripts/allocate_olmoe_0125_instruct.sh first." >&2
@@ -87,7 +112,13 @@ model_args=(
     --use_fast
     --model_dtype "${model_dtype}"
 )
-data_args=(--calib_dataset "${calib_dataset}" --nsamples "${nsamples}" --seqlen "${seqlen}")
+data_args=(
+    --calib_dataset "${calib_dataset}"
+    "${calib_path_args[@]}"
+    --nsamples "${nsamples}"
+    --seqlen "${seqlen}"
+    --seed "${seed}"
+)
 
 bpe_int=$(printf "%.0f" "${bpe}")
 quant_args=(--quantizer "${quantizer}" --expert_wbits "${bpe_int}" --groupsize 128 --mse --attn_wbits "${attn_wbits}" --dense_wbits "${dense_wbits}")
@@ -150,7 +181,7 @@ if [[ "${eval_downstream}" == "true" ]]; then
     eval_args=(--eval_downstream --downstream_tasks "${downstream_tasks}")
 fi
 
-prefix="${allocation_tag}-WT2"
+prefix="${allocation_tag}"
 if [[ "${save_model}" == "true" ]]; then
     save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
     io_args=(--save_path "${save_path}" --save_dtype "${save_dtype}")
@@ -169,6 +200,11 @@ echo "----------------------------------------------"
 echo " Model:            ${model_name}"
 echo " Model dtype:      ${model_dtype}"
 echo " Dataset:          ${calib_dataset} (nsamples=${nsamples}, seqlen=${seqlen})"
+if [[ "${calib_dataset}" == "mixed_chat_en" ]]; then
+    echo " Calibration file: ${calib_data_path}"
+else
+    echo " Calibration file: legacy ${calib_dataset} loader"
+fi
 echo " Quantizer:        ${quantizer}"
 echo " Expert bits:      ${bpe} (mixed: ${mixed_prec})"
 echo " Bit config:       ${bit_cfg}"

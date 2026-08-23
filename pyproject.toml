@@ -14,6 +14,7 @@ dependencies = [
     "transformers>=4.57.0",
     "accelerate>=1.10.1",
     "datasets>=4.3.0",
+    "huggingface-hub>=0.34.0,<1.0",
     "hqq>=0.2.8",
     "gemlite>=0.5.1",
     "triton>=3.4.0",

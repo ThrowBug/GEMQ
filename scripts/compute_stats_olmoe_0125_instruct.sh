@@ -18,10 +18,22 @@ wbits="${WBITS:-1,2,3}"
 # ===============================
 #  Dataset settings
 # ===============================
-dataset="c4"
-nsamples=128
-seqlen=2048
-seed=0
+dataset="${CALIB_DATASET:-mixed_chat_en}"
+nsamples="${NSAMPLES:-128}"
+seqlen="${SEQLEN:-2048}"
+seed="${SEED:-0}"
+default_calib_data_path="cache/calibration/${model_name}/mixed_chat_en-N${nsamples}-L${seqlen}-Seed${seed}.pt"
+calib_data_path="${CALIB_DATA_PATH:-${default_calib_data_path}}"
+calib_path_args=()
+
+if [[ "${dataset}" == "mixed_chat_en" ]]; then
+    if [[ ! -f "${calib_data_path}" ]]; then
+        echo "Prepared calibration data not found: ${calib_data_path}" >&2
+        echo "Run scripts/prepare_calib_olmoe_0125_instruct.sh first." >&2
+        exit 1
+    fi
+    calib_path_args=(--calib_data_path "${calib_data_path}")
+fi
 
 
 # =============================================================================
@@ -34,6 +46,7 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_model_stats \
     --model_name "${model_name}" \
     --model_dtype "${model_dtype}" \
     --calib_dataset "${dataset}" \
+    "${calib_path_args[@]}" \
     --use_fast \
     --seed "${seed}" \
     --nsamples "${nsamples}" \
@@ -51,6 +64,7 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_model_stats \
     --model_name "${model_name}" \
     --model_dtype "${model_dtype}" \
     --calib_dataset "${dataset}" \
+    "${calib_path_args[@]}" \
     --use_fast \
     --seed "${seed}" \
     --nsamples "${nsamples}" \

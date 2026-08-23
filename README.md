@@ -54,6 +54,26 @@ pip install -e .
 
 ### 1. Bit Allocation
 
+#### English mixed Chat calibration for OLMoE-0125-Instruct
+
+The OLMoE-0125-Instruct workflow uses one prepared calibration tensor for bit-allocation
+statistics, GPTQ, teacher-target collection, and router fine-tuning. It contains 50% English
+WildChat, 40% UltraChat 200k, and 10% FineWeb-Edu blocks. The preparation command streams
+only the records needed to build the cache; it does not download the complete datasets.
+
+```bash
+bash scripts/prepare_calib_olmoe_0125_instruct.sh
+bash scripts/compute_stats_olmoe_0125_instruct.sh
+bash scripts/allocate_olmoe_0125_instruct.sh
+bash scripts/quantize_olmoe_0125_instruct.sh
+```
+
+`SEED`, `NSAMPLES`, and `SEQLEN` are shared by all four scripts. The statistics,
+allocation, and quantization scripts default to `CALIB_DATASET=mixed_chat_en`. To use
+the original C4 loader and naming instead, run those three commands with
+`CALIB_DATASET=c4`; the preparation step is only needed for `mixed_chat_en`. Set
+`REBUILD_CALIB_CACHE=true` on the preparation command to rebuild an existing cache.
+
 > [!NOTE]
 >
 > We provide pre-generated bit allocation configs under `configs`, which can be used directly for quantization. You may skip this section if you do not want to regenerate them.
@@ -102,6 +122,7 @@ Generate the model-specific allocation and fake-quant checkpoint in the GEMQ
 environment:
 
 ```bash
+bash scripts/prepare_calib_olmoe_0125_instruct.sh
 bash scripts/compute_stats_olmoe_0125_instruct.sh
 bash scripts/allocate_olmoe_0125_instruct.sh
 bash scripts/quantize_olmoe_0125_instruct.sh

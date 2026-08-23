@@ -11,6 +11,7 @@ from transformers.testing_utils import CaptureLogger
 from datasets import load_dataset, Dataset, DatasetDict
 
 from gemq.utils.model_utils import NAME_TO_MODEL, ModelType
+from gemq.utils.mixed_calib import load_prepared_calibration
 
 
 def set_seed(seed):
@@ -172,7 +173,35 @@ def get_calib_loader(tokenizer, args):
     This is a unified interface to get calibration dataloaders for different datasets
     in both model stats collection and quantization.
     """
-    if args.calib_dataset == "wikitext2":
+    if args.calib_dataset == "mixed_chat_en":
+        calib_data_path = getattr(args, "calib_data_path", "")
+        if not calib_data_path:
+            raise ValueError(
+                "--calib_data_path is required when --calib_dataset=mixed_chat_en. "
+                "Prepare it first with `python -m gemq.prepare_calib_data`."
+            )
+        input_ids, metadata = load_prepared_calibration(
+            calib_data_path,
+            expected_nsamples=args.nsamples,
+            expected_seqlen=args.seqlen,
+            expected_seed=args.seed,
+            tokenizer=tokenizer,
+        )
+        if args.nsamples % args.batch_size != 0:
+            raise ValueError(
+                "For mixed_chat_en, --nsamples must be divisible by --batch_size so every "
+                "calibration stage consumes the same samples."
+            )
+        print(
+            f"Loaded prepared mixed calibration data from {calib_data_path} "
+            f"(sha256={metadata['input_ids_sha256']})."
+        )
+        calib_loader = [
+            (input_ids[start:start + args.batch_size], None)
+            for start in range(0, args.nsamples, args.batch_size)
+        ]
+
+    elif args.calib_dataset == "wikitext2":
         calib_loader, _ = get_loaders(
             args.calib_dataset,
             args.nsamples,

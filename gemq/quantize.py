@@ -419,6 +419,10 @@ def parse_args():
         help="Which calibration dataset to use",
     )
     parser.add_argument(
+        "--calib_data_path", type=str, default="",
+        help="Prepared .pt calibration cache (required for mixed_chat_en)",
+    )
+    parser.add_argument(
         "--nsamples", type=int, default=128,
         help="Number of calibration sequences"
     )

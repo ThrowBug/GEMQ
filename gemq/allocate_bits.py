@@ -11,11 +11,14 @@ from gemq.allocation.ilp_solvers import AVAILABLE_BACKENDS, GEMQSolver
 
 def auto_parse_filename(layer_re_path):
     calib_str = ""
-    if "math+c4" in layer_re_path:
+    normalized_path = layer_re_path.lower()
+    if "mixed_chat_en" in normalized_path:
+        calib_str = "MixedChatEn"
+    elif "math+c4" in normalized_path:
         calib_str = "MATH+C4"
-    elif "c4" in layer_re_path:
+    elif "c4" in normalized_path:
         calib_str = "C4"
-    elif "math" in layer_re_path:
+    elif "math" in normalized_path:
         calib_str = "MATH"
     else:
         raise ValueError(f"Cannot parse calibration dataset from layer_re_path: {layer_re_path}")
