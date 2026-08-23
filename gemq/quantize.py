@@ -618,7 +618,7 @@ if __name__ == "__main__":
     # the official implementation, which already applies it.
     align_deepseek_softmax_scale(model)
 
-    model.seqlen = 2048
+    model.seqlen = args.seqlen
     model.eval()
 
     # load calibration dataset

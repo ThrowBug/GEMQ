@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/.." && pwd)"
+repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
 
 # ===============================
@@ -12,7 +12,7 @@ model_name="allenai/OLMoE-1B-7B-0125-Instruct"
 bits_per_expert="${BITS_PER_EXPERT:-2.0}"
 wbits="${WBITS:-1,2,3}"
 ilp_solver="gemq"
-ilp_backend="highs"
+ilp_backend="${ILP_BACKEND:-highs}"
 extra_constr=${EXTRA_CONSTR:-"c2c3"}
 calib_dataset="${CALIB_DATASET:-mixed_chat_en}"
 nsamples="${NSAMPLES:-128}"
@@ -23,7 +23,7 @@ layer_re_path="${LAYER_RE_PATH:-${default_layer_re_path}}"
 
 if [[ ! -f "${layer_re_path}" ]]; then
     echo "Layer reconstruction statistics not found: ${layer_re_path}" >&2
-    echo "Run scripts/compute_stats_olmoe_0125_instruct.sh first." >&2
+    echo "Run scripts/OLMoE-1B-7B-0125-Instruct/compute_stats.sh first." >&2
     exit 1
 fi
 

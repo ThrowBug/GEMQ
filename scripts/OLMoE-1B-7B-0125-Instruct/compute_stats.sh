@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/.." && pwd)"
+repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
 
 # ===============================
@@ -14,6 +14,7 @@ model_str=""  # Empty means statistics are computed from the original model.
 model_dtype="bfloat16"
 gpus="${CUDA_VISIBLE_DEVICES:-0}"
 wbits="${WBITS:-1,2,3}"
+forward_batch_size="${FORWARD_BATCH_SIZE:-32}"
 
 # ===============================
 #  Dataset settings
@@ -22,14 +23,16 @@ dataset="${CALIB_DATASET:-mixed_chat_en}"
 nsamples="${NSAMPLES:-128}"
 seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
-default_calib_data_path="cache/calibration/${model_name}/mixed_chat_en-N${nsamples}-L${seqlen}-Seed${seed}.pt"
-calib_data_path="${CALIB_DATA_PATH:-${default_calib_data_path}}"
+calib_data_path="${CALIB_DATA_PATH:-}"
 calib_path_args=()
 
 if [[ "${dataset}" == "mixed_chat_en" ]]; then
+    if [[ -z "${calib_data_path}" ]]; then
+        calib_data_path="cache/calibration/${model_name}/${dataset}-N${nsamples}-L${seqlen}-Seed${seed}.pt"
+    fi
     if [[ ! -f "${calib_data_path}" ]]; then
         echo "Prepared calibration data not found: ${calib_data_path}" >&2
-        echo "Run scripts/prepare_calib_olmoe_0125_instruct.sh first." >&2
+        echo "Run scripts/OLMoE-1B-7B-0125-Instruct/prepare_calib.sh first." >&2
         exit 1
     fi
     calib_path_args=(--calib_data_path "${calib_data_path}")
@@ -72,4 +75,4 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_model_stats \
     --wbits "${wbits}" \
     --layer_grads_path "${layer_grads_path}" \
     --layer_re_path "${layer_re_path}" \
-    --forward_batch_size 32
+    --forward_batch_size "${forward_batch_size}"

@@ -47,7 +47,8 @@ NAME_TO_MODEL = {
     "deepseek-ai/DeepSeek-V2-Lite": ModelType.DEEPSEEKV2,
     "allenai/OLMoE-1B-7B-0924": ModelType.OLMOE,
     "allenai/OLMoE-1B-7B-0125-Instruct": ModelType.OLMOE,
-    "Qwen/Qwen3-30B-A3B": ModelType.QWEN3MOE
+    "Qwen/Qwen3-30B-A3B": ModelType.QWEN3MOE,
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelType.QWEN3MOE,
 }
 
 

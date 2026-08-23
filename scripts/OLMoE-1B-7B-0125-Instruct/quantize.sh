@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/.." && pwd)"
+repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
 
 # ===============================
@@ -20,8 +20,7 @@ calib_dataset="${CALIB_DATASET:-mixed_chat_en}"
 nsamples="${NSAMPLES:-128}"
 seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
-default_calib_data_path="cache/calibration/${model_name}/mixed_chat_en-N${nsamples}-L${seqlen}-Seed${seed}.pt"
-calib_data_path="${CALIB_DATA_PATH:-${default_calib_data_path}}"
+calib_data_path="${CALIB_DATA_PATH:-}"
 calib_path_args=()
 
 # ===============================
@@ -47,32 +46,32 @@ if [[ -z "${allocation_tag}" ]]; then
     esac
 fi
 bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_E${bpe}_B${wbits}_${extra_constr}.pkl"
-reproduce_mcmoe=true
+reproduce_mcmoe="${REPRODUCE_MCMOE:-true}"
 attn_wbits=${ATTN_WBITS:-4}
 dense_wbits=${DENSE_WBITS:-4}
 
 # ===============================
 #  Router fine-tuning
 # ===============================
-finetune_routers=true
+finetune_routers="${FINETUNE_ROUTERS:-true}"
 rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | layerwise_teacher
 rft_timing="${RFT_TIMING:-after_each_layer_quantization}" # after_all_quantization | after_each_layer_quantization
 rft_router_loss="${RFT_ROUTER_LOSS:-kd_tail}" # kd | kd_tail | l2 | l2_center
 rft_router_alpha=${RFT_ROUTER_ALPHA:-1.0}
-rft_router_loss_weight=1.0
-rft_output_kl_weight=0.0
-rft_epochs=1
-rft_batch_size=1
+rft_router_loss_weight="${RFT_ROUTER_LOSS_WEIGHT:-1.0}"
+rft_output_kl_weight="${RFT_OUTPUT_KL_WEIGHT:-0.0}"
+rft_epochs="${RFT_EPOCHS:-1}"
+rft_batch_size="${RFT_BATCH_SIZE:-1}"
 rft_lr="${RFT_LR:-1e-4}"
 rft_wd="${RFT_WD:-0.0}"
-rft_teacher_cache_dir="cache/router_finetune"
-rft_rebuild_teacher_cache=false
+rft_teacher_cache_dir="${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}"
+rft_rebuild_teacher_cache="${RFT_REBUILD_TEACHER_CACHE:-false}"
 
 # ===============================
 #  Evaluation settings
 # ===============================
-eval_downstream=false
-downstream_tasks="piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande,mathqa,mmlu"
+eval_downstream="${EVAL_DOWNSTREAM:-false}"
+downstream_tasks="${DOWNSTREAM_TASKS:-piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande,mathqa,mmlu}"
 
 # ===============================
 #  I/O settings
@@ -88,16 +87,19 @@ if [[ "${real_quant}" != "false" ]]; then
     exit 1
 fi
 if [[ "${calib_dataset}" == "mixed_chat_en" ]]; then
+    if [[ -z "${calib_data_path}" ]]; then
+        calib_data_path="cache/calibration/${model_name}/${calib_dataset}-N${nsamples}-L${seqlen}-Seed${seed}.pt"
+    fi
     if [[ ! -f "${calib_data_path}" ]]; then
         echo "Prepared calibration data not found: ${calib_data_path}" >&2
-        echo "Run scripts/prepare_calib_olmoe_0125_instruct.sh first." >&2
+        echo "Run scripts/OLMoE-1B-7B-0125-Instruct/prepare_calib.sh first." >&2
         exit 1
     fi
     calib_path_args=(--calib_data_path "${calib_data_path}")
 fi
 if [[ "${mixed_prec}" == "true" && ! -f "${bit_cfg}" ]]; then
     echo "Bit allocation config not found: ${bit_cfg}" >&2
-    echo "Run scripts/allocate_olmoe_0125_instruct.sh first." >&2
+    echo "Run scripts/OLMoE-1B-7B-0125-Instruct/allocate.sh first." >&2
     exit 1
 fi
 

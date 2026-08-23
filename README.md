@@ -21,8 +21,8 @@ GEMQ is a post-training quantization framework for Mixture-of-Experts (MoE) LLMs
 ## Updates
 
 - [2026/08] Bit allocation now runs on **HiGHS**, the ILP solver bundled with SciPy, so regenerating the bit configs no longer needs a Gurobi license. Gurobi stays available as an optional backend.
-- [2026/08] Real quantized inference now covers **OLMoE-1B-7B-0924** and **Qwen3-30B-A3B**, alongside Mixtral-8x7B and DeepSeek-V2-Lite. Run it with `scripts/bench_generate_<model>.sh`.
-- [2026/08] Real quantization is verified to match fake quantization end to end -- a 0.06% perplexity gap on DeepSeek-V2-Lite and 0.03% on OLMoE-1B-7B-0924. Run the checks with `scripts/test_real_quant.sh`.
+- [2026/08] Active workflows are organized by model under `scripts/<model>/`; the original real-quant scripts are retained under `scripts/deprecated/`.
+- [2026/08] Added mixed-data calibration, teacher-guided router fine-tuning, and BF16 fake-quant/vLLM workflows for **OLMoE-1B-7B-0125-Instruct** and **Qwen3-30B-A3B-Instruct-2507**.
 - [2026/08] Fixed a ~15% perplexity regression on DeepSeek-V2 caused by a missing YaRN `mscale` in HF's built-in implementation ([transformers#47435](https://github.com/huggingface/transformers/pull/47435)).
 
 
@@ -44,122 +44,92 @@ pip install -e .
 >
 > By default, bit allocation is solved with **HiGHS**, which does not require a commercial license.
 > In our experiments, however, we used **Gurobi** to produce the configs under `configs/`.
-> Gurobi remains available as an optional backend -- install it as shown above, then set `ilp_backend="gurobi"` in `scripts/allocate_<model>.sh`.
+> Gurobi remains available as an optional backend -- install it as shown above, then run a model's `allocate.sh` with `ILP_BACKEND=gurobi`.
 
 
 ## Usage
 
-> `scripts` provides the full pipeline -- bit allocation, quantization and real quantized inference -- for **Mixtral-8×7B**, **DeepSeek-V2-Lite**, **OLMoE-1B-7B-0924** and **Qwen3-30B-A3B**.
+Active workflows are grouped by model:
 
+| Model | Script directory | Default BPE |
+| --- | --- | ---: |
+| OLMoE-1B-7B-0125-Instruct | `scripts/OLMoE-1B-7B-0125-Instruct/` | 2.0 |
+| Qwen3-30B-A3B-Instruct-2507 | `scripts/Qwen3-30B-A3B-Instruct-2507/` | 2.5 |
 
-### 1. Bit Allocation
+The old paper-reproduction and packed real-quant workflows are available under
+`scripts/deprecated/`.
 
-#### English mixed Chat calibration for OLMoE-0125-Instruct
+### Calibration, allocation, and quantization
 
-The OLMoE-0125-Instruct workflow uses one prepared calibration tensor for bit-allocation
-statistics, GPTQ, teacher-target collection, and router fine-tuning. It contains 50% English
+Both active workflows default to one prepared calibration tensor containing 50% English
 WildChat, 40% UltraChat 200k, and 10% FineWeb-Edu blocks. The preparation command streams
-only the records needed to build the cache; it does not download the complete datasets.
+only the records needed for the cache. The exact same input IDs are then used for
+bit-allocation statistics, GPTQ, teacher-target collection, and router fine-tuning.
+
+For OLMoE:
 
 ```bash
-bash scripts/prepare_calib_olmoe_0125_instruct.sh
-bash scripts/compute_stats_olmoe_0125_instruct.sh
-bash scripts/allocate_olmoe_0125_instruct.sh
-bash scripts/quantize_olmoe_0125_instruct.sh
+bash scripts/OLMoE-1B-7B-0125-Instruct/prepare_calib.sh
+bash scripts/OLMoE-1B-7B-0125-Instruct/compute_stats.sh
+bash scripts/OLMoE-1B-7B-0125-Instruct/allocate.sh
+bash scripts/OLMoE-1B-7B-0125-Instruct/quantize.sh
 ```
 
-`SEED`, `NSAMPLES`, and `SEQLEN` are shared by all four scripts. The statistics,
-allocation, and quantization scripts default to `CALIB_DATASET=mixed_chat_en`. To use
-the original C4 loader and naming instead, run those three commands with
-`CALIB_DATASET=c4`; the preparation step is only needed for `mixed_chat_en`. Set
-`REBUILD_CALIB_CACHE=true` on the preparation command to rebuild an existing cache.
+For Qwen3-MoE:
 
-> [!NOTE]
->
-> We provide pre-generated bit allocation configs under `configs`, which can be used directly for quantization. You may skip this section if you do not want to regenerate them.
+```bash
+bash scripts/Qwen3-30B-A3B-Instruct-2507/prepare_calib.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/compute_stats.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize.sh
+```
+
+`SEED`, `NSAMPLES`, and `SEQLEN` are shared by the four stages. Set
+`REBUILD_CALIB_CACHE=true` to rebuild an existing mixed cache. To use GEMQ's legacy C4
+loader and C4 naming, skip `prepare_calib.sh` and pass `CALIB_DATASET=c4` to the remaining
+three scripts. Qwen statistics default to `CUDA_VISIBLE_DEVICES=0,1,2`; override it for a
+different machine.
 
 > [!IMPORTANT]
 >
-> **All provided configs and results reported in the paper were produced with the Gurobi backend.** HiGHS was added later solely to remove the Gurobi license requirement. Both backends solve the same ILP, but because the optimum may not be unique, HiGHS can return a different allocation. To reproduce the paper exactly, use the provided configs or set `ilp_backend="gurobi"` in the allocation script.
+> The configs reported in the original paper were produced with Gurobi. HiGHS solves the
+> same ILP without a commercial license, but a non-unique optimum may result in a different
+> allocation. Use `ILP_BACKEND=gurobi` when exact solver reproduction is required.
 
-To generate the configs from scratch, follow the steps below.
+The quantization scripts expose router trainer, router loss, timing, loss weights, optimizer,
+dataset, bit-width, and cache controls as environment variables near the top of each file.
+They save dequantized approximate weights as standard BF16 Hugging Face checkpoints under
+`results/fake_quant_models/`, which vLLM can load without a GEMQ runtime patch.
 
+### vLLM serving, benchmarking, and evaluation
 
-1. Download the first shard of the C4 training dataset (c4-train.00000-of-01024.json) from [allenai/c4](https://huggingface.co/datasets/allenai/c4/blob/main/en/c4-train.00000-of-01024.json.gz) and save it under `./data`.
-
-2. Run `scripts/compute_stats_<model>.sh` to compute model statistics on the calibration dataset. The resulting statistics (gradients and perturbation errors) will be saved under `cache`.
-
-
-3. Run `scripts/allocate_<model>.sh` to solve the ILP for bit allocation using the generated model statistics. The allocation results (bit configs) will be saved under `configs`. 
-
-
-### 2. Mixed-Precision Quantization
-
-Simply run `scripts/quantize_<model>.sh` for model quantization. Please refer to the script for the detailed available options.
-
-The evaluation code runs automatically after quantization. If you want to evaluate the model on downstream tasks, please ensure that [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) is installed.
-
-Quantized models will be saved under `results`.
-
-
-### 3. Inference
-
-Use `scripts/bench_generate_<model>.sh` to run inference demos and benchmark the real quantized models. Set `bpe` and `finetune_routers` there to match the quantization run, since the checkpoint path is derived from them.
-
-> [!NOTE]
->
-> Decoding is fully fused; prefill still loops over hit experts in Python, so its throughput is dominated by kernel launch overhead and scales with depth and expert count rather than with prompt length.
-
-
-### OLMoE-1B-7B-0125-Instruct: BF16 fake quantization and vLLM
-
-The OLMoE-0125 workflow intentionally uses `real_quant=false`. GEMQ performs
-quantize-dequantize once and saves the approximate weights as a standard BF16
-Hugging Face checkpoint. vLLM then loads those weights directly; it does not
-enable a vLLM quantizer, unpack weights, or call GEMQ inference patches.
-
-Generate the model-specific allocation and fake-quant checkpoint in the GEMQ
-environment:
-
-```bash
-bash scripts/prepare_calib_olmoe_0125_instruct.sh
-bash scripts/compute_stats_olmoe_0125_instruct.sh
-bash scripts/allocate_olmoe_0125_instruct.sh
-bash scripts/quantize_olmoe_0125_instruct.sh
-```
-
-Start the fake-quant model in the separate vLLM environment. The default is one
-GPU with BF16 weights and a BF16 KV cache (`kv-cache-dtype=auto` follows the
-model dtype):
+Start OLMoE on one GPU:
 
 ```bash
 MODEL_VARIANT=FQ CUDA_VISIBLE_DEVICES=0 \
-    bash scripts/serve_vllm_olmoe_0125_instruct.sh
+    bash scripts/OLMoE-1B-7B-0125-Instruct/serve_vllm.sh
 ```
 
-Set `MODEL_VARIANT=FP` to serve the original Hugging Face checkpoint. Two data
-parallel replicas can be requested with
-`CUDA_VISIBLE_DEVICES=0,1 DATA_PARALLEL_SIZE=2`; tensor parallelism is controlled
-independently by `TENSOR_PARALLEL_SIZE`.
-
-With the server running, measure API throughput and latency from the vLLM
-environment:
+Start Qwen with its default tensor parallel size of two:
 
 ```bash
-MODEL_VARIANT=FQ bash scripts/bench_vllm_olmoe_0125_instruct.sh
+MODEL_VARIANT=FQ CUDA_VISIBLE_DEVICES=0,1 \
+    bash scripts/Qwen3-30B-A3B-Instruct-2507/serve_vllm.sh
 ```
 
-Run GSM8K accuracy evaluation from the GEMQ/EvalScope environment. Omitting
-`LIMIT` evaluates the full dataset:
+Set `MODEL_VARIANT=FP` to serve the original checkpoint. With the service running, use the
+matching model directory for API performance and EvalScope accuracy evaluation:
 
 ```bash
-MODEL_VARIANT=FQ LIMIT=10 bash scripts/eval_vllm_olmoe_0125_instruct.sh
+MODEL_VARIANT=FQ bash scripts/Qwen3-30B-A3B-Instruct-2507/bench_vllm.sh
+MODEL_VARIANT=FQ LIMIT=10 bash scripts/Qwen3-30B-A3B-Instruct-2507/eval_vllm.sh
 ```
 
-The service, performance benchmark, and EvalScope scripts share `VLLM_HOST`,
-`VLLM_PORT`, `VLLM_API_KEY`, `MODEL_VARIANT`, and `SERVED_MODEL_NAME`. See the
-scripts for the additional path, concurrency, sequence-length, and generation
-overrides.
+The service, benchmark, and evaluation scripts share `VLLM_HOST`, `VLLM_PORT`,
+`VLLM_API_KEY`, `MODEL_VARIANT`, and `SERVED_MODEL_NAME`. `FQ_MODEL_PATH` overrides the
+automatically derived quantized checkpoint path. When quantization used a nonzero `SEED`,
+set the serving and benchmark scripts' `CALIB_SEED` to the same value; benchmark `SEED`
+remains reserved for request generation.
 
 
 ## License
