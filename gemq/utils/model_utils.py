@@ -1,5 +1,9 @@
 import gc
+import importlib.metadata
+import os
+import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, auto
 
@@ -61,10 +65,145 @@ class ModelInfo:
     num_experts_per_token: int
 
 
-def dispatch_model_to_all_devices(model):
+def _format_memory_size(num_bytes):
+    return f"{num_bytes / (1024 ** 3):.2f} GiB"
+
+
+def _package_version(package_name):
+    try:
+        return importlib.metadata.version(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def _normalize_device_label(device):
+    if isinstance(device, int):
+        return f"cuda:{device}"
+    if isinstance(device, torch.device):
+        return str(device)
+    if isinstance(device, str) and device.isdigit():
+        return f"cuda:{device}"
+    return str(device)
+
+
+def _compact_integer_ranges(values):
+    values = sorted(set(values))
+    if not values:
+        return "none"
+
+    ranges = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = value
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
+def _summarize_device_map(device_map):
+    if not device_map:
+        return
+
+    layer_pattern = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+    layers_by_device = defaultdict(list)
+    other_entries_by_device = defaultdict(list)
+    for module_name, device in device_map.items():
+        device_label = _normalize_device_label(device)
+        match = layer_pattern.search(module_name)
+        if match:
+            layers_by_device[device_label].append(int(match.group(1)))
+        else:
+            other_entries_by_device[device_label].append(module_name or "<root>")
+
+    for device_label in sorted(set(layers_by_device) | set(other_entries_by_device)):
+        parts = [f"layers={_compact_integer_ranges(layers_by_device[device_label])}"]
+        other_entries = other_entries_by_device[device_label]
+        if other_entries:
+            preview = ", ".join(other_entries[:4])
+            if len(other_entries) > 4:
+                preview += f", ... (+{len(other_entries) - 4})"
+            parts.append(f"other={preview}")
+        print(f"  device map {device_label}: {'; '.join(parts)}")
+
+
+def _tensor_storage_bytes_by_device(named_tensors):
+    totals = defaultdict(int)
+    seen_storages = set()
+    for _, tensor in named_tensors:
+        device_label = str(tensor.device)
+        if tensor.device.type == "meta":
+            storage_key = (device_label, id(tensor))
+            num_bytes = tensor.numel() * tensor.element_size()
+        else:
+            try:
+                storage = tensor.untyped_storage()
+                storage_key = (device_label, storage.data_ptr(), storage.nbytes())
+                num_bytes = storage.nbytes()
+            except (RuntimeError, NotImplementedError):
+                storage_key = (device_label, id(tensor))
+                num_bytes = tensor.numel() * tensor.element_size()
+        if storage_key not in seen_storages:
+            seen_storages.add(storage_key)
+            totals[device_label] += num_bytes
+    return totals
+
+
+def report_cuda_diagnostics(stage, model=None, device_map=None, include_versions=False):
+    """Print read-only CUDA memory and model-placement diagnostics."""
+    print(f"[CUDA diagnostics] {stage}")
+    if include_versions:
+        print(
+            "  versions: "
+            f"torch={torch.__version__}, torch_cuda={torch.version.cuda}, "
+            f"transformers={_package_version('transformers')}, "
+            f"accelerate={_package_version('accelerate')}"
+        )
+
+    if not torch.cuda.is_available():
+        print("  CUDA is unavailable to PyTorch")
+    else:
+        device_count = torch.cuda.device_count()
+        visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+        print(
+            f"  visible CUDA devices: {device_count} "
+            f"(CUDA_VISIBLE_DEVICES={visible_devices})"
+        )
+        for device_index in range(device_count):
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+                print(
+                    f"  cuda:{device_index} ({torch.cuda.get_device_name(device_index)}): "
+                    f"free={_format_memory_size(free_bytes)}, "
+                    f"total={_format_memory_size(total_bytes)}, "
+                    f"allocated={_format_memory_size(torch.cuda.memory_allocated(device_index))}, "
+                    f"reserved={_format_memory_size(torch.cuda.memory_reserved(device_index))}, "
+                    f"peak_allocated={_format_memory_size(torch.cuda.max_memory_allocated(device_index))}, "
+                    f"peak_reserved={_format_memory_size(torch.cuda.max_memory_reserved(device_index))}"
+                )
+            except RuntimeError as error:
+                print(f"  cuda:{device_index}: unable to query memory ({error})")
+
+    _summarize_device_map(device_map)
+    if model is not None:
+        parameter_bytes = _tensor_storage_bytes_by_device(model.named_parameters())
+        buffer_bytes = _tensor_storage_bytes_by_device(model.named_buffers())
+        for device_label in sorted(set(parameter_bytes) | set(buffer_bytes)):
+            print(
+                f"  model tensors {device_label}: "
+                f"parameters={_format_memory_size(parameter_bytes[device_label])}, "
+                f"buffers={_format_memory_size(buffer_bytes[device_label])}"
+            )
+
+
+def dispatch_model_to_all_devices(model, cuda_diagnostics=False):
     """
     Dispatch model to all available devices.
     """
+    if cuda_diagnostics:
+        report_cuda_diagnostics("before model dispatch", model=model)
     print("Dispatching model weights to all devices ... ", end="")
     t0 = time.time()
     device_map = infer_auto_device_map(
@@ -79,9 +218,15 @@ def dispatch_model_to_all_devices(model):
         ],
         max_memory=get_balanced_memory(model),
     )
+    if cuda_diagnostics:
+        report_cuda_diagnostics("after inferring the device map", device_map=device_map)
     model = dispatch_model(model, device_map=device_map)
     torch.cuda.synchronize()
     print(f"Done in {(time.time() - t0)/60:.2f} minutes")
+    if cuda_diagnostics:
+        report_cuda_diagnostics(
+            "after model dispatch", model=model, device_map=device_map
+        )
     return model
 
 

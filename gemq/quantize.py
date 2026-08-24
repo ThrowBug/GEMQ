@@ -1,5 +1,6 @@
 import os
 import argparse
+import sys
 import time
 import math
 import gc
@@ -230,6 +231,10 @@ def quantize_weights_gptq(
     # disable KV cache for quantization
     use_cache = model.config.use_cache
     model.config.use_cache = False
+    cuda_diagnostics = getattr(args, "cuda_diagnostics", False)
+
+    if cuda_diagnostics:
+        report_cuda_diagnostics("before GPTQ quantization", model=model)
 
     # build a bit allocation config for each Linear module
     bit_cfg = build_alloc_cfg(model, args)
@@ -373,6 +378,18 @@ def quantize_weights_gptq(
 
     model.config.use_cache = use_cache  # restore
 
+    if cuda_diagnostics:
+        report_cuda_diagnostics(
+            "GPTQ complete, before input/output cleanup", model=model
+        )
+    del inps, outs, layer_kwargs
+    gc.collect()
+    torch.cuda.empty_cache()
+    if cuda_diagnostics:
+        report_cuda_diagnostics(
+            "GPTQ complete, after input/output cleanup", model=model
+        )
+
     return quant_modules
 
 
@@ -381,6 +398,10 @@ def parse_args():
     parser.add_argument(
         "--verbose", action="store_true",
         help="Whether to enable verbose logging"
+    )
+    parser.add_argument(
+        "--cuda_diagnostics", action="store_true",
+        help="Print read-only CUDA memory and model-placement diagnostics",
     )
     
     # model args
@@ -605,6 +626,32 @@ if __name__ == "__main__":
     args = parse_args()
     print(json.dumps(vars(args), indent=4))
 
+    if args.cuda_diagnostics:
+        original_excepthook = sys.excepthook
+
+        def cuda_diagnostics_excepthook(exc_type, exc_value, exc_traceback):
+            error_text = str(exc_value).lower()
+            is_cuda_runtime_error = (
+                issubclass(exc_type, RuntimeError)
+                and any(marker in error_text for marker in ("cuda", "cublas", "cudnn"))
+            )
+            if is_cuda_runtime_error:
+                try:
+                    report_cuda_diagnostics(
+                        "uncaught CUDA RuntimeError",
+                        model=globals().get("model"),
+                        device_map=getattr(globals().get("model"), "hf_device_map", None),
+                    )
+                except Exception as diagnostic_error:
+                    print(
+                        "[CUDA diagnostics] failed while reporting the exception: "
+                        f"{diagnostic_error}"
+                    )
+            original_excepthook(exc_type, exc_value, exc_traceback)
+
+        sys.excepthook = cuda_diagnostics_excepthook
+        report_cuda_diagnostics("startup", include_versions=True)
+
     # load pre-trained model
     print("Loading model ...")
     tokenizer = AutoTokenizer.from_pretrained(
@@ -620,6 +667,8 @@ if __name__ == "__main__":
 
     model.seqlen = args.seqlen
     model.eval()
+    if args.cuda_diagnostics:
+        report_cuda_diagnostics("model loaded", model=model)
 
     # load calibration dataset
     print("Loading calibration data ...")
@@ -635,6 +684,8 @@ if __name__ == "__main__":
         else:
             router_ft_config = RouterFinetuneConfig.from_args(args)
         calibration_input_ids, calibration_attention_mask = materialize_calibration_inputs(dataloader)
+        if args.cuda_diagnostics:
+            report_cuda_diagnostics("before collecting teacher targets", model=model)
         teacher_targets = get_or_collect_teacher_targets(
             model,
             tokenizer,
@@ -644,6 +695,8 @@ if __name__ == "__main__":
             args,
             router_ft_config,
         )
+        if args.cuda_diagnostics:
+            report_cuda_diagnostics("after collecting teacher targets", model=model)
 
     # quantize model weights
     if not args.eval_fp:
@@ -663,24 +716,34 @@ if __name__ == "__main__":
     # finetune routers
     if args.finetune_routers:
         if args.rft_trainer == "legacy_ce":
-            model = dispatch_model_to_all_devices(model)
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
             print("Evaluating quantized model before fine-tuning ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics("before pre-finetune evaluation", model=model)
             evaluate_perplexity(
                 model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
             )
 
             print("Fine-tuning routers with legacy autoregressive CE ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics("before legacy router fine-tuning", model=model)
             finetune_routers(model, dataloader, args)
         elif args.rft_trainer == "distill_ce":
-            model = dispatch_model_to_all_devices(model)
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
             print("Evaluating quantized model before fine-tuning ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics("before pre-finetune evaluation", model=model)
             evaluate_perplexity(
                 model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
             )
 
             print("Fine-tuning routers jointly with distilled autoregressive CE ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics(
+                    "before distilled-CE router fine-tuning", model=model
+                )
             finetune_routers_distill_ce(model, teacher_targets, args)
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
@@ -688,24 +751,30 @@ if __name__ == "__main__":
                 model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=True
             )
             if router_ft_config.needs_output_targets:
-                model = dispatch_model_to_all_devices(model)
+                model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
             print("Fine-tuning routers layer by layer ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics(
+                    "before layer-wise router fine-tuning", model=model
+                )
             finetune_routers_after_all_quantization(
                 model, dataloader, teacher_targets, args, router_ft_config
             )
             if router_ft_config.is_router_only:
-                model = dispatch_model_to_all_devices(model)
+                model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
         else:
             # Interleaved fine-tuning already happened inside quantize_weights_gptq.
-            model = dispatch_model_to_all_devices(model)
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
     # evaluate model
     print("Evaluating model ...")
     model.eval()
+    if args.cuda_diagnostics:
+        report_cuda_diagnostics("before final evaluation", model=model)
     if args.eval_downstream or args.finetune_routers:
         # move all model weights onto gpus and use model() for forwarding
         if not args.finetune_routers:
-            model = dispatch_model_to_all_devices(model)
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
         evaluate_perplexity(model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False)
         if args.eval_downstream:

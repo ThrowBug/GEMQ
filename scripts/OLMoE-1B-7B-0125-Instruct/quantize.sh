@@ -74,6 +74,11 @@ eval_downstream="${EVAL_DOWNSTREAM:-false}"
 downstream_tasks="${DOWNSTREAM_TASKS:-piqa,arc_easy,arc_challenge,boolq,hellaswag,winogrande,mathqa,mmlu}"
 
 # ===============================
+#  Diagnostics
+# ===============================
+cuda_diagnostics="${CUDA_DIAGNOSTICS:-false}"
+
+# ===============================
 #  I/O settings
 # ===============================
 # This workflow intentionally saves dequantized approximate weights (W_hat).
@@ -183,6 +188,11 @@ if [[ "${eval_downstream}" == "true" ]]; then
     eval_args=(--eval_downstream --downstream_tasks "${downstream_tasks}")
 fi
 
+diagnostic_args=()
+if [[ "${cuda_diagnostics}" == "true" ]]; then
+    diagnostic_args=(--cuda_diagnostics)
+fi
+
 prefix="${allocation_tag}"
 if [[ "${save_model}" == "true" ]]; then
     save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
@@ -226,6 +236,7 @@ echo " RFT optimizer:    epochs=${rft_epochs}, batch=${rft_batch_size}, lr=${rft
 echo " Real quant:       ${real_quant}"
 echo " Save dtype:       ${save_dtype}"
 echo " Save path:        ${save_path}"
+echo " CUDA diagnostics: ${cuda_diagnostics}"
 echo "=============================================="
 
 CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.quantize \
@@ -233,4 +244,5 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.quantize \
     "${data_args[@]}" \
     "${quant_args[@]}" \
     "${eval_args[@]}" \
+    "${diagnostic_args[@]}" \
     "${io_args[@]}"
