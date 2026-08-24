@@ -83,20 +83,21 @@ fi
 
 gpus="${CUDA_VISIBLE_DEVICES:-0,1}"
 tensor_parallel_size="${TENSOR_PARALLEL_SIZE:-2}"
+pipeline_parallel_size="${PIPELINE_PARALLEL_SIZE:-1}"
 data_parallel_size="${DATA_PARALLEL_SIZE:-1}"
 host="${VLLM_HOST:-127.0.0.1}"
 port="${VLLM_PORT:-8000}"
 api_key="${VLLM_API_KEY:-EMPTY}"
 gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.90}"
 
-if ! [[ "${tensor_parallel_size}" =~ ^[1-9][0-9]*$ && "${data_parallel_size}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "TENSOR_PARALLEL_SIZE and DATA_PARALLEL_SIZE must be positive integers." >&2
+if ! [[ "${tensor_parallel_size}" =~ ^[1-9][0-9]*$ && "${pipeline_parallel_size}" =~ ^[1-9][0-9]*$ && "${data_parallel_size}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TENSOR_PARALLEL_SIZE, PIPELINE_PARALLEL_SIZE, and DATA_PARALLEL_SIZE must be positive integers." >&2
     exit 1
 fi
 visible_gpu_count=$(( $(tr -cd ',' <<< "${gpus}" | wc -c) + 1 ))
-required_gpu_count=$(( tensor_parallel_size * data_parallel_size ))
+required_gpu_count=$(( tensor_parallel_size * pipeline_parallel_size * data_parallel_size ))
 if (( visible_gpu_count < required_gpu_count )); then
-    echo "CUDA_VISIBLE_DEVICES exposes ${visible_gpu_count} GPU(s), but TP x DP requires ${required_gpu_count}." >&2
+    echo "CUDA_VISIBLE_DEVICES exposes ${visible_gpu_count} GPU(s), but TP x PP x DP requires ${required_gpu_count}." >&2
     exit 1
 fi
 
@@ -108,6 +109,7 @@ serve_args=(
     --port "${port}"
     --api-key "${api_key}"
     --tensor-parallel-size "${tensor_parallel_size}"
+    --pipeline-parallel-size "${pipeline_parallel_size}"
     --data-parallel-size "${data_parallel_size}"
     --gpu-memory-utilization "${gpu_memory_utilization}"
     --generation-config vllm
@@ -124,6 +126,7 @@ echo " Model variant:       ${model_variant}"
 echo " Model path:          ${model_path}"
 echo " Served model name:   ${served_model_name}"
 echo " Tensor parallel:     ${tensor_parallel_size}"
+echo " Pipeline parallel:   ${pipeline_parallel_size}"
 echo " Data parallel:       ${data_parallel_size}"
 echo " CUDA devices:        ${gpus}"
 echo " Endpoint:            http://${host}:${port}/v1"
