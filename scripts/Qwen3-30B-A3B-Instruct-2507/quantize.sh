@@ -30,7 +30,7 @@ quantizer="gptq"
 bpe="${BPE:-2.5}"
 wbits="${WBITS:-1,2,3}"
 extra_constr="${EXTRA_CONSTR:-c2c3}"
-mixed_prec=true
+mixed_prec="${MIXED_PREC:-true}"
 allocation_tag="${ALLOCATION_TAG:-}"
 if [[ -z "${allocation_tag}" ]]; then
     case "${calib_dataset}" in
