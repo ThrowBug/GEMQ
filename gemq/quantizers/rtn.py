@@ -87,8 +87,10 @@ class MCMoeRTNWeightQuantizer(nn.Module):
         binary_slice = torch.where(x_ >= 0, 1, -1)
         binary_slice = binary_slice/2 + 0.5
 
-        scale_tensor = scale_tensor.unsqueeze(1).expand(-1, 128)
-        zero = zero.unsqueeze(1).expand(-1, 128)
+        # Do not assume that the quantization block (or the final partial block)
+        # has 128 columns.
+        scale_tensor = scale_tensor.unsqueeze(1).expand_as(x)
+        zero = zero.unsqueeze(1).expand_as(x)
         return scale_tensor * (binary_slice - zero)
 
     @classmethod
@@ -152,6 +154,13 @@ class MCMoeRTNWeightQuantizer(nn.Module):
 
     @classmethod
     def normal_quantize(cls, w, blocksize=128, wbit=2):
+        if not isinstance(wbit, int) or wbit < 0:
+            raise ValueError(f"wbit must be a non-negative integer, got {wbit!r}")
+        if blocksize <= 0:
+            raise ValueError(f"blocksize must be positive, got {blocksize}")
+        if wbit == 0:
+            return torch.zeros_like(w)
+
         columns = w.shape[1]
         w_q = torch.zeros_like(w)
         w_q = w_q.to(w.device)
