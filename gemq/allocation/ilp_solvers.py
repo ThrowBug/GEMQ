@@ -1,8 +1,14 @@
+import math
 import pickle
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.optimize import Bounds, LinearConstraint, milp
+
+from gemq.utils.expert_cost_utils import (
+    load_expert_cost_artifact,
+    select_candidate_costs,
+)
 
 
 AVAILABLE_BACKENDS = ("highs", "gurobi")
@@ -262,3 +268,161 @@ class GEMQSolver:
         )
 
         return opt_set
+
+
+class ExpertCostSolver(GEMQSolver):
+    """Global expert-cost ILP with optional equal-count physical pruning.
+
+    The objective coefficients are C[layer, expert, bit] from the expert-cost
+    artifact.  Unlike the legacy Layer-RE formulation, no extra sensitivity
+    multiplier and no c2/c3 constraints are applied.
+    """
+
+    def __init__(
+        self,
+        expert_cost_path,
+        x_space,
+        max_prune_ratio=0.25,
+        top_k=1,
+        start_layer_idx=0,
+        backend="highs",
+    ):
+        if backend not in AVAILABLE_BACKENDS:
+            raise ValueError(
+                f"Unknown ILP backend: {backend!r}. Available: {AVAILABLE_BACKENDS}"
+            )
+        self.x_space = [int(bit) for bit in x_space]
+        if not self.x_space or len(set(self.x_space)) != len(self.x_space):
+            raise ValueError("x_space must be non-empty and contain no duplicates")
+        if any(bit < 0 for bit in self.x_space):
+            raise ValueError(f"x_space must be non-negative: {self.x_space}")
+        if not any(bit > 0 for bit in self.x_space):
+            raise ValueError("x_space must contain at least one positive bit-width")
+
+        artifact = load_expert_cost_artifact(expert_cost_path)
+        self.coef = select_candidate_costs(artifact, self.x_space).double().numpy()
+        self.counts = artifact["counts"].numpy()
+        self.imputed_mask = artifact["imputed_mask"].numpy()
+        self.artifact_metadata = artifact.get("metadata", {})
+        self.num_moe_layers, self.num_experts, self.num_x = self.coef.shape
+        self.start_layer_idx = int(start_layer_idx)
+        self.num_layers = self.start_layer_idx + self.num_moe_layers
+        self.backend = backend
+        self.extra_constr = "none"
+        self.last_objective = None
+
+        self.max_prune_ratio = float(max_prune_ratio)
+        if not 0.0 <= self.max_prune_ratio <= 1.0:
+            raise ValueError(
+                f"max_prune_ratio must be in [0, 1], got {self.max_prune_ratio}"
+            )
+        self.top_k = int(top_k)
+        if not 1 <= self.top_k <= self.num_experts:
+            raise ValueError(
+                f"top_k must be in [1, {self.num_experts}], got {self.top_k}"
+            )
+        ratio_cap = math.floor(self.max_prune_ratio * self.num_experts + 1e-12)
+        self.max_pruned_per_layer = min(ratio_cap, self.num_experts - self.top_k)
+
+        print(
+            f"num_layers: {self.num_layers}, num_experts: {self.num_experts}, "
+            f"x_space: {self.x_space}"
+        )
+        if 0 in self.x_space:
+            print(
+                "zero-bit constraints: "
+                f"at most {self.max_pruned_per_layer} experts/layer "
+                f"(ratio={self.max_prune_ratio:g}, top_k={self.top_k}), "
+                "equal zero-bit count across layers"
+            )
+
+    def build_objective(self):
+        return np.asarray(self.coef, dtype=np.float64).reshape(-1)
+
+    def build_constraints(self, total_bits):
+        L, E, K = self.num_moe_layers, self.num_experts, self.num_x
+        n = self.num_vars
+
+        budget_row = np.tile(np.asarray(self.x_space, dtype=np.float64), L * E)
+        ub_matrices = [sp.csr_matrix(budget_row.reshape(1, n))]
+        ub_values = [float(total_bits)]
+
+        one_hot = sp.csr_matrix(
+            (np.ones(n), np.arange(n), np.arange(0, n + 1, K)),
+            shape=(L * E, n),
+        )
+        eq_matrices = [one_hot]
+        eq_values = [np.ones(L * E)]
+
+        if 0 in self.x_space:
+            zero_ki = self.x_space.index(0)
+
+            # Per-layer upper bound.  The same scalar incorporates both the user
+            # prune-ratio cap and the requirement that at least top_k experts survive.
+            rows, cols = [], []
+            for layer_idx in range(L):
+                for expert_idx in range(E):
+                    rows.append(layer_idx)
+                    cols.append((layer_idx * E + expert_idx) * K + zero_ki)
+            prune_caps = sp.csr_matrix(
+                (np.ones(len(rows)), (rows, cols)), shape=(L, n)
+            )
+            ub_matrices.append(prune_caps)
+            ub_values.extend([float(self.max_pruned_per_layer)] * L)
+
+            # Every layer must prune the same number of experts.  The chosen count
+            # is left to the objective and budget rather than fixed by the ratio.
+            if L > 1:
+                rows, cols, data = [], [], []
+                for layer_idx in range(1, L):
+                    row = layer_idx - 1
+                    for expert_idx in range(E):
+                        rows.extend((row, row))
+                        cols.extend(
+                            (
+                                (layer_idx * E + expert_idx) * K + zero_ki,
+                                expert_idx * K + zero_ki,
+                            )
+                        )
+                        data.extend((1.0, -1.0))
+                equal_prune = sp.csr_matrix(
+                    (data, (rows, cols)), shape=(L - 1, n)
+                )
+                eq_matrices.append(equal_prune)
+                eq_values.append(np.zeros(L - 1))
+
+        A_ub = sp.vstack(ub_matrices, format="csr")
+        b_ub = np.asarray(ub_values, dtype=np.float64)
+        A_eq = sp.vstack(eq_matrices, format="csr")
+        b_eq = np.concatenate(eq_values)
+        A_lb = sp.csr_matrix((0, n))
+        b_lb = np.zeros(0)
+        return (A_ub, b_ub), (A_eq, b_eq), (A_lb, b_lb)
+
+    def compute_objective(self, opt_set):
+        value = 0.0
+        for layer_idx, experts in opt_set.items():
+            local_layer_idx = layer_idx - self.start_layer_idx
+            for expert_idx, bit in experts.items():
+                value += self.coef[
+                    local_layer_idx, expert_idx, self.x_space.index(bit)
+                ]
+        return float(value)
+
+    def solve_all(self, total_bits):
+        total_bits = math.floor(float(total_bits) + 1e-12)
+        positive_min = min(bit for bit in self.x_space if bit > 0)
+        if 0 in self.x_space:
+            min_required = (
+                self.num_moe_layers
+                * (self.num_experts - self.max_pruned_per_layer)
+                * positive_min
+            )
+        else:
+            min_required = self.num_moe_layers * self.num_experts * min(self.x_space)
+        if total_bits < min_required:
+            raise ValueError(
+                f"Bit budget {total_bits} is infeasible: at least {min_required} bits "
+                "are required by the candidate set and pruning constraints."
+            )
+        return super().solve_all(total_bits)

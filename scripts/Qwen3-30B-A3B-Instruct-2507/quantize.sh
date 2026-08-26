@@ -27,9 +27,17 @@ calib_path_args=()
 #  Quantization settings
 # ===============================
 quantizer="gptq"
-bpe="${BPE:-2.5}"
-wbits="${WBITS:-1,2,3}"
-extra_constr="${EXTRA_CONSTR:-c2c3}"
+allocation_metric="${ALLOCATION_METRIC:-expert_cost}" # expert_cost | layer_re
+bpe="${BPE:-2.0}"
+if [[ -n "${WBITS:-}" ]]; then
+    wbits="${WBITS}"
+elif [[ "${allocation_metric}" == "expert_cost" ]]; then
+    wbits="0,2,3"
+else
+    wbits="1,2,3"
+fi
+max_prune_ratio="${MAX_PRUNE_RATIO:-0.25}"
+expert_cost_context_bit="${EXPERT_COST_CONTEXT_BIT:-2}"
 mixed_prec="${MIXED_PREC:-true}"
 allocation_tag="${ALLOCATION_TAG:-}"
 if [[ -z "${allocation_tag}" ]]; then
@@ -45,7 +53,28 @@ if [[ -z "${allocation_tag}" ]]; then
             ;;
     esac
 fi
-bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_E${bpe}_B${wbits}_${extra_constr}.pkl"
+bpe_tag="$(printf '%.1f' "${bpe}")"
+if [[ "${allocation_metric}" == "expert_cost" ]]; then
+    extra_constr="${EXTRA_CONSTR:-none}"
+    if [[ "${extra_constr}" != "none" ]]; then
+        echo "EXTRA_CONSTR is only valid with ALLOCATION_METRIC=layer_re." >&2
+        exit 1
+    fi
+    default_bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-expert_cost-Ctxuniform${expert_cost_context_bit}_E${bpe_tag}_B${wbits}"
+    if [[ ",${wbits}," == *,0,* ]]; then
+        max_prune_ratio_tag="$(printf '%g' "${max_prune_ratio}")"
+        default_bit_cfg+="_Pmax${max_prune_ratio_tag}_EqPrune"
+    fi
+    default_bit_cfg+=".pkl"
+elif [[ "${allocation_metric}" == "layer_re" ]]; then
+    extra_constr="${EXTRA_CONSTR:-c2c3}"
+    constraint_tag=""; [[ "${extra_constr}" != "none" ]] && constraint_tag="_${extra_constr}"
+    default_bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-layer_re_E${bpe_tag}_B${wbits}${constraint_tag}.pkl"
+else
+    echo "ALLOCATION_METRIC must be expert_cost or layer_re, got: ${allocation_metric}" >&2
+    exit 1
+fi
+bit_cfg="${BIT_CFG_PATH:-${default_bit_cfg}}"
 # The legacy Qwen script warns that the MC-MoE GPTQ implementation can produce NaNs.
 reproduce_mcmoe="${REPRODUCE_MCMOE:-false}"
 attn_wbits="${ATTN_WBITS:-4}"
@@ -211,6 +240,7 @@ else
     echo " Calibration file: legacy ${calib_dataset} loader"
 fi
 echo " Quantizer:        ${quantizer} (reproduce_mcmoe=${reproduce_mcmoe})"
+echo " Allocation metric:${allocation_metric}"
 echo " Expert bits:      ${bpe} (mixed: ${mixed_prec})"
 echo " Bit config:       ${bit_cfg}"
 echo " Attn wbits:       ${attn_wbits}"

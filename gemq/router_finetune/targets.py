@@ -33,6 +33,43 @@ class TeacherTargets:
         return self.router_logits[layer_idx]
 
 
+def project_teacher_router_logits(targets, kept_expert_ids):
+    """Project original-model router targets onto physically surviving experts.
+
+    The cached teacher artifact remains in the original expert-ID space; projection
+    creates an in-memory view for the pruned student and never overwrites the cache.
+    """
+    if targets is None or targets.router_logits is None:
+        return targets
+    if len(targets.router_logits) != len(kept_expert_ids):
+        raise ValueError(
+            f"Teacher has {len(targets.router_logits)} router layers but pruning "
+            f"provides {len(kept_expert_ids)} layers."
+        )
+    projected = []
+    for layer_idx, (logits, kept_ids) in enumerate(
+        zip(targets.router_logits, kept_expert_ids)
+    ):
+        if not kept_ids:
+            raise ValueError(f"Layer {layer_idx} keeps no experts.")
+        if min(kept_ids) < 0 or max(kept_ids) >= logits.shape[-1]:
+            raise ValueError(
+                f"Layer {layer_idx} kept IDs are outside teacher logits with "
+                f"{logits.shape[-1]} experts."
+            )
+        index = torch.tensor(kept_ids, dtype=torch.long, device=logits.device)
+        projected.append(logits.index_select(-1, index).contiguous())
+    metadata = dict(targets.metadata)
+    metadata["router_logits_projection"] = "kept original expert IDs after pruning"
+    return TeacherTargets(
+        input_ids=targets.input_ids,
+        attention_mask=targets.attention_mask,
+        router_logits=tuple(projected),
+        final_hidden_states=targets.final_hidden_states,
+        metadata=metadata,
+    )
+
+
 def materialize_calibration_inputs(dataloader):
     """Materialize the exact, ordered token tensors used by quantization."""
     input_parts = []

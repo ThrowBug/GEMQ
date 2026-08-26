@@ -10,6 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, logging
 
 from gemq.expert_costs import compute_qwen3_expert_costs
 from gemq.utils.data_utils import get_calib_loader
+from gemq.utils.expert_cost_utils import impute_zero_frequency_costs
 from gemq.utils.model_utils import ModelType, NAME_TO_MODEL
 
 
@@ -159,12 +160,15 @@ def main(argv=None):
         device="cuda",
     )
 
+    filled_costs, imputed_mask = impute_zero_frequency_costs(costs, counts)
     artifact = {
-        "costs": costs,
+        "costs": filled_costs,
+        "raw_costs": costs,
         "counts": counts,
+        "imputed_mask": imputed_mask,
         "candidate_bits": torch.tensor(args.candidate_bits, dtype=torch.int64),
         "metadata": {
-            "format_version": 1,
+            "format_version": 2,
             "model": args.model,
             "model_name": args.model_name,
             "model_dtype": args.model_dtype,
@@ -188,7 +192,10 @@ def main(argv=None):
             ),
             "quantizer": "GEMQ MCMoeRTN block-wise weight-only fake quantization",
             "zero_bit_definition": "f_i^0(x) = 0",
-            "zero_frequency_policy": "cost=NaN,count=0",
+            "zero_frequency_policy": (
+                "replace count-zero costs by the same-layer, same-bit mean over "
+                "positive-count experts; preserve pre-imputation values in raw_costs"
+            ),
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
         },
     }
@@ -198,9 +205,10 @@ def main(argv=None):
     torch.save(artifact, args.output_path)
 
     print(f"Saved expert cost artifact to: {args.output_path}")
-    print(f"costs.shape={tuple(costs.shape)}, counts.shape={tuple(counts.shape)}")
-    print("costs:")
-    print(costs)
+    print(f"costs.shape={tuple(filled_costs.shape)}, counts.shape={tuple(counts.shape)}")
+    print(f"zero-frequency experts: {int(imputed_mask.sum().item())}")
+    print("costs (zero-frequency entries imputed):")
+    print(filled_costs)
     print("counts:")
     print(counts)
 

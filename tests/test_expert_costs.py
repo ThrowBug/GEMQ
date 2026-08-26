@@ -3,6 +3,11 @@ import torch.nn as nn
 
 from gemq.expert_costs import _collect_active_inputs, _compute_layer_costs
 from gemq.quantizers.rtn import MCMoeRTNWeightQuantizer
+from gemq.utils.expert_cost_utils import (
+    impute_zero_frequency_costs,
+    load_expert_cost_artifact,
+    select_candidate_costs,
+)
 
 
 class _IdentityExpert(nn.Module):
@@ -83,3 +88,42 @@ def test_rtn_zero_bit_and_partial_binary_block():
     torch.testing.assert_close(zero_bit, torch.zeros_like(weights))
     assert one_bit.shape == weights.shape
     assert torch.isfinite(one_bit).all()
+
+
+def test_zero_frequency_imputation_and_candidate_subset(tmp_path):
+    raw = torch.tensor(
+        [
+            [
+                [1.0, 10.0, 100.0, 1000.0],
+                [3.0, 30.0, 300.0, 3000.0],
+                [float("nan"), float("nan"), float("nan"), float("nan")],
+            ]
+        ],
+        dtype=torch.float64,
+    )
+    counts = torch.tensor([[4, 2, 0]])
+    filled, mask = impute_zero_frequency_costs(raw, counts)
+    torch.testing.assert_close(
+        filled[0, 2], torch.tensor([2.0, 20.0, 200.0, 2000.0], dtype=torch.float64)
+    )
+    assert mask.tolist() == [[False, False, True]]
+
+    path = tmp_path / "v1.pt"
+    torch.save(
+        {
+            "costs": raw,
+            "counts": counts,
+            "candidate_bits": torch.tensor([0, 1, 2, 3]),
+            "metadata": {"format_version": 1},
+        },
+        path,
+    )
+    artifact = load_expert_cost_artifact(path)
+    selected = select_candidate_costs(artifact, [0, 2, 3])
+    assert selected.shape == (1, 3, 3)
+    torch.testing.assert_close(
+        selected[0, 0], torch.tensor([1.0, 100.0, 1000.0], dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        selected[0, 2], torch.tensor([2.0, 200.0, 2000.0], dtype=torch.float64)
+    )

@@ -29,6 +29,12 @@ from gemq.router_finetune.losses import compute_causal_output_distill_ce
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
+    project_teacher_router_logits,
+)
+from gemq.pruning import (
+    has_zero_bit_experts,
+    load_expert_bit_config,
+    prune_qwen3_experts,
 )
 from gemq.router_finetune.trainer import (
     finetune_router_after_layer_quantization,
@@ -220,7 +226,12 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
 
 @torch.no_grad()
 def quantize_weights_gptq(
-    model, dataloader, args, router_ft_config=None, teacher_targets=None
+    model,
+    dataloader,
+    args,
+    router_ft_config=None,
+    teacher_targets=None,
+    expert_bit_cfg=None,
 ):
     """
     Perform mixed-precision weight-only quantization with GPTQ quantizer.
@@ -237,7 +248,7 @@ def quantize_weights_gptq(
         report_cuda_diagnostics("before GPTQ quantization", model=model)
 
     # build a bit allocation config for each Linear module
-    bit_cfg = build_alloc_cfg(model, args)
+    bit_cfg = build_alloc_cfg(model, args, expert_bit_cfg=expert_bit_cfg)
 
     # prepare decoder inputs and kwargs for model forward
     inps, layer_kwargs = compute_decoder_inputs(model, dataloader, args.model_name, "cuda")
@@ -674,6 +685,13 @@ if __name__ == "__main__":
     print("Loading calibration data ...")
     dataloader = get_calib_loader(tokenizer, args)
 
+    # Load the allocation before collecting teacher signals, but do not mutate the
+    # model yet: pruning-aware distillation uses the original full model as teacher.
+    expert_bit_cfg = None
+    pruning_result = None
+    if args.mixed:
+        expert_bit_cfg = load_expert_bit_config(args.bit_cfg)
+
     router_ft_config = None
     teacher_targets = None
     if args.finetune_routers and args.rft_trainer in {"distill_ce", "layerwise_teacher"}:
@@ -698,6 +716,17 @@ if __name__ == "__main__":
         if args.cuda_diagnostics:
             report_cuda_diagnostics("after collecting teacher targets", model=model)
 
+    if (
+        not args.eval_fp
+        and expert_bit_cfg is not None
+        and has_zero_bit_experts(expert_bit_cfg)
+    ):
+        pruning_result = prune_qwen3_experts(model, args.model_name, expert_bit_cfg)
+        expert_bit_cfg = pruning_result.remapped_bit_config
+        teacher_targets = project_teacher_router_logits(
+            teacher_targets, pruning_result.kept_expert_ids
+        )
+
     # quantize model weights
     if not args.eval_fp:
         # quantize and get a name-module mapping of quantized modules
@@ -708,7 +737,12 @@ if __name__ == "__main__":
                 router_ft_config if args.rft_trainer == "layerwise_teacher" else None
             )
             quant_modules = quantize_weights_gptq(
-                model, dataloader, args, layerwise_config, teacher_targets
+                model,
+                dataloader,
+                args,
+                layerwise_config,
+                teacher_targets,
+                expert_bit_cfg,
             )
         else:
             raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
@@ -795,6 +829,15 @@ if __name__ == "__main__":
     if args.save_path:
         print("Saving model ...")
         os.makedirs(args.save_path, exist_ok=True)
+        if pruning_result is not None:
+            pruning_metadata = dict(pruning_result.metadata)
+            pruning_metadata["source_bit_config"] = args.bit_cfg
+            with open(
+                os.path.join(args.save_path, "expert_pruning_map.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(pruning_metadata, f, indent=2, ensure_ascii=False)
         if router_ft_config is not None:
             with open(
                 os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"
