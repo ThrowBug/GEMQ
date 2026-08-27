@@ -14,6 +14,12 @@ from hqq.models.hf.base import AutoHQQHFModel
 
 from gemq.quantizers.gptq import MCMoeGPTQWeightQuantizer, GPTQWeightQuantizer
 from gemq.utils.data_utils import get_calib_loader
+from gemq.utils.gptq_checkpoint import (
+    build_gptq_checkpoint_identity,
+    build_gptq_checkpoint_metadata,
+    load_gptq_checkpoint_metadata,
+    save_gptq_checkpoint,
+)
 from gemq.utils.model_utils import *
 from gemq.utils.quant_utils import *
 from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
@@ -42,6 +48,25 @@ from gemq.router_finetune.trainer import (
 )
 
 logging.set_verbosity_error()
+
+
+def load_causal_lm(model_path, args, description="model"):
+    print(f"Loading {description} ...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="cpu",
+        torch_dtype=args.model_dtype,
+        attn_implementation=args.attn_impl,
+        trust_remote_code=args.trust_remote_code,
+    )
+    # HF's built-in DeepSeek-V2 omits the YaRN mscale on the attention scale; no-op on
+    # the official implementation, which already applies it.
+    align_deepseek_softmax_scale(model)
+    model.seqlen = args.seqlen
+    model.eval()
+    if args.cuda_diagnostics:
+        report_cuda_diagnostics(f"{description} loaded", model=model)
+    return model
 
 
 def save_quantized_model(model, tokenizer, save_path, save_dtype, real_quant):
@@ -628,6 +653,18 @@ def parse_args():
         "--save_dtype", type=str, default="float16", choices=["float16", "bfloat16"],
         help="Data type to save the quantized model"
     )
+    parser.add_argument(
+        "--save_gptq_checkpoint", action="store_true",
+        help="Save a reusable checkpoint after GPTQ and before router fine-tuning",
+    )
+    parser.add_argument(
+        "--load_gptq_checkpoint", action="store_true",
+        help="Load a reusable post-GPTQ checkpoint and skip pruning and GPTQ",
+    )
+    parser.add_argument(
+        "--gptq_checkpoint_path", type=str, default="",
+        help="Automatically derived reusable GPTQ checkpoint directory",
+    )
     
     return parser.parse_args()
 
@@ -663,25 +700,57 @@ if __name__ == "__main__":
         sys.excepthook = cuda_diagnostics_excepthook
         report_cuda_diagnostics("startup", include_versions=True)
 
-    # load pre-trained model
-    print("Loading model ...")
+    if args.save_gptq_checkpoint and args.load_gptq_checkpoint:
+        raise ValueError(
+            "--save_gptq_checkpoint and --load_gptq_checkpoint are mutually exclusive."
+        )
+    checkpoint_enabled = args.save_gptq_checkpoint or args.load_gptq_checkpoint
+    if checkpoint_enabled and not args.gptq_checkpoint_path:
+        raise ValueError(
+            "--gptq_checkpoint_path is required when saving or loading a GPTQ checkpoint."
+        )
+    if (
+        checkpoint_enabled
+        and args.save_path
+        and os.path.abspath(args.gptq_checkpoint_path) == os.path.abspath(args.save_path)
+    ):
+        raise ValueError("GPTQ checkpoint path and final model save path must differ.")
+    if checkpoint_enabled and args.eval_fp:
+        raise ValueError("Reusable GPTQ checkpoints cannot be combined with --eval_fp.")
+    if checkpoint_enabled and args.real_quant:
+        raise ValueError("Reusable GPTQ checkpoints currently support fake quantization only.")
+    if (
+        checkpoint_enabled
+        and args.finetune_routers
+        and args.rft_trainer == "layerwise_teacher"
+    ):
+        raise ValueError(
+            "Reusable GPTQ checkpoints currently support legacy_ce and distill_ce, "
+            "not layerwise_teacher."
+        )
+    if args.save_gptq_checkpoint and os.path.exists(args.gptq_checkpoint_path):
+        raise FileExistsError(
+            "GPTQ checkpoint already exists and will not be overwritten: "
+            f"{args.gptq_checkpoint_path}"
+        )
+
+    # The tokenizer and calibration inputs always retain the original model identity,
+    # even when the student weights are loaded from a post-GPTQ checkpoint.
+    needs_teacher_targets = (
+        args.finetune_routers
+        and args.rft_trainer in {"distill_ce", "layerwise_teacher"}
+    )
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, use_fast=args.use_fast, trust_remote_code=args.trust_remote_code
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="cpu", torch_dtype=args.model_dtype,
-        attn_implementation=args.attn_impl, trust_remote_code=args.trust_remote_code,
-    )
-    # HF's built-in DeepSeek-V2 omits the YaRN mscale on the attention scale; no-op on
-    # the official implementation, which already applies it.
-    align_deepseek_softmax_scale(model)
 
-    model.seqlen = args.seqlen
-    model.eval()
-    if args.cuda_diagnostics:
-        report_cuda_diagnostics("model loaded", model=model)
+    # Preserve the historical model-before-data order for every fresh quantization.
+    # Only legacy CE checkpoint reuse can avoid loading the source weights entirely.
+    model = None
+    if not args.load_gptq_checkpoint or needs_teacher_targets:
+        description = "source model" if args.load_gptq_checkpoint else "model"
+        model = load_causal_lm(args.model, args, description=description)
 
-    # load calibration dataset
     print("Loading calibration data ...")
     dataloader = get_calib_loader(tokenizer, args)
 
@@ -689,19 +758,38 @@ if __name__ == "__main__":
     # model yet: pruning-aware distillation uses the original full model as teacher.
     expert_bit_cfg = None
     pruning_result = None
+    pruning_metadata = None
     if args.mixed:
         expert_bit_cfg = load_expert_bit_config(args.bit_cfg)
 
     router_ft_config = None
     teacher_targets = None
-    if args.finetune_routers and args.rft_trainer in {"distill_ce", "layerwise_teacher"}:
+    if needs_teacher_targets:
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
         if args.rft_trainer == "distill_ce":
             router_ft_config = DistillCEConfig.from_args(args)
         else:
             router_ft_config = RouterFinetuneConfig.from_args(args)
+
+    calibration_input_ids = None
+    calibration_attention_mask = None
+    if needs_teacher_targets or checkpoint_enabled:
         calibration_input_ids, calibration_attention_mask = materialize_calibration_inputs(dataloader)
+
+    checkpoint_identity = None
+    loaded_checkpoint_metadata = None
+    if checkpoint_enabled:
+        checkpoint_identity = build_gptq_checkpoint_identity(
+            args, calibration_input_ids, calibration_attention_mask
+        )
+    if args.load_gptq_checkpoint:
+        loaded_checkpoint_metadata = load_gptq_checkpoint_metadata(
+            args.gptq_checkpoint_path, checkpoint_identity
+        )
+        pruning_metadata = loaded_checkpoint_metadata.get("pruning")
+
+    if needs_teacher_targets:
         if args.cuda_diagnostics:
             report_cuda_diagnostics("before collecting teacher targets", model=model)
         teacher_targets = get_or_collect_teacher_targets(
@@ -716,19 +804,32 @@ if __name__ == "__main__":
         if args.cuda_diagnostics:
             report_cuda_diagnostics("after collecting teacher targets", model=model)
 
-    if (
-        not args.eval_fp
-        and expert_bit_cfg is not None
-        and has_zero_bit_experts(expert_bit_cfg)
-    ):
-        pruning_result = prune_qwen3_experts(model, args.model_name, expert_bit_cfg)
-        expert_bit_cfg = pruning_result.remapped_bit_config
-        teacher_targets = project_teacher_router_logits(
-            teacher_targets, pruning_result.kept_expert_ids
+    quant_modules = {}
+    if args.load_gptq_checkpoint:
+        if model is not None:
+            del model
+            model = None
+            gc.collect()
+            torch.cuda.empty_cache()
+        model = load_causal_lm(
+            args.gptq_checkpoint_path, args, description="reusable GPTQ student"
         )
+    else:
+        if (
+            not args.eval_fp
+            and expert_bit_cfg is not None
+            and has_zero_bit_experts(expert_bit_cfg)
+        ):
+            pruning_result = prune_qwen3_experts(model, args.model_name, expert_bit_cfg)
+            expert_bit_cfg = pruning_result.remapped_bit_config
+            pruning_metadata = dict(pruning_result.metadata)
+            pruning_metadata["source_bit_config"] = args.bit_cfg
+            teacher_targets = project_teacher_router_logits(
+                teacher_targets, pruning_result.kept_expert_ids
+            )
 
-    # quantize model weights
-    if not args.eval_fp:
+    # quantize model weights unless a validated post-GPTQ student was loaded
+    if not args.eval_fp and not args.load_gptq_checkpoint:
         # quantize and get a name-module mapping of quantized modules
         print(f"Start quantizing model weights ...")
         quantizer = args.quantizer.lower().split("-")[0]
@@ -746,6 +847,17 @@ if __name__ == "__main__":
             )
         else:
             raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
+
+        if args.save_gptq_checkpoint:
+            checkpoint_metadata = build_gptq_checkpoint_metadata(
+                checkpoint_identity, model, pruning_metadata
+            )
+            save_gptq_checkpoint(
+                model,
+                tokenizer,
+                args.gptq_checkpoint_path,
+                checkpoint_metadata,
+            )
     
     # finetune routers
     if args.finetune_routers:
@@ -829,9 +941,7 @@ if __name__ == "__main__":
     if args.save_path:
         print("Saving model ...")
         os.makedirs(args.save_path, exist_ok=True)
-        if pruning_result is not None:
-            pruning_metadata = dict(pruning_result.metadata)
-            pruning_metadata["source_bit_config"] = args.bit_cfg
+        if pruning_metadata is not None:
             with open(
                 os.path.join(args.save_path, "expert_pruning_map.json"),
                 "w",

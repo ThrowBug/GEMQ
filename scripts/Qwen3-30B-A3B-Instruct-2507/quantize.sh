@@ -115,6 +115,9 @@ cuda_diagnostics="${CUDA_DIAGNOSTICS:-false}"
 real_quant=false
 save_model=true
 save_dtype="bfloat16"
+save_gptq_checkpoint="${SAVE_GPTQ_CHECKPOINT:-false}"
+load_gptq_checkpoint="${LOAD_GPTQ_CHECKPOINT:-false}"
+gptq_checkpoint_root="${GPTQ_CHECKPOINT_ROOT:-results/gptq_checkpoints}"
 
 if [[ "${calib_dataset}" == "mixed_chat_en" ]]; then
     if [[ -z "${calib_data_path}" ]]; then
@@ -219,6 +222,26 @@ if [[ "${cuda_diagnostics}" == "true" ]]; then
 fi
 
 prefix="${quant_allocation_tag}"
+gptq_checkpoint_path="${gptq_checkpoint_root}/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}"
+checkpoint_args=()
+if [[ "${save_gptq_checkpoint}" == "true" && "${load_gptq_checkpoint}" == "true" ]]; then
+    echo "SAVE_GPTQ_CHECKPOINT and LOAD_GPTQ_CHECKPOINT cannot both be true." >&2
+    exit 1
+elif [[ "${save_gptq_checkpoint}" == "true" ]]; then
+    if [[ -e "${gptq_checkpoint_path}" ]]; then
+        echo "GPTQ checkpoint already exists and will not be overwritten: ${gptq_checkpoint_path}" >&2
+        echo "Set LOAD_GPTQ_CHECKPOINT=true to reuse it." >&2
+        exit 1
+    fi
+    checkpoint_args=(--save_gptq_checkpoint --gptq_checkpoint_path "${gptq_checkpoint_path}")
+elif [[ "${load_gptq_checkpoint}" == "true" ]]; then
+    if [[ ! -f "${gptq_checkpoint_path}/_SUCCESS" ]]; then
+        echo "Complete GPTQ checkpoint not found: ${gptq_checkpoint_path}" >&2
+        exit 1
+    fi
+    checkpoint_args=(--load_gptq_checkpoint --gptq_checkpoint_path "${gptq_checkpoint_path}")
+fi
+
 if [[ "${save_model}" == "true" ]]; then
     save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
     io_args=(--save_path "${save_path}" --save_dtype "${save_dtype}")
@@ -263,6 +286,11 @@ echo " RFT optimizer:    epochs=${rft_epochs}, batch=${rft_batch_size}, lr=${rft
 echo " Real quant:       ${real_quant}"
 echo " Save dtype:       ${save_dtype}"
 echo " Save path:        ${save_path}"
+echo " Save GPTQ ckpt:   ${save_gptq_checkpoint}"
+echo " Load GPTQ ckpt:   ${load_gptq_checkpoint}"
+if [[ "${save_gptq_checkpoint}" == "true" || "${load_gptq_checkpoint}" == "true" ]]; then
+    echo " GPTQ ckpt path:   ${gptq_checkpoint_path}"
+fi
 echo " CUDA diagnostics: ${cuda_diagnostics}"
 echo "=============================================="
 
@@ -272,4 +300,5 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.quantize \
     "${quant_args[@]}" \
     "${eval_args[@]}" \
     "${diagnostic_args[@]}" \
+    "${checkpoint_args[@]}" \
     "${io_args[@]}"
