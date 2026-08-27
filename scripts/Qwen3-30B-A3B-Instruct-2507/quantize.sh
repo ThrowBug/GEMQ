@@ -157,9 +157,12 @@ if [[ "${reproduce_mcmoe}" == "true" ]]; then
 fi
 if [[ "${mixed_prec}" == "true" ]]; then
     qtype="$(basename "$(dirname "${bit_cfg}")")"
+    bit_cfg_filename="$(basename "${bit_cfg}")"
+    quant_allocation_tag="${bit_cfg_filename%.pkl}"
     quant_args+=(--mixed --bit_cfg "${bit_cfg}")
 else
     qtype="Uniform"
+    quant_allocation_tag="${allocation_tag}"
 fi
 
 rft_tag=""
@@ -215,7 +218,7 @@ if [[ "${cuda_diagnostics}" == "true" ]]; then
     diagnostic_args=(--cuda_diagnostics)
 fi
 
-prefix="${allocation_tag}"
+prefix="${quant_allocation_tag}"
 if [[ "${save_model}" == "true" ]]; then
     save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
     io_args=(--save_path "${save_path}" --save_dtype "${save_dtype}")
@@ -243,6 +246,7 @@ echo " Quantizer:        ${quantizer} (reproduce_mcmoe=${reproduce_mcmoe})"
 echo " Allocation metric:${allocation_metric}"
 echo " Expert bits:      ${bpe} (mixed: ${mixed_prec})"
 echo " Bit config:       ${bit_cfg}"
+echo " Allocation tag:   ${quant_allocation_tag}"
 echo " Attn wbits:       ${attn_wbits}"
 echo " Dense wbits:      ${dense_wbits}"
 echo " Finetune routers: ${finetune_routers} (trainer=${rft_trainer})"
