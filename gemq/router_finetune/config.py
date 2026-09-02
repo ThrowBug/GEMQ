@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from gemq.router_finetune.transfer import TRANSFER_LOSS_TYPES
+
 
 ROUTER_LOSS_TYPES = ("kd", "kd_tail", "l2", "l2_center")
 RFT_TIMINGS = ("after_all_quantization", "after_each_layer_quantization")
@@ -16,6 +18,10 @@ class DistillCEConfig:
     weight_decay: float
     teacher_cache_dir: str
     rebuild_teacher_cache: bool
+    transfer_loss: str
+    transfer_weight: float
+    transfer_anneal_ratio: float
+    transfer_temperature: float
 
     @classmethod
     def from_args(cls, args):
@@ -26,6 +32,10 @@ class DistillCEConfig:
             weight_decay=args.rft_wd,
             teacher_cache_dir=args.rft_teacher_cache_dir,
             rebuild_teacher_cache=args.rft_rebuild_teacher_cache,
+            transfer_loss=getattr(args, "rft_transfer_loss", "none"),
+            transfer_weight=getattr(args, "rft_transfer_weight", 1.0),
+            transfer_anneal_ratio=getattr(args, "rft_transfer_anneal_ratio", 0.2),
+            transfer_temperature=getattr(args, "rft_transfer_temperature", 0.2),
         )
         config.validate()
         return config
@@ -39,6 +49,18 @@ class DistillCEConfig:
             raise ValueError("--rft_lr must be positive.")
         if self.weight_decay < 0.0:
             raise ValueError("--rft_wd must be non-negative.")
+        if self.transfer_loss not in TRANSFER_LOSS_TYPES:
+            raise ValueError(f"Unsupported transfer loss: {self.transfer_loss}")
+        if self.transfer_weight < 0.0:
+            raise ValueError("--rft_transfer_weight must be non-negative.")
+        if not 0.0 < self.transfer_anneal_ratio <= 1.0:
+            raise ValueError("--rft_transfer_anneal_ratio must be in (0, 1].")
+        if self.transfer_temperature <= 0.0:
+            raise ValueError("--rft_transfer_temperature must be positive.")
+        if self.transfer_loss != "none" and self.transfer_weight == 0.0:
+            raise ValueError(
+                "--rft_transfer_weight must be positive when transfer loss is enabled."
+            )
 
     @property
     def needs_router_targets(self):
@@ -47,6 +69,14 @@ class DistillCEConfig:
     @property
     def needs_output_targets(self):
         return True
+
+    @property
+    def needs_router_statistics(self):
+        return self.transfer_loss != "none"
+
+    @property
+    def transfer_enabled(self):
+        return self.transfer_loss != "none"
 
 
 @dataclass(frozen=True)

@@ -96,6 +96,10 @@ rft_lr="${RFT_LR:-1e-4}"
 rft_wd="${RFT_WD:-0.0}"
 rft_teacher_cache_dir="${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}"
 rft_rebuild_teacher_cache="${RFT_REBUILD_TEACHER_CACHE:-false}"
+rft_transfer_loss="${RFT_TRANSFER_LOSS:-none}" # none | prob_corr_kl
+rft_transfer_weight="${RFT_TRANSFER_WEIGHT:-1.0}"
+rft_transfer_anneal_ratio="${RFT_TRANSFER_ANNEAL_RATIO:-0.2}"
+rft_transfer_temperature="${RFT_TRANSFER_TEMPERATURE:-0.2}"
 
 # ===============================
 #  Evaluation settings
@@ -133,6 +137,10 @@ fi
 if [[ "${mixed_prec}" == "true" && ! -f "${bit_cfg}" ]]; then
     echo "Bit allocation config not found: ${bit_cfg}" >&2
     echo "Run scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh first." >&2
+    exit 1
+fi
+if [[ "${rft_transfer_loss}" != "none" && ( "${finetune_routers}" != "true" || "${rft_trainer}" != "distill_ce" ) ]]; then
+    echo "RFT_TRANSFER_LOSS is supported only with FINETUNE_ROUTERS=true and RFT_TRAINER=distill_ce." >&2
     exit 1
 fi
 
@@ -184,7 +192,19 @@ if [[ "${finetune_routers}" == "true" ]]; then
             ;;
         distill_ce)
             rft_tag="_RFT-distill_ce"
-            quant_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
+            quant_args+=(
+                --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
+                --rft_transfer_loss "${rft_transfer_loss}"
+                --rft_transfer_weight "${rft_transfer_weight}"
+                --rft_transfer_anneal_ratio "${rft_transfer_anneal_ratio}"
+                --rft_transfer_temperature "${rft_transfer_temperature}"
+            )
+            if [[ "${rft_transfer_loss}" != "none" ]]; then
+                transfer_weight_tag="${rft_transfer_weight//./p}"
+                transfer_anneal_tag="${rft_transfer_anneal_ratio//./p}"
+                transfer_temperature_tag="${rft_transfer_temperature//./p}"
+                rft_tag+="-transfer_${rft_transfer_loss}-w${transfer_weight_tag}-a${transfer_anneal_tag}-t${transfer_temperature_tag}"
+            fi
             ;;
         layerwise_teacher)
             timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"
@@ -277,6 +297,7 @@ if [[ "${rft_trainer}" == "legacy_ce" ]]; then
     echo " Router objective: hard-label autoregressive CE"
 elif [[ "${rft_trainer}" == "distill_ce" ]]; then
     echo " Router objective: teacher soft-label autoregressive CE"
+    echo " Transfer loss:    ${rft_transfer_loss} (weight=${rft_transfer_weight}, anneal=${rft_transfer_anneal_ratio}, temperature=${rft_transfer_temperature})"
 else
     echo " RFT timing:       ${rft_timing}"
     echo " Router objective: ${rft_router_loss} (alpha=${rft_router_alpha}, weight=${rft_router_loss_weight})"

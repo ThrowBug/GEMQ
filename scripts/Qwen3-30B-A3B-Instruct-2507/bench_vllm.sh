@@ -31,7 +31,16 @@ rft_tag=""
 if [[ "${finetune_routers}" == "true" ]]; then
     case "${rft_trainer}" in
         legacy_ce) rft_tag="_RFT-legacy_ce" ;;
-        distill_ce) rft_tag="_RFT-distill_ce" ;;
+        distill_ce)
+            rft_tag="_RFT-distill_ce"
+            rft_transfer_loss="${RFT_TRANSFER_LOSS:-none}"
+            if [[ "${rft_transfer_loss}" != "none" ]]; then
+                transfer_weight_tag="${RFT_TRANSFER_WEIGHT:-1.0}"; transfer_weight_tag="${transfer_weight_tag//./p}"
+                transfer_anneal_tag="${RFT_TRANSFER_ANNEAL_RATIO:-0.2}"; transfer_anneal_tag="${transfer_anneal_tag//./p}"
+                transfer_temperature_tag="${RFT_TRANSFER_TEMPERATURE:-0.2}"; transfer_temperature_tag="${transfer_temperature_tag//./p}"
+                rft_tag+="-transfer_${rft_transfer_loss}-w${transfer_weight_tag}-a${transfer_anneal_tag}-t${transfer_temperature_tag}"
+            fi
+            ;;
         layerwise_teacher)
             rft_timing="${RFT_TIMING:-after_each_layer_quantization}"
             timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"

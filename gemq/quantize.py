@@ -9,6 +9,7 @@ from functools import partial
 from tqdm import tqdm
 
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, logging
 from hqq.models.hf.base import AutoHQQHFModel
 
@@ -32,6 +33,14 @@ from gemq.router_finetune.config import (
     RouterFinetuneConfig,
 )
 from gemq.router_finetune.losses import compute_causal_output_distill_ce
+from gemq.router_finetune.transfer import (
+    TRANSFER_LOSS_TYPES,
+    build_transfer_matrices,
+    linear_transfer_weight,
+    snapshot_reference_routers,
+    transfer_reference_probabilities,
+    transferred_router_kl,
+)
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
@@ -159,8 +168,15 @@ def finetune_routers(model, dataloader, args):
     model.config.use_cache = use_cache
 
 
-def finetune_routers_distill_ce(model, teacher_targets, args):
-    """Fine-tune all routers jointly using full-precision teacher soft labels."""
+def finetune_routers_distill_ce(
+    model,
+    teacher_targets,
+    args,
+    config,
+    reference_router_weights=None,
+    pruning_metadata=None,
+):
+    """Fine-tune all routers with output distillation and optional transfer KL."""
     if teacher_targets.final_hidden_states is None:
         raise RuntimeError("Distilled CE requires cached teacher final hidden states.")
 
@@ -184,6 +200,117 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
     for p in router_params:
         p.requires_grad = True
 
+    transfer_enabled = config.transfer_enabled
+    transfer_hook_state = {"losses": None, "token_mask": None}
+    transfer_handles = []
+    effective_support = None
+    transfer_artifact = None
+    if transfer_enabled:
+        if teacher_targets.router_stats is None:
+            raise RuntimeError(
+                "Probability transfer requires cached teacher router correlations."
+            )
+        if reference_router_weights is None:
+            raise RuntimeError(
+                "Probability transfer requires complete pre-pruning router weights."
+            )
+        transfer_matrices, kept_ids, pruned_ids, effective_support = (
+            build_transfer_matrices(
+                teacher_targets.router_stats,
+                pruning_metadata,
+                config.transfer_temperature,
+            )
+        )
+        transfer_artifact = {
+            "version": 1,
+            "similarity": "pearson",
+            "temperature": config.transfer_temperature,
+            "mean_effective_support": effective_support,
+            "kept_old_ids": [list(values) for values in kept_ids],
+            "pruned_old_ids": [list(values) for values in pruned_ids],
+            "transfer_matrices": [matrix.cpu() for matrix in transfer_matrices],
+        }
+        student_routers = [
+            router for _name, router in get_router_modules(model, args.model_name)
+        ]
+        if not (
+            len(student_routers)
+            == len(reference_router_weights)
+            == len(transfer_matrices)
+        ):
+            raise ValueError(
+                "Student routers, reference routers, and transfer matrices have "
+                "different layer counts."
+            )
+
+        placed_references = []
+        placed_matrices = []
+        for layer_idx, (student_router, reference, matrix) in enumerate(
+            zip(student_routers, reference_router_weights, transfer_matrices)
+        ):
+            device = student_router.weight.device
+            dtype = student_router.weight.dtype
+            reference_weight = reference.weight.to(device=device, dtype=dtype)
+            reference_bias = None
+            if reference.bias is not None:
+                reference_bias = reference.bias.to(device=device, dtype=dtype)
+            if reference_weight.shape[0] != len(kept_ids[layer_idx]) + len(
+                pruned_ids[layer_idx]
+            ):
+                raise ValueError(
+                    f"Layer {layer_idx} reference router width does not match pruning metadata."
+                )
+            if student_router.weight.shape[0] != len(kept_ids[layer_idx]):
+                raise ValueError(
+                    f"Layer {layer_idx} student router has {student_router.weight.shape[0]} "
+                    f"outputs but pruning metadata keeps {len(kept_ids[layer_idx])}."
+                )
+            placed_references.append((reference_weight, reference_bias))
+            placed_matrices.append(matrix.to(device=device, dtype=torch.float32))
+
+        def make_transfer_hook(layer_idx):
+            def transfer_hook(module, inputs, _output):
+                losses = transfer_hook_state["losses"]
+                if losses is None:
+                    return
+                hidden_states = inputs[0].detach()
+                reference_weight, reference_bias = placed_references[layer_idx]
+                with torch.no_grad():
+                    reference_logits = F.linear(
+                        hidden_states, reference_weight, reference_bias
+                    )
+                    target_probabilities = transfer_reference_probabilities(
+                        reference_logits,
+                        placed_matrices[layer_idx],
+                        kept_ids[layer_idx],
+                        pruned_ids[layer_idx],
+                    )
+                # Recompute only the small router projection on detached inputs so
+                # transfer KL is local to this layer. Distilled CE still supplies
+                # the joint, cross-layer gradient through the normal forward.
+                student_logits = F.linear(
+                    hidden_states, module.weight, module.bias
+                )
+                losses.append(
+                    transferred_router_kl(
+                        student_logits,
+                        target_probabilities,
+                        token_mask=transfer_hook_state["token_mask"],
+                    )
+                )
+
+            return transfer_hook
+
+        for layer_idx, router in enumerate(student_routers):
+            transfer_handles.append(
+                router.register_forward_hook(make_transfer_hook(layer_idx))
+            )
+        print(
+            "Enabled pruning-aware router transfer KL: "
+            f"temperature={config.transfer_temperature}, "
+            f"mean_effective_support={effective_support:.3f}"
+        )
+
     org_pmean, org_gmean = 0.0, 0.0
     for name, param in model.named_parameters():
         if get_module_type(name, args.model_name) == LinearModuleType.GATE:
@@ -196,14 +323,41 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
     head_parameter = next(model.lm_head.parameters())
     head_device = head_parameter.device
     optimizer = torch.optim.AdamW(router_params, lr=args.rft_lr, weight_decay=args.rft_wd)
+    steps_per_epoch = args.nsamples // args.rft_batch_size
+    if steps_per_epoch <= 0:
+        raise ValueError("Router fine-tuning has no complete batches.")
+    total_steps = args.rft_epochs * steps_per_epoch
+    global_step = 0
     for epoch in range(args.rft_epochs):
-        loss_sum = 0.0
+        loss_sums = {"total": 0.0, "distill_ce": 0.0, "transfer_kl": 0.0}
+        weight_sum = 0.0
         start_time = time.time()
-        for i in range(args.nsamples // args.rft_batch_size):
+        for i in range(steps_per_epoch):
             idx = i * args.rft_batch_size
             end = idx + args.rft_batch_size
             data = input_ids[idx:end].to("cuda")
-            outputs = model(input_ids=data)
+            batch_attention_mask = None
+            if teacher_targets.attention_mask is not None:
+                batch_attention_mask = teacher_targets.attention_mask[idx:end].to(
+                    data.device
+                )
+
+            transfer_weight = 0.0
+            if transfer_enabled:
+                transfer_weight = linear_transfer_weight(
+                    config.transfer_weight,
+                    config.transfer_anneal_ratio,
+                    global_step,
+                    total_steps,
+                )
+                transfer_hook_state["losses"] = [] if transfer_weight > 0.0 else None
+                transfer_hook_state["token_mask"] = batch_attention_mask
+
+            outputs = model(
+                input_ids=data,
+                attention_mask=batch_attention_mask,
+                use_cache=False,
+            )
 
             with torch.no_grad():
                 teacher_hidden = teacher_targets.final_hidden_states[idx:end].to(
@@ -213,19 +367,59 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
                 teacher_output_logits = teacher_output_logits.to(
                     device=outputs.logits.device, non_blocking=True
                 )
-            loss = compute_causal_output_distill_ce(outputs.logits, teacher_output_logits)
+            distill_ce_loss = compute_causal_output_distill_ce(
+                outputs.logits,
+                teacher_output_logits,
+                attention_mask=batch_attention_mask,
+            )
+            transfer_kl_loss = None
+            loss = distill_ce_loss
+            if transfer_weight > 0.0:
+                layer_losses = transfer_hook_state["losses"]
+                if len(layer_losses) != len(reference_router_weights):
+                    raise RuntimeError(
+                        f"Expected {len(reference_router_weights)} router transfer losses, "
+                        f"captured {len(layer_losses)}."
+                    )
+                transfer_kl_loss = torch.stack(
+                    [value.to(distill_ce_loss.device) for value in layer_losses]
+                ).mean()
+                loss = loss + transfer_weight * transfer_kl_loss
+            transfer_hook_state["losses"] = None
+            transfer_hook_state["token_mask"] = None
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-            loss_sum += loss.item()
+            loss_sums["total"] += loss.detach().item()
+            loss_sums["distill_ce"] += distill_ce_loss.detach().item()
+            if transfer_kl_loss is not None:
+                loss_sums["transfer_kl"] += transfer_kl_loss.detach().item()
+            weight_sum += transfer_weight
             if i % 32 == 0:
-                print(f"[epoch {epoch} | iter {i:>3d}] loss: {loss_sum / (i+1):.6f}")
-            del outputs, teacher_hidden, teacher_output_logits, loss
+                print(
+                    f"[epoch {epoch} | iter {i:>3d}] "
+                    f"total={loss_sums['total'] / (i + 1):.6f}, "
+                    f"distill_ce={loss_sums['distill_ce'] / (i + 1):.6f}, "
+                    f"transfer_kl={loss_sums['transfer_kl'] / (i + 1):.6f}, "
+                    f"transfer_weight={transfer_weight:.6f}"
+                )
+            global_step += 1
+            del (
+                outputs,
+                teacher_hidden,
+                teacher_output_logits,
+                distill_ce_loss,
+                transfer_kl_loss,
+                loss,
+            )
         elapsed = time.time() - start_time
         print(
-            f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, "
+            f"epoch {epoch:>2}: total={loss_sums['total'] / steps_per_epoch:.6f}, "
+            f"distill_ce={loss_sums['distill_ce'] / steps_per_epoch:.6f}, "
+            f"transfer_kl={loss_sums['transfer_kl'] / steps_per_epoch:.6f}, "
+            f"mean_transfer_weight={weight_sum / steps_per_epoch:.6f}, "
             f"elapse: {elapsed:.2f} seconds"
         )
 
@@ -245,8 +439,16 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
             if args.verbose:
                 print("Sum of routers params after finetuning:", gmean)
 
+    for handle in transfer_handles:
+        handle.remove()
+    optimizer.zero_grad(set_to_none=True)
+    if transfer_enabled:
+        del placed_references, placed_matrices
+        gc.collect()
+        torch.cuda.empty_cache()
     model = model.to(org_dtype)
     model.config.use_cache = use_cache
+    return transfer_artifact
 
 
 @torch.no_grad()
@@ -621,6 +823,23 @@ def parse_args():
         "--rft_rebuild_teacher_cache", action="store_true",
         help="Recompute teacher targets even when a matching cache exists"
     )
+    parser.add_argument(
+        "--rft_transfer_loss", type=str, default="none",
+        choices=TRANSFER_LOSS_TYPES,
+        help="Optional pruning-aware router probability-transfer loss for distill_ce"
+    )
+    parser.add_argument(
+        "--rft_transfer_weight", type=float, default=1.0,
+        help="Initial weight of the pruning-aware router transfer KL"
+    )
+    parser.add_argument(
+        "--rft_transfer_anneal_ratio", type=float, default=0.2,
+        help="Fraction of router fine-tuning steps over which transfer KL anneals to zero"
+    )
+    parser.add_argument(
+        "--rft_transfer_temperature", type=float, default=0.2,
+        help="Softmax temperature used to build correlation-based transfer matrices"
+    )
 
     # evaluation args
     parser.add_argument(
@@ -704,6 +923,13 @@ if __name__ == "__main__":
         raise ValueError(
             "--save_gptq_checkpoint and --load_gptq_checkpoint are mutually exclusive."
         )
+    if args.rft_transfer_loss != "none" and (
+        not args.finetune_routers or args.rft_trainer != "distill_ce"
+    ):
+        raise ValueError(
+            "--rft_transfer_loss is supported only with "
+            "--finetune_routers --rft_trainer distill_ce."
+        )
     checkpoint_enabled = args.save_gptq_checkpoint or args.load_gptq_checkpoint
     if checkpoint_enabled and not args.gptq_checkpoint_path:
         raise ValueError(
@@ -764,6 +990,8 @@ if __name__ == "__main__":
 
     router_ft_config = None
     teacher_targets = None
+    reference_router_weights = None
+    router_transfer_artifact = None
     if needs_teacher_targets:
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
@@ -801,6 +1029,23 @@ if __name__ == "__main__":
             args,
             router_ft_config,
         )
+        if (
+            args.rft_trainer == "distill_ce"
+            and router_ft_config.transfer_enabled
+        ):
+            reference_router_weights = snapshot_reference_routers(
+                model, args.model_name
+            )
+            reference_parameter_count = sum(
+                item.weight.numel()
+                + (0 if item.bias is None else item.bias.numel())
+                for item in reference_router_weights
+            )
+            print(
+                "Snapshotted complete pre-pruning routers for probability transfer: "
+                f"{reference_parameter_count:,} BF16 parameters "
+                f"({reference_parameter_count * 2 / (1024 ** 2):.2f} MiB)."
+            )
         if args.cuda_diagnostics:
             report_cuda_diagnostics("after collecting teacher targets", model=model)
 
@@ -826,6 +1071,20 @@ if __name__ == "__main__":
             pruning_metadata["source_bit_config"] = args.bit_cfg
             teacher_targets = project_teacher_router_logits(
                 teacher_targets, pruning_result.kept_expert_ids
+            )
+
+    if (
+        router_ft_config is not None
+        and args.rft_trainer == "distill_ce"
+        and router_ft_config.transfer_enabled
+    ):
+        if (
+            pruning_metadata is None
+            or int(pruning_metadata.get("pruned_experts_per_layer", 0)) <= 0
+        ):
+            raise ValueError(
+                "Probability-transfer router fine-tuning requires a zero-bit "
+                "allocation with physically pruned experts."
             )
 
     # quantize model weights unless a validated post-GPTQ student was loaded
@@ -890,7 +1149,14 @@ if __name__ == "__main__":
                 report_cuda_diagnostics(
                     "before distilled-CE router fine-tuning", model=model
                 )
-            finetune_routers_distill_ce(model, teacher_targets, args)
+            router_transfer_artifact = finetune_routers_distill_ce(
+                model,
+                teacher_targets,
+                args,
+                router_ft_config,
+                reference_router_weights=reference_router_weights,
+                pruning_metadata=pruning_metadata,
+            )
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
             evaluate_perplexity(
@@ -953,6 +1219,11 @@ if __name__ == "__main__":
                 os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"
             ) as f:
                 json.dump({"trainer": args.rft_trainer, **vars(router_ft_config)}, f, indent=4)
+        if router_transfer_artifact is not None:
+            torch.save(
+                router_transfer_artifact,
+                os.path.join(args.save_path, "router_transfer_matrices.pt"),
+            )
 
         if args.real_quant:
             # for real quant, replace nn.Linear to HQQLinear for weight packing and saving

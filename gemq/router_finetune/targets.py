@@ -8,6 +8,12 @@ from pathlib import Path
 import torch
 import transformers
 
+from gemq.router_finetune.transfer import (
+    router_statistics_from_cached_layers,
+    router_statistics_from_logits,
+    stack_router_statistics,
+    validate_router_statistics,
+)
 from gemq.utils.model_utils import (
     compute_decoder_inputs,
     extract_router_logits,
@@ -26,6 +32,7 @@ class TeacherTargets:
     router_logits: tuple[torch.Tensor, ...] | None
     final_hidden_states: torch.Tensor | None
     metadata: dict
+    router_stats: dict | None = None
 
     def router_logits_for_layer(self, layer_idx):
         if self.router_logits is None:
@@ -67,6 +74,7 @@ def project_teacher_router_logits(targets, kept_expert_ids):
         router_logits=tuple(projected),
         final_hidden_states=targets.final_hidden_states,
         metadata=metadata,
+        router_stats=targets.router_stats,
     )
 
 
@@ -169,7 +177,14 @@ def _torch_load(path):
         return torch.load(path, map_location="cpu")
 
 
-def _load_cached_targets(cache_path, identity, input_ids, attention_mask, config):
+def _load_cached_targets(
+    cache_path,
+    identity,
+    input_ids,
+    attention_mask,
+    config,
+    require_all=True,
+):
     metadata_path = cache_path / "metadata.json"
     inputs_path = cache_path / "calibration_inputs.pt"
     if not metadata_path.is_file() or not inputs_path.is_file():
@@ -196,25 +211,35 @@ def _load_cached_targets(cache_path, identity, input_ids, attention_mask, config
         required.add("router_logits")
     if config.needs_output_targets:
         required.add("final_hidden_states")
-    if not required.issubset(available):
+    if getattr(config, "needs_router_statistics", False):
+        required.add("router_correlation")
+    if require_all and not required.issubset(available):
         return None
 
     router_logits = None
-    if config.needs_router_targets:
+    if config.needs_router_targets and "router_logits" in available:
         router_payload = _torch_load(cache_path / "router_logits.pt")
         router_logits = tuple(router_payload["router_logits"])
     final_hidden_states = None
-    if config.needs_output_targets:
+    if config.needs_output_targets and "final_hidden_states" in available:
         final_payload = _torch_load(cache_path / "final_hidden_states.pt")
         final_hidden_states = final_payload["final_hidden_states"]
+    router_stats = None
+    if (
+        getattr(config, "needs_router_statistics", False)
+        and "router_correlation" in available
+    ):
+        router_stats = _torch_load(cache_path / "router_stats.pt")
 
-    print(f"Loaded validated teacher targets from: {cache_path}")
+    if require_all:
+        print(f"Loaded validated teacher targets from: {cache_path}")
     return TeacherTargets(
         input_ids=input_ids,
         attention_mask=attention_mask,
         router_logits=router_logits,
         final_hidden_states=final_hidden_states,
         metadata=metadata,
+        router_stats=router_stats,
     )
 
 
@@ -250,6 +275,9 @@ def _save_targets(cache_path, identity, targets):
             cache_path / "final_hidden_states.pt",
         )
         available.add("final_hidden_states")
+    if targets.router_stats is not None:
+        _atomic_torch_save(targets.router_stats, cache_path / "router_stats.pt")
+        available.add("router_correlation")
 
     metadata = {"identity": identity, "available_targets": sorted(available)}
     temp_path = metadata_path.with_suffix(".json.tmp")
@@ -269,7 +297,17 @@ def _extract_layer_hidden(layer_output):
 
 
 @torch.no_grad()
-def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, config):
+def collect_teacher_targets(
+    model,
+    dataloader,
+    input_ids,
+    attention_mask,
+    args,
+    config,
+    collect_router_targets=None,
+    collect_output_targets=None,
+    collect_router_statistics=None,
+):
     """Collect targets from one complete, unquantized layer-wise teacher pass."""
     print("Collecting full-precision teacher targets ...")
     original_training = model.training
@@ -284,14 +322,31 @@ def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, 
         )
     layers = get_blocks(model, args.model_name)
     outs = torch.empty_like(inps)
-    all_router_logits = [] if config.needs_router_targets else None
+    collect_router_targets = (
+        config.needs_router_targets
+        if collect_router_targets is None
+        else collect_router_targets
+    )
+    collect_output_targets = (
+        config.needs_output_targets
+        if collect_output_targets is None
+        else collect_output_targets
+    )
+    collect_router_statistics = (
+        getattr(config, "needs_router_statistics", False)
+        if collect_router_statistics is None
+        else collect_router_statistics
+    )
+    needs_router_forward = collect_router_targets or collect_router_statistics
+    all_router_logits = [] if collect_router_targets else None
+    all_router_statistics = [] if collect_router_statistics else None
 
     for layer_idx, layer in enumerate(layers):
         layer = layer.to("cuda")
         layers[layer_idx] = layer
         captured = []
         handle = None
-        if config.needs_router_targets:
+        if needs_router_forward:
             _, router = get_router_module(layer, args.model_name)
 
             def capture_router_logits(_module, _inputs, output):
@@ -311,7 +366,12 @@ def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, 
                 )
             layer_logits = torch.cat(captured, dim=0)
             layer_logits = layer_logits.reshape(input_ids.shape[0], input_ids.shape[1], -1).contiguous()
-            all_router_logits.append(layer_logits)
+            if collect_router_targets:
+                all_router_logits.append(layer_logits)
+            if collect_router_statistics:
+                all_router_statistics.append(
+                    router_statistics_from_logits(layer_logits, attention_mask)
+                )
 
         inps, outs = outs, inps
         layers[layer_idx] = layer.to("cpu")
@@ -319,7 +379,7 @@ def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, 
         torch.cuda.empty_cache()
 
     final_hidden_states = None
-    if config.needs_output_targets:
+    if collect_output_targets:
         norm = model.model.norm.to("cuda")
         final_chunks = []
         for start in range(0, inps.shape[0], config.batch_size):
@@ -338,15 +398,21 @@ def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, 
         router_logits=tuple(all_router_logits) if all_router_logits is not None else None,
         final_hidden_states=final_hidden_states,
         metadata={},
+        router_stats=(
+            stack_router_statistics(all_router_statistics)
+            if all_router_statistics is not None
+            else None
+        ),
     )
 
 
 def _validate_target_shapes(targets, model, args, config):
     expected_tokens = tuple(targets.input_ids.shape)
+    expected_layers = len(get_blocks(model, args.model_name))
+    expected_experts = getattr(model.config, "num_experts", None)
     if config.needs_router_targets:
         if targets.router_logits is None:
             raise ValueError("Teacher targets are missing router logits.")
-        expected_layers = len(get_blocks(model, args.model_name))
         if len(targets.router_logits) != expected_layers:
             raise ValueError(
                 f"Teacher cache has {len(targets.router_logits)} router layers; "
@@ -358,7 +424,6 @@ def _validate_target_shapes(targets, model, args, config):
                     f"Layer {layer_idx} teacher router shape {tuple(logits.shape)} does not "
                     f"match calibration inputs {expected_tokens}."
                 )
-            expected_experts = getattr(model.config, "num_experts", None)
             if expected_experts is not None and logits.shape[-1] != expected_experts:
                 raise ValueError(
                     f"Layer {layer_idx} teacher cache has {logits.shape[-1]} experts; "
@@ -373,9 +438,17 @@ def _validate_target_shapes(targets, model, args, config):
                 f"Teacher final hidden shape {tuple(targets.final_hidden_states.shape)} does not "
                 f"match {expected_shape}."
             )
+    if getattr(config, "needs_router_statistics", False):
+        validate_router_statistics(
+            targets.router_stats,
+            expected_layers=expected_layers,
+            expected_experts=expected_experts,
+        )
 
 
-def get_or_collect_teacher_targets(model, tokenizer, dataloader, input_ids, attention_mask, args, config):
+def get_or_collect_teacher_targets(
+    model, tokenizer, dataloader, input_ids, attention_mask, args, config
+):
     identity = _build_cache_identity(model, tokenizer, input_ids, attention_mask, args)
     cache_path = _cache_path(config.teacher_cache_dir, identity)
     if not config.rebuild_teacher_cache:
@@ -383,6 +456,77 @@ def get_or_collect_teacher_targets(model, tokenizer, dataloader, input_ids, atte
         if cached is not None:
             _validate_target_shapes(cached, model, args, config)
             return cached
+
+        partial = _load_cached_targets(
+            cache_path,
+            identity,
+            input_ids,
+            attention_mask,
+            config,
+            require_all=False,
+        )
+        if partial is not None:
+            if (
+                getattr(config, "needs_router_statistics", False)
+                and partial.router_stats is None
+                and "router_logits" in partial.metadata.get("available_targets", [])
+            ):
+                payload = _torch_load(cache_path / "router_logits.pt")
+                partial.router_stats = router_statistics_from_cached_layers(
+                    tuple(payload["router_logits"]), attention_mask
+                )
+                print(
+                    "Derived router correlation statistics from existing cached "
+                    f"router logits: {cache_path}"
+                )
+
+            missing_router = config.needs_router_targets and partial.router_logits is None
+            missing_output = (
+                config.needs_output_targets and partial.final_hidden_states is None
+            )
+            missing_statistics = (
+                getattr(config, "needs_router_statistics", False)
+                and partial.router_stats is None
+            )
+            if not (missing_router or missing_output or missing_statistics):
+                _validate_target_shapes(partial, model, args, config)
+                _save_targets(cache_path, identity, partial)
+                return partial
+
+            collected = collect_teacher_targets(
+                model,
+                dataloader,
+                input_ids,
+                attention_mask,
+                args,
+                config,
+                collect_router_targets=missing_router,
+                collect_output_targets=missing_output,
+                collect_router_statistics=missing_statistics,
+            )
+            targets = TeacherTargets(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                router_logits=(
+                    collected.router_logits
+                    if missing_router
+                    else partial.router_logits
+                ),
+                final_hidden_states=(
+                    collected.final_hidden_states
+                    if missing_output
+                    else partial.final_hidden_states
+                ),
+                metadata=partial.metadata,
+                router_stats=(
+                    collected.router_stats
+                    if missing_statistics
+                    else partial.router_stats
+                ),
+            )
+            _validate_target_shapes(targets, model, args, config)
+            _save_targets(cache_path, identity, targets)
+            return targets
 
     targets = collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, config)
     _validate_target_shapes(targets, model, args, config)

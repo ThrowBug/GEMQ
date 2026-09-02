@@ -67,6 +67,32 @@ def test_distill_ce_has_independent_target_requirements():
     assert "distill_ce" in RFT_TRAINERS
     assert not config.needs_router_targets
     assert config.needs_output_targets
+    assert not config.needs_router_statistics
+
+
+def test_distill_ce_transfer_requires_router_statistics():
+    config = DistillCEConfig.from_args(
+        _args(
+            rft_transfer_loss="prob_corr_kl",
+            rft_transfer_weight=1.0,
+            rft_transfer_anneal_ratio=0.2,
+            rft_transfer_temperature=0.2,
+        )
+    )
+    assert config.transfer_enabled
+    assert config.needs_router_statistics
+
+
+def test_distill_ce_transfer_rejects_zero_weight():
+    with pytest.raises(ValueError, match="must be positive"):
+        DistillCEConfig.from_args(
+            _args(
+                rft_transfer_loss="prob_corr_kl",
+                rft_transfer_weight=0.0,
+                rft_transfer_anneal_ratio=0.2,
+                rft_transfer_temperature=0.2,
+            )
+        )
 
 
 def test_distill_ce_does_not_validate_layerwise_loss_arguments():
