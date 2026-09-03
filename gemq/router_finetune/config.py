@@ -16,6 +16,7 @@ class DistillCEConfig:
     weight_decay: float
     teacher_cache_dir: str
     rebuild_teacher_cache: bool
+    transfer_weight: float
 
     @classmethod
     def from_args(cls, args):
@@ -26,6 +27,7 @@ class DistillCEConfig:
             weight_decay=args.rft_wd,
             teacher_cache_dir=args.rft_teacher_cache_dir,
             rebuild_teacher_cache=args.rft_rebuild_teacher_cache,
+            transfer_weight=float(getattr(args, "rft_transfer_weight", 0.0)),
         )
         config.validate()
         return config
@@ -39,6 +41,12 @@ class DistillCEConfig:
             raise ValueError("--rft_lr must be positive.")
         if self.weight_decay < 0.0:
             raise ValueError("--rft_wd must be non-negative.")
+        if self.transfer_weight < 0.0:
+            raise ValueError("--rft_transfer_weight must be non-negative.")
+
+    @property
+    def transfer_enabled(self):
+        return self.transfer_weight > 0.0
 
     @property
     def needs_router_targets(self):

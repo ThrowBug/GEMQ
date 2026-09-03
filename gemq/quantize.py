@@ -32,15 +32,22 @@ from gemq.router_finetune.config import (
     RouterFinetuneConfig,
 )
 from gemq.router_finetune.losses import compute_causal_output_distill_ce
+from gemq.router_finetune.output_reconstruction import cosine_transfer_weight
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
     project_teacher_router_logits,
 )
 from gemq.pruning import (
+    consume_qwen3_output_reconstruction,
     has_zero_bit_experts,
     load_expert_bit_config,
+    mask_qwen3_experts,
     prune_qwen3_experts,
+    remap_quantized_module_names,
+    restore_pruned_router_rows,
+    set_qwen3_output_reconstruction,
+    snapshot_pruned_router_rows,
 )
 from gemq.router_finetune.trainer import (
     finetune_router_after_layer_quantization,
@@ -159,10 +166,27 @@ def finetune_routers(model, dataloader, args):
     model.config.use_cache = use_cache
 
 
-def finetune_routers_distill_ce(model, teacher_targets, args):
+def _global_gradient_norm(gradients, reduction_device=None):
+    if reduction_device is None:
+        reduction_device = next(
+            (gradient.device for gradient in gradients if gradient is not None),
+            torch.device("cpu"),
+        )
+    squared_norm = torch.zeros((), device=reduction_device, dtype=torch.float)
+    for gradient in gradients:
+        if gradient is None:
+            continue
+        value = gradient.detach().float().square().sum().to(reduction_device)
+        squared_norm = squared_norm + value
+    return float(squared_norm.sqrt().item())
+
+
+def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
     """Fine-tune all routers jointly using full-precision teacher soft labels."""
     if teacher_targets.final_hidden_states is None:
         raise RuntimeError("Distilled CE requires cached teacher final hidden states.")
+    if config is None:
+        config = DistillCEConfig.from_args(args)
 
     # Keep the optimizer, model mode, dtype, batching, and trainable parameters aligned
     # with finetune_routers(); only the hard-label CE objective changes.
@@ -196,57 +220,156 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
     head_parameter = next(model.lm_head.parameters())
     head_device = head_parameter.device
     optimizer = torch.optim.AdamW(router_params, lr=args.rft_lr, weight_decay=args.rft_wd)
-    for epoch in range(args.rft_epochs):
-        loss_sum = 0.0
-        start_time = time.time()
-        for i in range(args.nsamples // args.rft_batch_size):
-            idx = i * args.rft_batch_size
-            end = idx + args.rft_batch_size
-            data = input_ids[idx:end].to("cuda")
-            outputs = model(input_ids=data)
+    num_batches = args.nsamples // args.rft_batch_size
+    if num_batches <= 0:
+        raise ValueError("Router fine-tuning has no complete batches.")
+    total_steps = args.rft_epochs * num_batches
+    global_step = 0
+    router_row_snapshots = None
+    transfer_collection_enabled = False
 
-            with torch.no_grad():
-                teacher_hidden = teacher_targets.final_hidden_states[idx:end].to(
-                    device=head_device, dtype=head_parameter.dtype
+    try:
+        if config.transfer_enabled:
+            set_qwen3_output_reconstruction(model, args.model_name, True)
+            transfer_collection_enabled = True
+            router_row_snapshots = snapshot_pruned_router_rows(
+                model, args.model_name
+            )
+
+        for epoch in range(args.rft_epochs):
+            total_sum = 0.0
+            distill_sum = 0.0
+            transfer_sum = 0.0
+            start_time = time.time()
+            for i in range(num_batches):
+                idx = i * args.rft_batch_size
+                end = idx + args.rft_batch_size
+                data = input_ids[idx:end].to("cuda")
+                outputs = model(input_ids=data)
+
+                with torch.no_grad():
+                    teacher_hidden = teacher_targets.final_hidden_states[idx:end].to(
+                        device=head_device, dtype=head_parameter.dtype
+                    )
+                    teacher_output_logits = model.lm_head(teacher_hidden)
+                    teacher_output_logits = teacher_output_logits.to(
+                        device=outputs.logits.device, non_blocking=True
+                    )
+                distill_loss = compute_causal_output_distill_ce(
+                    outputs.logits, teacher_output_logits
                 )
-                teacher_output_logits = model.lm_head(teacher_hidden)
-                teacher_output_logits = teacher_output_logits.to(
-                    device=outputs.logits.device, non_blocking=True
-                )
-            loss = compute_causal_output_distill_ce(outputs.logits, teacher_output_logits)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                transfer_batch = None
+                transfer_loss = distill_loss.new_zeros(())
+                transfer_weight = 0.0
+                if config.transfer_enabled:
+                    transfer_batch = consume_qwen3_output_reconstruction(
+                        model, args.model_name, loss_device=distill_loss.device
+                    )
+                    transfer_loss = transfer_batch.loss
+                    transfer_weight = cosine_transfer_weight(
+                        config.transfer_weight, global_step, total_steps
+                    )
+                total_loss = distill_loss + transfer_weight * transfer_loss
 
-            loss_sum += loss.item()
-            if i % 32 == 0:
-                print(f"[epoch {epoch} | iter {i:>3d}] loss: {loss_sum / (i+1):.6f}")
-            del outputs, teacher_hidden, teacher_output_logits, loss
-        elapsed = time.time() - start_time
-        print(
-            f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, "
-            f"elapse: {elapsed:.2f} seconds"
-        )
-
-        if epoch == 0:
-            pmean, gmean = 0.0, 0.0
-            for name, param in model.named_parameters():
-                if get_module_type(name, args.model_name) == LinearModuleType.GATE:
-                    gmean += param.mean().item()
+                should_log = i % 32 == 0
+                optimizer.zero_grad(set_to_none=True)
+                grad_ratio_raw = None
+                grad_ratio_weighted = None
+                if config.transfer_enabled and should_log:
+                    distill_gradients = torch.autograd.grad(
+                        distill_loss,
+                        router_params,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    transfer_gradients = torch.autograd.grad(
+                        transfer_loss,
+                        router_params,
+                        allow_unused=True,
+                    )
+                    for parameter, distill_gradient, transfer_gradient in zip(
+                        router_params, distill_gradients, transfer_gradients
+                    ):
+                        if distill_gradient is None and transfer_gradient is None:
+                            continue
+                        combined = (
+                            torch.zeros_like(parameter)
+                            if distill_gradient is None
+                            else distill_gradient
+                        )
+                        if transfer_gradient is not None:
+                            combined = combined + transfer_weight * transfer_gradient
+                        parameter.grad = combined
+                    distill_norm = _global_gradient_norm(
+                        distill_gradients, reduction_device=distill_loss.device
+                    )
+                    transfer_norm = _global_gradient_norm(
+                        transfer_gradients, reduction_device=distill_loss.device
+                    )
+                    grad_ratio_raw = transfer_norm / (distill_norm + 1e-12)
+                    grad_ratio_weighted = transfer_weight * grad_ratio_raw
                 else:
-                    pmean += param.mean().item()
+                    total_loss.backward()
 
-            assert math.fabs(org_pmean - pmean) < 1e-8, \
-                "Other parameters are changing during router fine-tuning!"
-            assert math.fabs(org_gmean - gmean) > 1e-10, \
-                "Routers are not changing during fine-tuning!"
-            print("Sanity check passed!")
-            if args.verbose:
-                print("Sum of routers params after finetuning:", gmean)
+                optimizer.step()
+                if router_row_snapshots is not None:
+                    restore_pruned_router_rows(router_row_snapshots)
 
-    model = model.to(org_dtype)
-    model.config.use_cache = use_cache
+                total_sum += total_loss.item()
+                distill_sum += distill_loss.item()
+                transfer_sum += transfer_loss.item()
+                if should_log:
+                    if transfer_batch is None:
+                        print(
+                            f"[epoch {epoch} | iter {i:>3d}] "
+                            f"loss: {total_sum / (i + 1):.6f}"
+                        )
+                    else:
+                        print(
+                            f"[epoch {epoch} | iter {i:>3d}] "
+                            f"total={total_sum / (i + 1):.6f}, "
+                            f"distill_ce={distill_sum / (i + 1):.6f}, "
+                            f"transfer_kl={transfer_sum / (i + 1):.6f}, "
+                            f"transfer_weight={transfer_weight:.6f}, "
+                            f"grad_ratio_raw={grad_ratio_raw:.6f}, "
+                            f"grad_ratio_weighted={grad_ratio_weighted:.6f}, "
+                            f"pruned_hit_rate={transfer_batch.pruned_hit_rate:.6f}, "
+                            f"lost_mass={transfer_batch.lost_mass:.6f}, "
+                            f"fit_error={transfer_batch.fit_error:.6f}, "
+                            f"layer_error_before={transfer_batch.layer_error_before:.6f}, "
+                            f"layer_error_after={transfer_batch.layer_error_after:.6f}, "
+                            f"relative_improvement={transfer_batch.relative_improvement:.6f}"
+                        )
+                global_step += 1
+                del outputs, teacher_hidden, teacher_output_logits
+                del distill_loss, transfer_loss, total_loss, transfer_batch
+            elapsed = time.time() - start_time
+            print(
+                f"epoch {epoch:>2} loss: {total_sum / num_batches:.6f}, "
+                f"elapse: {elapsed:.2f} seconds"
+            )
+
+            if epoch == 0:
+                pmean, gmean = 0.0, 0.0
+                for name, param in model.named_parameters():
+                    if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+                        gmean += param.mean().item()
+                    else:
+                        pmean += param.mean().item()
+
+                assert math.fabs(org_pmean - pmean) < 1e-8, \
+                    "Other parameters are changing during router fine-tuning!"
+                assert math.fabs(org_gmean - gmean) > 1e-10, \
+                    "Routers are not changing during fine-tuning!"
+                print("Sanity check passed!")
+                if args.verbose:
+                    print("Sum of routers params after finetuning:", gmean)
+    finally:
+        if transfer_collection_enabled:
+            set_qwen3_output_reconstruction(model, args.model_name, False)
+        model = model.to(org_dtype)
+        model.config.use_cache = use_cache
 
 
 @torch.no_grad()
@@ -257,6 +380,7 @@ def quantize_weights_gptq(
     router_ft_config=None,
     teacher_targets=None,
     expert_bit_cfg=None,
+    allow_zero_bit_experts=False,
 ):
     """
     Perform mixed-precision weight-only quantization with GPTQ quantizer.
@@ -273,7 +397,12 @@ def quantize_weights_gptq(
         report_cuda_diagnostics("before GPTQ quantization", model=model)
 
     # build a bit allocation config for each Linear module
-    bit_cfg = build_alloc_cfg(model, args, expert_bit_cfg=expert_bit_cfg)
+    bit_cfg = build_alloc_cfg(
+        model,
+        args,
+        expert_bit_cfg=expert_bit_cfg,
+        allow_zero_bit_experts=allow_zero_bit_experts,
+    )
 
     # prepare decoder inputs and kwargs for model forward
     inps, layer_kwargs = compute_decoder_inputs(model, dataloader, args.model_name, "cuda")
@@ -621,6 +750,13 @@ def parse_args():
         "--rft_rebuild_teacher_cache", action="store_true",
         help="Recompute teacher targets even when a matching cache exists"
     )
+    parser.add_argument(
+        "--rft_transfer_weight", type=float, default=0.0,
+        help=(
+            "Initial weight of online zero-bit expert output-reconstruction KL; "
+            "cosine-decayed to zero over the complete distilled-CE run"
+        ),
+    )
 
     # evaluation args
     parser.add_argument(
@@ -734,6 +870,23 @@ if __name__ == "__main__":
             f"{args.gptq_checkpoint_path}"
         )
 
+    transfer_enabled = args.rft_transfer_weight > 0.0
+    if args.rft_transfer_weight < 0.0:
+        raise ValueError("--rft_transfer_weight must be non-negative.")
+    if transfer_enabled and (
+        not args.finetune_routers or args.rft_trainer != "distill_ce"
+    ):
+        raise ValueError(
+            "--rft_transfer_weight > 0 requires --finetune_routers and "
+            "--rft_trainer distill_ce."
+        )
+    if transfer_enabled and not args.mixed:
+        raise ValueError("Output-reconstruction transfer requires --mixed.")
+    if transfer_enabled and NAME_TO_MODEL.get(args.model_name) != ModelType.QWEN3MOE:
+        raise NotImplementedError(
+            "Output-reconstruction transfer currently supports Qwen3-MoE only."
+        )
+
     # The tokenizer and calibration inputs always retain the original model identity,
     # even when the student weights are loaded from a post-GPTQ checkpoint.
     needs_teacher_targets = (
@@ -759,8 +912,13 @@ if __name__ == "__main__":
     expert_bit_cfg = None
     pruning_result = None
     pruning_metadata = None
+    masked_pruning_active = False
     if args.mixed:
         expert_bit_cfg = load_expert_bit_config(args.bit_cfg)
+    if transfer_enabled and not has_zero_bit_experts(expert_bit_cfg):
+        raise ValueError(
+            "Output-reconstruction transfer requires at least one 0-bit expert."
+        )
 
     router_ft_config = None
     teacher_targets = None
@@ -785,7 +943,9 @@ if __name__ == "__main__":
         )
     if args.load_gptq_checkpoint:
         loaded_checkpoint_metadata = load_gptq_checkpoint_metadata(
-            args.gptq_checkpoint_path, checkpoint_identity
+            args.gptq_checkpoint_path,
+            checkpoint_identity,
+            expected_expert_pruning_state="masked" if transfer_enabled else None,
         )
         pruning_metadata = loaded_checkpoint_metadata.get("pruning")
 
@@ -814,19 +974,36 @@ if __name__ == "__main__":
         model = load_causal_lm(
             args.gptq_checkpoint_path, args, description="reusable GPTQ student"
         )
+        if loaded_checkpoint_metadata.get("expert_pruning_state") == "masked":
+            if expert_bit_cfg is None:
+                raise ValueError("A masked GPTQ checkpoint requires --mixed and --bit_cfg.")
+            pruning_result = mask_qwen3_experts(
+                model, args.model_name, expert_bit_cfg
+            )
+            masked_pruning_active = True
     else:
         if (
             not args.eval_fp
             and expert_bit_cfg is not None
             and has_zero_bit_experts(expert_bit_cfg)
         ):
-            pruning_result = prune_qwen3_experts(model, args.model_name, expert_bit_cfg)
-            expert_bit_cfg = pruning_result.remapped_bit_config
-            pruning_metadata = dict(pruning_result.metadata)
-            pruning_metadata["source_bit_config"] = args.bit_cfg
-            teacher_targets = project_teacher_router_logits(
-                teacher_targets, pruning_result.kept_expert_ids
-            )
+            if transfer_enabled:
+                pruning_result = mask_qwen3_experts(
+                    model, args.model_name, expert_bit_cfg
+                )
+                masked_pruning_active = True
+                pruning_metadata = dict(pruning_result.metadata)
+                pruning_metadata["source_bit_config"] = args.bit_cfg
+            else:
+                pruning_result = prune_qwen3_experts(
+                    model, args.model_name, expert_bit_cfg
+                )
+                expert_bit_cfg = pruning_result.remapped_bit_config
+                pruning_metadata = dict(pruning_result.metadata)
+                pruning_metadata["source_bit_config"] = args.bit_cfg
+                teacher_targets = project_teacher_router_logits(
+                    teacher_targets, pruning_result.kept_expert_ids
+                )
 
     # quantize model weights unless a validated post-GPTQ student was loaded
     if not args.eval_fp and not args.load_gptq_checkpoint:
@@ -844,13 +1021,21 @@ if __name__ == "__main__":
                 layerwise_config,
                 teacher_targets,
                 expert_bit_cfg,
+                allow_zero_bit_experts=masked_pruning_active,
             )
         else:
             raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
 
         if args.save_gptq_checkpoint:
             checkpoint_metadata = build_gptq_checkpoint_metadata(
-                checkpoint_identity, model, pruning_metadata
+                checkpoint_identity,
+                model,
+                pruning_metadata,
+                expert_pruning_state=(
+                    "masked"
+                    if masked_pruning_active
+                    else ("physical" if pruning_metadata is not None else "none")
+                ),
             )
             save_gptq_checkpoint(
                 model,
@@ -890,7 +1075,9 @@ if __name__ == "__main__":
                 report_cuda_diagnostics(
                     "before distilled-CE router fine-tuning", model=model
                 )
-            finetune_routers_distill_ce(model, teacher_targets, args)
+            finetune_routers_distill_ce(
+                model, teacher_targets, args, router_ft_config
+            )
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
             evaluate_perplexity(
@@ -911,6 +1098,20 @@ if __name__ == "__main__":
         else:
             # Interleaved fine-tuning already happened inside quantize_weights_gptq.
             model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
+
+    if masked_pruning_active:
+        pruning_result = prune_qwen3_experts(
+            model, args.model_name, expert_bit_cfg
+        )
+        quant_modules = remap_quantized_module_names(
+            quant_modules, pruning_result
+        )
+        expert_bit_cfg = pruning_result.remapped_bit_config
+        pruning_metadata = dict(pruning_result.metadata)
+        pruning_metadata["source_bit_config"] = args.bit_cfg
+        pruning_metadata["training_state"] = "masked"
+        pruning_metadata["final_state"] = "physical"
+        masked_pruning_active = False
 
     # evaluate model
     print("Evaluating model ...")

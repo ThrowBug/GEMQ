@@ -96,6 +96,16 @@ rft_lr="${RFT_LR:-1e-4}"
 rft_wd="${RFT_WD:-0.0}"
 rft_teacher_cache_dir="${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}"
 rft_rebuild_teacher_cache="${RFT_REBUILD_TEACHER_CACHE:-false}"
+rft_transfer_weight="${RFT_TRANSFER_WEIGHT:-0.0}"
+transfer_enabled="$(awk -v value="${rft_transfer_weight}" 'BEGIN { print ((value + 0) > 0) ? "true" : "false" }')"
+if [[ "${transfer_enabled}" == "true" && ( "${finetune_routers}" != "true" || "${rft_trainer}" != "distill_ce" ) ]]; then
+    echo "RFT_TRANSFER_WEIGHT>0 requires FINETUNE_ROUTERS=true and RFT_TRAINER=distill_ce." >&2
+    exit 1
+fi
+if [[ "${transfer_enabled}" == "true" && "${mixed_prec}" != "true" ]]; then
+    echo "RFT_TRANSFER_WEIGHT>0 requires MIXED_PREC=true." >&2
+    exit 1
+fi
 
 # ===============================
 #  Evaluation settings
@@ -184,7 +194,14 @@ if [[ "${finetune_routers}" == "true" ]]; then
             ;;
         distill_ce)
             rft_tag="_RFT-distill_ce"
-            quant_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
+            quant_args+=(
+                --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
+                --rft_transfer_weight "${rft_transfer_weight}"
+            )
+            if [[ "${transfer_enabled}" == "true" ]]; then
+                transfer_weight_tag="${rft_transfer_weight//./p}"
+                rft_tag+="-ReconKL-w${transfer_weight_tag}-cos"
+            fi
             ;;
         layerwise_teacher)
             timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"
@@ -223,6 +240,9 @@ fi
 
 prefix="${quant_allocation_tag}"
 gptq_checkpoint_path="${gptq_checkpoint_root}/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}"
+if [[ "${transfer_enabled}" == "true" ]]; then
+    gptq_checkpoint_path+="_PruneMask"
+fi
 checkpoint_args=()
 if [[ "${save_gptq_checkpoint}" == "true" && "${load_gptq_checkpoint}" == "true" ]]; then
     echo "SAVE_GPTQ_CHECKPOINT and LOAD_GPTQ_CHECKPOINT cannot both be true." >&2
@@ -277,6 +297,9 @@ if [[ "${rft_trainer}" == "legacy_ce" ]]; then
     echo " Router objective: hard-label autoregressive CE"
 elif [[ "${rft_trainer}" == "distill_ce" ]]; then
     echo " Router objective: teacher soft-label autoregressive CE"
+    if [[ "${transfer_enabled}" == "true" ]]; then
+        echo " Transfer objective: output reconstruction KL (weight=${rft_transfer_weight}, cosine decay)"
+    fi
 else
     echo " RFT timing:       ${rft_timing}"
     echo " Router objective: ${rft_router_loss} (alpha=${rft_router_alpha}, weight=${rft_router_loss_weight})"

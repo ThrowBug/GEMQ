@@ -6,7 +6,7 @@ from hqq.core.quantize import Quantizer
 from gemq.utils.model_utils import *
 
 
-def build_alloc_cfg(model, args, expert_bit_cfg=None):
+def build_alloc_cfg(model, args, expert_bit_cfg=None, allow_zero_bit_experts=False):
     """
     Build a bit allocation config for the model. The config includes bitwidth for
     each Linear modules required quantization.
@@ -46,12 +46,17 @@ def build_alloc_cfg(model, args, expert_bit_cfg=None):
                     expert_id = get_expert_id(name, args.model_name)
                     expert_bit = int(expert_bit_cfg[i][expert_id])
                     if expert_bit <= 0:
-                        raise ValueError(
-                            f"Layer {i} expert {expert_id} still has {expert_bit} bits "
-                            "while building GPTQ config. Zero-bit experts must be "
-                            "physically pruned and remapped first."
-                        )
-                    layer_bit_cfg[name] = expert_bit
+                        if not allow_zero_bit_experts:
+                            raise ValueError(
+                                f"Layer {i} expert {expert_id} still has {expert_bit} bits "
+                                "while building GPTQ config. Zero-bit experts must be "
+                                "physically pruned and remapped first."
+                            )
+                        # A masked zero-bit expert remains at its original precision so
+                        # online router fine-tuning can evaluate its reference output.
+                        layer_bit_cfg[name] = 16
+                    else:
+                        layer_bit_cfg[name] = expert_bit
                 else:
                     layer_bit_cfg[name] = args.expert_wbits
         bit_cfg.append(layer_bit_cfg)

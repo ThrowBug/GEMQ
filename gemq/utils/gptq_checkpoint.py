@@ -14,6 +14,7 @@ CHECKPOINT_FORMAT_VERSION = 1
 METADATA_FILENAME = "gptq_checkpoint_meta.json"
 PRUNING_FILENAME = "expert_pruning_map.json"
 SUCCESS_FILENAME = "_SUCCESS"
+EXPERT_PRUNING_STATES = {"none", "masked", "physical"}
 QUANTIZATION_BUFFER_NAMES = {
     "quant_scales",
     "quant_zeros",
@@ -91,7 +92,30 @@ def build_gptq_checkpoint_identity(args, input_ids, attention_mask):
     return identity
 
 
-def build_gptq_checkpoint_metadata(identity, model, pruning_metadata=None):
+def build_gptq_checkpoint_metadata(
+    identity,
+    model,
+    pruning_metadata=None,
+    expert_pruning_state=None,
+):
+    if expert_pruning_state is None:
+        expert_pruning_state = "physical" if pruning_metadata is not None else "none"
+    if expert_pruning_state not in EXPERT_PRUNING_STATES:
+        raise ValueError(f"Unsupported expert pruning state: {expert_pruning_state!r}")
+    if expert_pruning_state == "none" and pruning_metadata is not None:
+        raise ValueError("Unpruned GPTQ checkpoint metadata cannot contain a pruning map.")
+    if expert_pruning_state != "none" and pruning_metadata is None:
+        raise ValueError(
+            f"GPTQ checkpoint state {expert_pruning_state!r} requires a pruning map."
+        )
+    metadata_state = (
+        pruning_metadata.get("state") if isinstance(pruning_metadata, dict) else None
+    )
+    if metadata_state is not None and metadata_state != expert_pruning_state:
+        raise ValueError(
+            "Pruning-map state differs from GPTQ checkpoint state: "
+            f"{metadata_state!r} != {expert_pruning_state!r}."
+        )
     return {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "identity_sha256": _json_sha256(identity),
@@ -100,6 +124,7 @@ def build_gptq_checkpoint_metadata(identity, model, pruning_metadata=None):
             "weight_dtype": str(next(model.parameters()).dtype),
             "format": "huggingface_fake_quant_w_hat",
         },
+        "expert_pruning_state": expert_pruning_state,
         "pruning": pruning_metadata,
     }
 
@@ -170,7 +195,11 @@ def _identity_mismatches(expected, actual, prefix="identity"):
     return mismatches
 
 
-def load_gptq_checkpoint_metadata(checkpoint_path, expected_identity):
+def load_gptq_checkpoint_metadata(
+    checkpoint_path,
+    expected_identity,
+    expected_expert_pruning_state=None,
+):
     """Validate completeness and identity before loading any checkpoint weights."""
     checkpoint = Path(checkpoint_path)
     if not checkpoint.is_dir():
@@ -210,6 +239,38 @@ def load_gptq_checkpoint_metadata(checkpoint_path, expected_identity):
         raise ValueError(f"GPTQ checkpoint identity hash is invalid: {metadata_path}")
 
     pruning_metadata = metadata.get("pruning")
+    pruning_state = metadata.get("expert_pruning_state")
+    if pruning_state is None:
+        # Version-1 checkpoints predate masked pruning and were compacted before
+        # GPTQ whenever a pruning map was present.
+        pruning_state = "physical" if pruning_metadata is not None else "none"
+    if pruning_state not in EXPERT_PRUNING_STATES:
+        raise ValueError(
+            f"Unsupported GPTQ checkpoint expert pruning state: {pruning_state!r}"
+        )
+    if pruning_state == "none" and pruning_metadata is not None:
+        raise ValueError("Unpruned GPTQ checkpoint unexpectedly contains a pruning map.")
+    if pruning_state != "none" and pruning_metadata is None:
+        raise ValueError(
+            f"GPTQ checkpoint state {pruning_state!r} is missing its pruning map."
+        )
+    metadata_state = (
+        pruning_metadata.get("state") if isinstance(pruning_metadata, dict) else None
+    )
+    if metadata_state is not None and metadata_state != pruning_state:
+        raise ValueError(
+            "GPTQ checkpoint pruning-map state differs from its top-level state: "
+            f"{metadata_state!r} != {pruning_state!r}."
+        )
+    metadata["expert_pruning_state"] = pruning_state
+    if (
+        expected_expert_pruning_state is not None
+        and pruning_state != expected_expert_pruning_state
+    ):
+        raise ValueError(
+            "GPTQ checkpoint expert pruning state differs: expected "
+            f"{expected_expert_pruning_state!r}, found {pruning_state!r}."
+        )
     pruning_path = checkpoint / PRUNING_FILENAME
     if pruning_metadata is not None:
         if not pruning_path.is_file():

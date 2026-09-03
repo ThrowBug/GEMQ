@@ -27,11 +27,23 @@ fi
 
 finetune_routers="${FINETUNE_ROUTERS:-true}"
 rft_trainer="${RFT_TRAINER:-layerwise_teacher}"
+rft_transfer_weight="${RFT_TRANSFER_WEIGHT:-0.0}"
+transfer_enabled="$(awk -v value="${rft_transfer_weight}" 'BEGIN { print ((value + 0) > 0) ? "true" : "false" }')"
+if [[ "${transfer_enabled}" == "true" && ( "${finetune_routers}" != "true" || "${rft_trainer}" != "distill_ce" ) ]]; then
+    echo "RFT_TRANSFER_WEIGHT>0 requires FINETUNE_ROUTERS=true and RFT_TRAINER=distill_ce." >&2
+    exit 1
+fi
 rft_tag=""
 if [[ "${finetune_routers}" == "true" ]]; then
     case "${rft_trainer}" in
         legacy_ce) rft_tag="_RFT-legacy_ce" ;;
-        distill_ce) rft_tag="_RFT-distill_ce" ;;
+        distill_ce)
+            rft_tag="_RFT-distill_ce"
+            if [[ "${transfer_enabled}" == "true" ]]; then
+                transfer_weight_tag="${rft_transfer_weight//./p}"
+                rft_tag+="-ReconKL-w${transfer_weight_tag}-cos"
+            fi
+            ;;
         layerwise_teacher)
             rft_timing="${RFT_TIMING:-after_each_layer_quantization}"
             timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"

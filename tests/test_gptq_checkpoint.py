@@ -100,3 +100,26 @@ def test_checkpoint_load_validates_identity_and_completion(tmp_path):
     (checkpoint / SUCCESS_FILENAME).unlink()
     with pytest.raises(RuntimeError, match="incomplete"):
         load_gptq_checkpoint_metadata(checkpoint, identity)
+
+
+def test_checkpoint_records_and_validates_masked_pruning_state(tmp_path):
+    input_ids = torch.arange(12).reshape(2, 6)
+    identity = build_gptq_checkpoint_identity(_args(), input_ids, None)
+    model = _FakeModel()
+    metadata = build_gptq_checkpoint_metadata(
+        identity,
+        model,
+        {"original_num_experts": 4, "num_experts": 3},
+        expert_pruning_state="masked",
+    )
+    checkpoint = tmp_path / "masked-checkpoint"
+    save_gptq_checkpoint(model, _FakeTokenizer(), checkpoint, metadata)
+
+    loaded = load_gptq_checkpoint_metadata(
+        checkpoint, identity, expected_expert_pruning_state="masked"
+    )
+    assert loaded["expert_pruning_state"] == "masked"
+    with pytest.raises(ValueError, match="pruning state differs"):
+        load_gptq_checkpoint_metadata(
+            checkpoint, identity, expected_expert_pruning_state="physical"
+        )
