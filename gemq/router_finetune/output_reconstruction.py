@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -43,21 +42,6 @@ class OutputReconstructionBatch:
     @property
     def pruned_hit_rate(self):
         return self.active_count / max(self.token_count, 1)
-
-
-def cosine_transfer_weight(initial_weight, step, total_steps):
-    """Cosine decay from ``initial_weight`` to zero over all optimizer steps."""
-    initial_weight = float(initial_weight)
-    if initial_weight < 0.0:
-        raise ValueError(f"initial_weight must be non-negative, got {initial_weight}")
-    if total_steps <= 0:
-        raise ValueError(f"total_steps must be positive, got {total_steps}")
-    if not 0 <= step < total_steps:
-        raise ValueError(f"step must be in [0, {total_steps}), got {step}")
-    if total_steps == 1:
-        return initial_weight
-    progress = step / (total_steps - 1)
-    return 0.5 * initial_weight * (1.0 + math.cos(math.pi * progress))
 
 
 def project_probability_simplex(values):

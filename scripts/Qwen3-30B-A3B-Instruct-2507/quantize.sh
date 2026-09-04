@@ -200,7 +200,7 @@ if [[ "${finetune_routers}" == "true" ]]; then
             )
             if [[ "${transfer_enabled}" == "true" ]]; then
                 transfer_weight_tag="${rft_transfer_weight//./p}"
-                rft_tag+="-ReconKL-w${transfer_weight_tag}-cos"
+                rft_tag+="-ReconKL-w${transfer_weight_tag}-const"
             fi
             ;;
         layerwise_teacher)
@@ -298,7 +298,7 @@ if [[ "${rft_trainer}" == "legacy_ce" ]]; then
 elif [[ "${rft_trainer}" == "distill_ce" ]]; then
     echo " Router objective: teacher soft-label autoregressive CE"
     if [[ "${transfer_enabled}" == "true" ]]; then
-        echo " Transfer objective: output reconstruction KL (weight=${rft_transfer_weight}, cosine decay)"
+        echo " Transfer objective: output reconstruction KL (constant weight=${rft_transfer_weight})"
     fi
 else
     echo " RFT timing:       ${rft_timing}"

@@ -41,7 +41,7 @@ if [[ "${finetune_routers}" == "true" ]]; then
             rft_tag="_RFT-distill_ce"
             if [[ "${transfer_enabled}" == "true" ]]; then
                 transfer_weight_tag="${rft_transfer_weight//./p}"
-                rft_tag+="-ReconKL-w${transfer_weight_tag}-cos"
+                rft_tag+="-ReconKL-w${transfer_weight_tag}-const"
             fi
             ;;
         layerwise_teacher)

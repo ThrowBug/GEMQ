@@ -32,7 +32,6 @@ from gemq.router_finetune.config import (
     RouterFinetuneConfig,
 )
 from gemq.router_finetune.losses import compute_causal_output_distill_ce
-from gemq.router_finetune.output_reconstruction import cosine_transfer_weight
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
@@ -223,8 +222,6 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
     num_batches = args.nsamples // args.rft_batch_size
     if num_batches <= 0:
         raise ValueError("Router fine-tuning has no complete batches.")
-    total_steps = args.rft_epochs * num_batches
-    global_step = 0
     router_row_snapshots = None
     transfer_collection_enabled = False
 
@@ -261,15 +258,14 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
 
                 transfer_batch = None
                 transfer_loss = distill_loss.new_zeros(())
-                transfer_weight = 0.0
+                transfer_weight = (
+                    config.transfer_weight if config.transfer_enabled else 0.0
+                )
                 if config.transfer_enabled:
                     transfer_batch = consume_qwen3_output_reconstruction(
                         model, args.model_name, loss_device=distill_loss.device
                     )
                     transfer_loss = transfer_batch.loss
-                    transfer_weight = cosine_transfer_weight(
-                        config.transfer_weight, global_step, total_steps
-                    )
                 total_loss = distill_loss + transfer_weight * transfer_loss
 
                 should_log = i % 32 == 0
@@ -341,7 +337,6 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
                             f"layer_error_after={transfer_batch.layer_error_after:.6f}, "
                             f"relative_improvement={transfer_batch.relative_improvement:.6f}"
                         )
-                global_step += 1
                 del outputs, teacher_hidden, teacher_output_logits
                 del distill_loss, transfer_loss, total_loss, transfer_batch
             elapsed = time.time() - start_time
@@ -752,10 +747,7 @@ def parse_args():
     )
     parser.add_argument(
         "--rft_transfer_weight", type=float, default=0.0,
-        help=(
-            "Initial weight of online zero-bit expert output-reconstruction KL; "
-            "cosine-decayed to zero over the complete distilled-CE run"
-        ),
+        help="Constant weight of online zero-bit expert output-reconstruction KL",
     )
 
     # evaluation args

@@ -1,23 +1,13 @@
 import math
 
-import pytest
 import torch
 
 from gemq.router_finetune.output_reconstruction import (
     build_output_reconstruction_target,
-    cosine_transfer_weight,
     output_reconstruction_kl,
     project_probability_simplex,
     solve_transfer_coefficients,
 )
-
-
-def test_cosine_transfer_weight_uses_the_full_run():
-    values = [cosine_transfer_weight(2.0, step, 5) for step in range(5)]
-    assert values[0] == pytest.approx(2.0)
-    assert values[-1] == pytest.approx(0.0)
-    assert all(left >= right for left, right in zip(values, values[1:]))
-    assert cosine_transfer_weight(2.0, 0, 1) == pytest.approx(2.0)
 
 
 def test_simplex_projection_is_nonnegative_and_normalized():
