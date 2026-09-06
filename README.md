@@ -101,6 +101,45 @@ dataset, bit-width, and cache controls as environment variables near the top of 
 They save dequantized approximate weights as standard BF16 Hugging Face checkpoints under
 `results/fake_quant_models/`, which vLLM can load without a GEMQ runtime patch.
 
+### Confidence-aware output distillation (CAKLD)
+
+Both active `quantize.sh` scripts accept `RFT_TRAINER=cakld`. This reuses the
+`distill_ce` joint router-training workflow after **all** layers are quantized;
+it does not use the layerwise loss/timing options. Existing trainers and defaults
+remain available. Only routers are optimized, not the full BitDistiller QAT model.
+
+```bash
+RFT_TRAINER=cakld RFT_CAKLD_GAMMA=auto LOAD_GPTQ_CHECKPOINT=true \
+    bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize.sh
+```
+
+Use `LOAD_GPTQ_CHECKPOINT=true` only when the matching pre-fine-tuning checkpoint
+already exists; otherwise omit it to run GPTQ normally. Keep allocation and GPTQ
+settings identical when comparing with `RFT_TRAINER=distill_ce`.
+
+The temperature-1 objective is
+`(1 - gamma) * KL(teacher || student) + gamma * KL(student || teacher)`, averaged
+over valid next-token positions. `gamma=0` has the same student gradient as soft CE,
+but its scalar loss excludes teacher entropy, so the printed values differ.
+
+`RFT_CAKLD_GAMMA=auto` computes a single fixed scalar before the first router update:
+the mean **maximum vocabulary probability** of the teacher over the calibration
+set's valid next-token positions. It follows the max-prob definition in
+[BitDistiller's code](https://github.com/OpenBitSys/BitDistiller/blob/main/train/train.py),
+not the observed-target probability in [paper Eq. (5)](https://aclanthology.org/2024.acl-long.7.pdf).
+Unlike that estimator's batch counting, this implementation divides by the actual
+valid-token count and excludes padding and final positions. Existing teacher hidden
+caches are streamed through the unchanged `lm_head`; no new cache format, dense
+probability cache, or full teacher forward is needed. A finite number in `[0, 1]`
+overrides automatic estimation. There is no annealing or extra auxiliary weight.
+
+Logs report epoch-running means of CAKLD, forward KL, reverse KL, and the fixed
+gamma. `router_ft_config.json` records the resolved gamma, confidence definition,
+source, and sample/token counts. Final model paths gain
+`_RFT-cakld-maxprob-gauto` (or e.g. `-g0p5` for a manual gamma); the GPTQ checkpoint
+path and identity are unchanged, so old `distill_ce` checkpoints remain reusable.
+When serving a CAKLD result, set `FQ_MODEL_PATH` to its saved model path.
+
 ### vLLM serving, benchmarking, and evaluation
 
 Start OLMoE on one GPU:

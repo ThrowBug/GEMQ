@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+from gemq.router_finetune.config import parse_cakld_gamma
+
 
 def _flatten_logits(student_logits, teacher_logits):
     if student_logits.shape != teacher_logits.shape:
@@ -173,3 +175,44 @@ def compute_causal_output_distill_ce(student_logits, teacher_logits, attention_m
         student_logits, teacher_logits, attention_mask
     )
     return compute_output_distill_ce(student, teacher, token_mask=prediction_mask)
+
+
+def compute_output_cakld(
+    student_logits, teacher_logits, gamma, token_mask=None, *, return_components=False
+):
+    """(1-gamma) KL(teacher || student) + gamma KL(student || teacher).
+
+    Both distributions span the full vocabulary at temperature 1. The teacher
+    is fixed, but the student probability multiplier in reverse KL MUST retain
+    its gradient. Components returned for logging are detached.
+    """
+    gamma = parse_cakld_gamma(gamma)
+    if gamma == "auto":
+        raise ValueError("CAKLD requires a resolved numeric gamma before training.")
+    if student_logits.shape != teacher_logits.shape or student_logits.ndim < 2:
+        raise ValueError("Student/teacher output shapes must match and include a vocabulary dimension.")
+    if student_logits.device != teacher_logits.device:
+        raise ValueError("Student/teacher output logits must be on the same device.")
+    vocab_size = student_logits.shape[-1]
+    student = student_logits.reshape(-1, vocab_size).float()
+    teacher = teacher_logits.detach().reshape(-1, vocab_size).float()
+    teacher_log_probs = F.log_softmax(teacher, dim=-1)
+    student_log_probs = F.log_softmax(student, dim=-1)
+    log_ratio = teacher_log_probs - student_log_probs
+    forward = _masked_mean((teacher_log_probs.exp() * log_ratio).sum(-1), token_mask)
+    reverse = _masked_mean(-(student_log_probs.exp() * log_ratio).sum(-1), token_mask)
+    loss = (1.0 - gamma) * forward + gamma * reverse
+    if return_components:
+        return loss, forward.detach(), reverse.detach()
+    return loss
+
+
+def compute_causal_output_cakld(
+    student_logits, teacher_logits, gamma, attention_mask=None, *, return_components=False
+):
+    student, teacher, prediction_mask = _causal_output_slices(
+        student_logits, teacher_logits, attention_mask
+    )
+    return compute_output_cakld(
+        student, teacher, gamma, prediction_mask, return_components=return_components
+    )

@@ -84,7 +84,8 @@ dense_wbits="${DENSE_WBITS:-4}"
 #  Router fine-tuning
 # ===============================
 finetune_routers="${FINETUNE_ROUTERS:-true}"
-rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | layerwise_teacher
+rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | cakld | layerwise_teacher
+rft_cakld_gamma="${RFT_CAKLD_GAMMA:-auto}" # auto (teacher max-prob) | fixed number in [0, 1]
 rft_timing="${RFT_TIMING:-after_each_layer_quantization}" # after_all_quantization | after_each_layer_quantization
 rft_router_loss="${RFT_ROUTER_LOSS:-kd_tail}" # kd | kd_tail | l2 | l2_center
 rft_router_alpha="${RFT_ROUTER_ALPHA:-1.0}"
@@ -96,6 +97,18 @@ rft_lr="${RFT_LR:-1e-4}"
 rft_wd="${RFT_WD:-0.0}"
 rft_teacher_cache_dir="${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}"
 rft_rebuild_teacher_cache="${RFT_REBUILD_TEACHER_CACHE:-false}"
+
+if [[ "${finetune_routers}" == "true" && "${rft_trainer}" == "cakld" ]]; then
+    # Validate before checking data/model files; also canonicalize the output tag.
+    rft_cakld_gamma="$(python -c '
+import sys
+from gemq.router_finetune.config import parse_cakld_gamma
+try:
+    print(parse_cakld_gamma(sys.argv[1]))
+except ValueError as error:
+    sys.exit(str(error).replace("--rft_cakld_gamma", "RFT_CAKLD_GAMMA"))
+' "${rft_cakld_gamma}")"
+fi
 
 # ===============================
 #  Evaluation settings
@@ -185,6 +198,14 @@ if [[ "${finetune_routers}" == "true" ]]; then
         distill_ce)
             rft_tag="_RFT-distill_ce"
             quant_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
+            ;;
+        cakld)
+            gamma_tag="${rft_cakld_gamma//./p}"
+            rft_tag="_RFT-cakld-maxprob-g${gamma_tag}"
+            quant_args+=(
+                --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
+                --rft_cakld_gamma "${rft_cakld_gamma}"
+            )
             ;;
         layerwise_teacher)
             timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"
@@ -277,6 +298,10 @@ if [[ "${rft_trainer}" == "legacy_ce" ]]; then
     echo " Router objective: hard-label autoregressive CE"
 elif [[ "${rft_trainer}" == "distill_ce" ]]; then
     echo " Router objective: teacher soft-label autoregressive CE"
+elif [[ "${rft_trainer}" == "cakld" ]]; then
+    echo " Router objective: CAKLD = (1-gamma)*forward_KL + gamma*reverse_KL"
+    echo " RFT timing:       after_all_quantization (joint router training)"
+    echo " CAKLD gamma:      ${rft_cakld_gamma} (max-prob when auto, fixed throughout training)"
 else
     echo " RFT timing:       ${rft_timing}"
     echo " Router objective: ${rft_router_loss} (alpha=${rft_router_alpha}, weight=${rft_router_loss_weight})"

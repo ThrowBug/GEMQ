@@ -11,6 +11,7 @@ from gemq.router_finetune.targets import (  # noqa: E402
     _save_targets,
     materialize_calibration_inputs,
 )
+from gemq.router_finetune.config import CAKLDConfig, DistillCEConfig
 
 
 def _config(needs_router=True, needs_output=False):
@@ -62,3 +63,22 @@ def test_cache_requires_requested_target_kinds(tmp_path):
     assert _load_cached_targets(
         tmp_path, identity, input_ids, None, _config(needs_router=True, needs_output=True)
     ) is None
+
+
+def test_existing_output_only_cache_is_shared_by_ce_and_cakld(tmp_path):
+    input_ids = torch.tensor([[1, 2, 3]])
+    identity = {"cache_version": 1, "input_ids_sha256": "test"}
+    targets = TeacherTargets(
+        input_ids=input_ids, attention_mask=None, router_logits=None,
+        final_hidden_states=torch.randn(1, 3, 5), metadata={},
+    )
+    _save_targets(tmp_path, identity, targets)
+    for config_class in (DistillCEConfig, CAKLDConfig):
+        config = config_class(
+            epochs=1, batch_size=1, learning_rate=1e-4, weight_decay=0.0,
+            teacher_cache_dir=str(tmp_path), rebuild_teacher_cache=False,
+        )
+        loaded = _load_cached_targets(tmp_path, identity, input_ids, None, config)
+        assert loaded is not None
+        assert torch.equal(loaded.final_hidden_states, targets.final_hidden_states)
+        assert loaded.router_logits is None

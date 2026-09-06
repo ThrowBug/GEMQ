@@ -25,13 +25,19 @@ from gemq.utils.quant_utils import *
 from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
 from gemq.utils.hf_loading import align_deepseek_softmax_scale
 from gemq.router_finetune.config import (
+    CAKLDConfig,
     DistillCEConfig,
     RFT_TIMINGS,
     RFT_TRAINERS,
     ROUTER_LOSS_TYPES,
     RouterFinetuneConfig,
+    parse_cakld_gamma,
 )
-from gemq.router_finetune.losses import compute_causal_output_distill_ce
+from gemq.router_finetune.confidence import resolve_cakld_gamma
+from gemq.router_finetune.losses import (
+    compute_causal_output_cakld,
+    compute_causal_output_distill_ce,
+)
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
@@ -161,8 +167,22 @@ def finetune_routers(model, dataloader, args):
 
 def finetune_routers_distill_ce(model, teacher_targets, args):
     """Fine-tune all routers jointly using full-precision teacher soft labels."""
+    return _finetune_routers_output_distillation(model, teacher_targets, args, objective="distill_ce")
+
+
+def finetune_routers_cakld(model, teacher_targets, args):
+    """Joint router fine-tuning with a fixed confidence-aware KL mixture."""
+    return _finetune_routers_output_distillation(model, teacher_targets, args, objective="cakld")
+
+
+def _finetune_routers_output_distillation(model, teacher_targets, args, *, objective):
     if teacher_targets.final_hidden_states is None:
-        raise RuntimeError("Distilled CE requires cached teacher final hidden states.")
+        raise RuntimeError("Output distillation requires cached teacher final hidden states.")
+    if objective not in {"distill_ce", "cakld"}:
+        raise ValueError(f"Unsupported output distillation objective: {objective}")
+    num_batches = args.nsamples // args.rft_batch_size
+    if num_batches == 0:
+        raise ValueError("Router fine-tuning requires nsamples >= rft_batch_size.")
 
     # Keep the optimizer, model mode, dtype, batching, and trainable parameters aligned
     # with finetune_routers(); only the hard-label CE objective changes.
@@ -195,15 +215,40 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
 
     head_parameter = next(model.lm_head.parameters())
     head_device = head_parameter.device
+    runtime_metadata = {}
+    gamma = None
+    if objective == "cakld":
+        print("Resolving fixed CAKLD gamma before the first router update ...")
+        runtime_metadata = resolve_cakld_gamma(
+            model.lm_head, teacher_targets, args.nsamples, args.rft_cakld_gamma
+        )
+        gamma = runtime_metadata["resolved_gamma"]
+        print(
+            f"CAKLD gamma={gamma:.8f}, source={runtime_metadata['gamma_source']}, "
+            f"confidence=max_prob, reduction=valid_token_mean, "
+            f"samples={runtime_metadata['confidence_samples']}, "
+            f"valid_tokens={runtime_metadata['confidence_valid_tokens']} (fixed, temperature=1)"
+        )
     optimizer = torch.optim.AdamW(router_params, lr=args.rft_lr, weight_decay=args.rft_wd)
     for epoch in range(args.rft_epochs):
         loss_sum = 0.0
+        forward_sum, reverse_sum = 0.0, 0.0
         start_time = time.time()
-        for i in range(args.nsamples // args.rft_batch_size):
+        for i in range(num_batches):
             idx = i * args.rft_batch_size
             end = idx + args.rft_batch_size
             data = input_ids[idx:end].to("cuda")
-            outputs = model(input_ids=data)
+            attention_mask = None
+            model_kwargs = {}
+            # Keep the historical CE forward unchanged. CAKLD excludes padding;
+            # omit an all-ones mask to retain the same no-padding forward path.
+            if objective == "cakld" and teacher_targets.attention_mask is not None:
+                attention_mask = teacher_targets.attention_mask[idx:end].to(data.device)
+                if not attention_mask.bool().all():
+                    model_kwargs["attention_mask"] = attention_mask
+                if not (attention_mask[:, :-1].bool() & attention_mask[:, 1:].bool()).any():
+                    raise ValueError("CAKLD training batch has no valid next-token positions.")
+            outputs = model(input_ids=data, **model_kwargs)
 
             with torch.no_grad():
                 teacher_hidden = teacher_targets.final_hidden_states[idx:end].to(
@@ -213,7 +258,15 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
                 teacher_output_logits = teacher_output_logits.to(
                     device=outputs.logits.device, non_blocking=True
                 )
-            loss = compute_causal_output_distill_ce(outputs.logits, teacher_output_logits)
+            if objective == "cakld":
+                loss, forward_kl, reverse_kl = compute_causal_output_cakld(
+                    outputs.logits, teacher_output_logits, gamma, attention_mask,
+                    return_components=True,
+                )
+                forward_sum += forward_kl.item()
+                reverse_sum += reverse_kl.item()
+            else:
+                loss = compute_causal_output_distill_ce(outputs.logits, teacher_output_logits)
 
             optimizer.zero_grad()
             loss.backward()
@@ -221,11 +274,19 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
 
             loss_sum += loss.item()
             if i % 32 == 0:
-                print(f"[epoch {epoch} | iter {i:>3d}] loss: {loss_sum / (i+1):.6f}")
+                if objective == "cakld":
+                    print(
+                        f"[epoch {epoch} | iter {i:>3d}] cakld={loss_sum / (i+1):.6f}, "
+                        f"forward_kl={forward_sum / (i+1):.6f}, "
+                        f"reverse_kl={reverse_sum / (i+1):.6f}, gamma={gamma:.8f} "
+                        "(epoch running means)"
+                    )
+                else:
+                    print(f"[epoch {epoch} | iter {i:>3d}] loss: {loss_sum / (i+1):.6f}")
             del outputs, teacher_hidden, teacher_output_logits, loss
         elapsed = time.time() - start_time
         print(
-            f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, "
+            f"epoch {epoch:>2} loss: {loss_sum / num_batches:.6f}, "
             f"elapse: {elapsed:.2f} seconds"
         )
 
@@ -247,6 +308,7 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
 
     model = model.to(org_dtype)
     model.config.use_cache = use_cache
+    return runtime_metadata
 
 
 @torch.no_grad()
@@ -571,9 +633,13 @@ def parse_args():
         "--rft_trainer", type=str, default="legacy_ce",
         choices=RFT_TRAINERS,
         help=(
-            "Use hard-label joint CE, teacher soft-label joint CE, or teacher-guided "
+            "Use hard-label joint CE, teacher soft-label joint CE, confidence-aware KL, or teacher-guided "
             "layer-wise router fine-tuning"
         )
+    )
+    parser.add_argument(
+        "--rft_cakld_gamma", type=parse_cakld_gamma, default="auto",
+        help="CAKLD only: 'auto' estimates fixed teacher max-prob confidence, or supply a number in [0, 1]",
     )
     parser.add_argument(
         "--rft_timing", type=str, default="after_all_quantization",
@@ -725,7 +791,7 @@ if __name__ == "__main__":
         and args.rft_trainer == "layerwise_teacher"
     ):
         raise ValueError(
-            "Reusable GPTQ checkpoints currently support legacy_ce and distill_ce, "
+            "Reusable GPTQ checkpoints currently support legacy_ce, distill_ce and cakld, "
             "not layerwise_teacher."
         )
     if args.save_gptq_checkpoint and os.path.exists(args.gptq_checkpoint_path):
@@ -738,7 +804,7 @@ if __name__ == "__main__":
     # even when the student weights are loaded from a post-GPTQ checkpoint.
     needs_teacher_targets = (
         args.finetune_routers
-        and args.rft_trainer in {"distill_ce", "layerwise_teacher"}
+        and args.rft_trainer in {"distill_ce", "cakld", "layerwise_teacher"}
     )
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, use_fast=args.use_fast, trust_remote_code=args.trust_remote_code
@@ -763,12 +829,15 @@ if __name__ == "__main__":
         expert_bit_cfg = load_expert_bit_config(args.bit_cfg)
 
     router_ft_config = None
+    router_ft_runtime = {}
     teacher_targets = None
     if needs_teacher_targets:
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
         if args.rft_trainer == "distill_ce":
             router_ft_config = DistillCEConfig.from_args(args)
+        elif args.rft_trainer == "cakld":
+            router_ft_config = CAKLDConfig.from_args(args)
         else:
             router_ft_config = RouterFinetuneConfig.from_args(args)
 
@@ -875,7 +944,7 @@ if __name__ == "__main__":
             if args.cuda_diagnostics:
                 report_cuda_diagnostics("before legacy router fine-tuning", model=model)
             finetune_routers(model, dataloader, args)
-        elif args.rft_trainer == "distill_ce":
+        elif args.rft_trainer in {"distill_ce", "cakld"}:
             model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
             print("Evaluating quantized model before fine-tuning ...")
@@ -885,12 +954,18 @@ if __name__ == "__main__":
                 model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
             )
 
-            print("Fine-tuning routers jointly with distilled autoregressive CE ...")
+            if args.rft_trainer == "cakld":
+                print("Fine-tuning routers jointly with confidence-aware KL (CAKLD) ...")
+            else:
+                print("Fine-tuning routers jointly with distilled autoregressive CE ...")
             if args.cuda_diagnostics:
                 report_cuda_diagnostics(
-                    "before distilled-CE router fine-tuning", model=model
+                    f"before {args.rft_trainer} router fine-tuning", model=model
                 )
-            finetune_routers_distill_ce(model, teacher_targets, args)
+            if args.rft_trainer == "cakld":
+                router_ft_runtime = finetune_routers_cakld(model, teacher_targets, args)
+            else:
+                finetune_routers_distill_ce(model, teacher_targets, args)
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
             evaluate_perplexity(
@@ -952,7 +1027,10 @@ if __name__ == "__main__":
             with open(
                 os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"
             ) as f:
-                json.dump({"trainer": args.rft_trainer, **vars(router_ft_config)}, f, indent=4)
+                json.dump(
+                    {"trainer": args.rft_trainer, **vars(router_ft_config), **router_ft_runtime},
+                    f, indent=4,
+                )
 
         if args.real_quant:
             # for real quant, replace nn.Linear to HQQLinear for weight packing and saving

@@ -4,8 +4,10 @@ torch = pytest.importorskip("torch")
 
 from gemq.router_finetune.losses import (  # noqa: E402
     compute_causal_output_distill_ce,
+    compute_causal_output_cakld,
     compute_causal_output_kl,
     compute_output_kl,
+    compute_output_cakld,
     compute_router_loss,
 )
 
@@ -138,3 +140,61 @@ def test_distill_ce_reduces_to_hard_ce_for_one_hot_teacher():
         student[:, :-1, :].reshape(-1, student.shape[-1]), hard_targets.reshape(-1)
     )
     assert torch.allclose(soft_ce, hard_ce)
+
+
+@pytest.mark.parametrize("gamma", [0.0, 0.3, 1.0])
+def test_cakld_matches_explicit_kl_values_and_gradients(gamma):
+    teacher = torch.tensor([[0.7, 0.2, 0.1]]).log().requires_grad_(True)
+    student = torch.tensor([[0.1, 0.3, 0.6]]).log().requires_grad_(True)
+    loss, forward, reverse = compute_output_cakld(student, teacher, gamma, return_components=True)
+    reference_student = student.detach().clone().requires_grad_(True)
+    pt = teacher.detach().softmax(-1)
+    ps = reference_student.softmax(-1)
+    expected_forward = (pt * (pt.log() - ps.log())).sum(-1).mean()
+    expected_reverse = (ps * (ps.log() - pt.log())).sum(-1).mean()
+    expected = (1 - gamma) * expected_forward + gamma * expected_reverse
+    assert torch.allclose(loss, expected, atol=1e-7)
+    assert torch.allclose(forward, expected_forward)
+    assert torch.allclose(reverse, expected_reverse)
+    expected_grad = torch.autograd.grad(expected, reference_student)[0]
+    loss.backward()
+    assert torch.allclose(student.grad, expected_grad, atol=1e-7)
+    assert teacher.grad is None
+    assert not forward.requires_grad and not reverse.requires_grad
+
+
+def test_cakld_zero_gamma_matches_ce_gradient_with_causal_mask():
+    torch.manual_seed(3)
+    teacher = torch.randn(2, 5, 7)
+    student = torch.randn(2, 5, 7, requires_grad=True)
+    mask = torch.tensor([[0, 1, 1, 1, 0], [1, 1, 1, 1, 1]])
+    ce = compute_causal_output_distill_ce(student, teacher, mask)
+    cakld = compute_causal_output_cakld(student, teacher, 0.0, mask)
+    ce_grad = torch.autograd.grad(ce, student)[0]
+    cakld_grad = torch.autograd.grad(cakld, student)[0]
+    assert torch.allclose(ce_grad, cakld_grad, atol=1e-7)
+    assert torch.count_nonzero(cakld_grad[:, -1]) == 0
+
+
+@pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0])
+def test_cakld_identical_logits_and_padding_have_zero_loss(gamma):
+    teacher = torch.randn(1, 4, 5)
+    student = teacher.clone()
+    student[:, 0, 0] += 80
+    student[:, 2:, 0] += 80
+    mask = torch.tensor([[0, 1, 1, 0]])
+    assert compute_causal_output_cakld(student, teacher, gamma, mask).item() == pytest.approx(0, abs=1e-6)
+
+
+def test_cakld_large_finite_logits_have_finite_gradients():
+    teacher = torch.tensor([[1000.0, -1000.0, 0.0]])
+    student = torch.tensor([[-1000.0, 1000.0, 0.0]], requires_grad=True)
+    loss = compute_output_cakld(student, teacher, 0.6)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert torch.isfinite(student.grad).all()
+
+
+def test_cakld_rejects_unresolved_gamma():
+    with pytest.raises(ValueError, match="resolved numeric"):
+        compute_output_cakld(torch.zeros(1, 3), torch.zeros(1, 3), "auto")

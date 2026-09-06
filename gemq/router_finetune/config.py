@@ -1,9 +1,24 @@
 from dataclasses import dataclass
+import math
 
 
 ROUTER_LOSS_TYPES = ("kd", "kd_tail", "l2", "l2_center")
 RFT_TIMINGS = ("after_all_quantization", "after_each_layer_quantization")
-RFT_TRAINERS = ("legacy_ce", "distill_ce", "layerwise_teacher")
+RFT_TRAINERS = ("legacy_ce", "distill_ce", "layerwise_teacher", "cakld")
+
+
+def parse_cakld_gamma(value):
+    """Accept automatic max-prob confidence or a fixed, finite KL mixture weight."""
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return "auto"
+    message = "--rft_cakld_gamma must be 'auto' or a finite number in [0, 1]."
+    try:
+        gamma = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(message) from None
+    if not math.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
+        raise ValueError(message)
+    return gamma
 
 
 @dataclass(frozen=True)
@@ -47,6 +62,27 @@ class DistillCEConfig:
     @property
     def needs_output_targets(self):
         return True
+
+
+@dataclass(frozen=True)
+class CAKLDConfig(DistillCEConfig):
+    """Global output distillation; gamma is estimated once, never annealed."""
+
+    gamma: str | float = "auto"
+
+    @classmethod
+    def from_args(cls, args):
+        base = DistillCEConfig.from_args(args)
+        config = cls(
+            **vars(base),
+            gamma=parse_cakld_gamma(getattr(args, "rft_cakld_gamma", "auto")),
+        )
+        config.validate()
+        return config
+
+    def validate(self):
+        super().validate()
+        parse_cakld_gamma(self.gamma)
 
 
 @dataclass(frozen=True)

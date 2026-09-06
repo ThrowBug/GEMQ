@@ -100,3 +100,13 @@ def test_checkpoint_load_validates_identity_and_completion(tmp_path):
     (checkpoint / SUCCESS_FILENAME).unlink()
     with pytest.raises(RuntimeError, match="incomplete"):
         load_gptq_checkpoint_metadata(checkpoint, identity)
+
+
+def test_checkpoint_identity_is_shared_by_ce_and_cakld():
+    input_ids = torch.arange(12).reshape(2, 6)
+    ce = build_gptq_checkpoint_identity(_args(rft_trainer="distill_ce"), input_ids, None)
+    for gamma in ("auto", 0.0, 0.5, 1.0):
+        cakld = build_gptq_checkpoint_identity(
+            _args(rft_trainer="cakld", rft_cakld_gamma=gamma), input_ids, None
+        )
+        assert cakld == ce

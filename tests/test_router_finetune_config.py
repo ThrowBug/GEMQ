@@ -2,7 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from gemq.router_finetune.config import DistillCEConfig, RFT_TRAINERS, RouterFinetuneConfig
+from gemq.router_finetune.config import (
+    CAKLDConfig, DistillCEConfig, RFT_TRAINERS, RouterFinetuneConfig, parse_cakld_gamma,
+)
 
 
 def _args(**overrides):
@@ -79,3 +81,23 @@ def test_distill_ce_does_not_validate_layerwise_loss_arguments():
         )
     )
     assert config.needs_output_targets
+
+
+@pytest.mark.parametrize("value, expected", [("auto", "auto"), ("0", 0.0), (1, 1.0), (".50", 0.5)])
+def test_cakld_gamma_parser(value, expected):
+    assert parse_cakld_gamma(value) == expected
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "oops", "", None, -0.1, 1.1])
+def test_cakld_gamma_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="finite number"):
+        parse_cakld_gamma(value)
+
+
+def test_cakld_reuses_ce_targets_and_ignores_layerwise_options():
+    args = _args(rft_timing="after_each_layer_quantization", rft_router_alpha=99.0)
+    config = CAKLDConfig.from_args(args)
+    assert "cakld" in RFT_TRAINERS
+    assert config.gamma == "auto"
+    assert config.needs_output_targets and not config.needs_router_targets
+    assert CAKLDConfig.from_args(_args(rft_cakld_gamma="0.75")).gamma == 0.75
