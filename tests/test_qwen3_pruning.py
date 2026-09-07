@@ -1,5 +1,11 @@
 from types import SimpleNamespace
+import ast
+import copy
+import math
+from pathlib import Path
+import time
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +20,9 @@ from gemq.pruning.qwen3 import (
     snapshot_pruned_router_rows,
 )
 from gemq.router_finetune.targets import TeacherTargets, project_teacher_router_logits
+from gemq.router_finetune.config import DistillCEConfig
+from gemq.router_finetune.losses import compute_causal_output_distill_ce
+from gemq.utils.expert_bit_config import has_zero_bit_experts
 
 
 MODEL_NAME = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -219,3 +228,191 @@ def test_quantized_module_names_are_remapped_after_physical_pruning():
     assert remapped["0.mlp.experts.1.gate_proj"] is modules[
         "0.mlp.experts.2.gate_proj"
     ]
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_detached_diagnostics_preserve_forward_and_report_real_values(active):
+    torch.manual_seed(4)
+    model = _TinyModel()
+    allocation = {i: {0: 2, 1: 0, 2: 3, 3: 2} for i in range(2)}
+    for layer in model.model.layers:
+        with torch.no_grad():
+            layer.mlp.gate.weight.zero_()
+            layer.mlp.gate.bias.copy_(torch.tensor([0., 4. if active else -8., 3., 2.]))
+    mask_qwen3_experts(model, MODEL_NAME, allocation)
+    hidden = torch.randn(1, 3, 2)
+
+    def forward():
+        value = hidden
+        for layer in model.model.layers:
+            value = layer.mlp(value)[0]
+        return value
+
+    baseline = forward()
+    set_qwen3_output_reconstruction(model, MODEL_NAME, True, track_grad=False)
+    detached_output = forward()
+    detached = consume_qwen3_output_reconstruction(model, MODEL_NAME)
+    set_qwen3_output_reconstruction(model, MODEL_NAME, True, track_grad=True)
+    differentiable_output = forward()
+    differentiable = consume_qwen3_output_reconstruction(model, MODEL_NAME)
+
+    torch.testing.assert_close(detached_output, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(differentiable_output, baseline, rtol=0, atol=0)
+    torch.testing.assert_close(detached.loss, differentiable.loss, rtol=0, atol=0)
+    assert not detached.loss.requires_grad
+    assert differentiable.loss.requires_grad
+    assert detached.fit_error == differentiable.fit_error
+    assert detached.active_count == (6 if active else 0)
+    baseline_grad = torch.autograd.grad(baseline.sum(), model.model.layers[0].mlp.gate.weight)[0]
+    observed_grad = torch.autograd.grad(detached_output.sum(), model.model.layers[0].mlp.gate.weight)[0]
+    torch.testing.assert_close(observed_grad, baseline_grad, rtol=0, atol=0)
+
+
+class _TinyCausalModel(_TinyModel):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(8, 2)
+        self.lm_head = nn.Linear(2, 8, bias=False)
+        self.config.use_cache = True
+
+    def forward(self, input_ids):
+        value = self.embedding(input_ids)
+        for layer in self.model.layers:
+            value = layer.mlp(value)[0]
+        return SimpleNamespace(logits=self.lm_head(value))
+
+
+def _joint_trainer_functions():
+    """Load real training functions without importing optional hqq/gemlite kernels."""
+    path = Path(__file__).resolve().parents[1] / "gemq" / "quantize.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names = {"_global_gradient_norm", "_output_reconstruction_diagnostics_enabled", "finetune_routers_distill_ce"}
+    module = ast.Module(
+        body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names],
+        type_ignores=[],
+    )
+    namespace = {
+        "torch": torch, "time": time, "math": math, "DistillCEConfig": DistillCEConfig,
+        "compute_causal_output_distill_ce": compute_causal_output_distill_ce,
+        "set_qwen3_output_reconstruction": set_qwen3_output_reconstruction,
+        "consume_qwen3_output_reconstruction": consume_qwen3_output_reconstruction,
+        "snapshot_pruned_router_rows": snapshot_pruned_router_rows,
+        "restore_pruned_router_rows": restore_pruned_router_rows,
+        "get_router_params": lambda model, name: [p for layer in model.model.layers for p in layer.mlp.gate.parameters()],
+        "get_module_type": lambda name, model_name: "gate" if ".mlp.gate." in name else "other",
+        "LinearModuleType": SimpleNamespace(GATE="gate"),
+        "NAME_TO_MODEL": {MODEL_NAME: "qwen3"},
+        "ModelType": SimpleNamespace(QWEN3MOE="qwen3"),
+        "has_zero_bit_experts": has_zero_bit_experts,
+    }
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace
+
+
+def test_diagnostic_eligibility_uses_actual_allocation_not_weight():
+    enabled = _joint_trainer_functions()["_output_reconstruction_diagnostics_enabled"]
+    args = SimpleNamespace(model_name=MODEL_NAME, mixed=True, finetune_routers=True,
+                           rft_trainer="distill_ce", rft_transfer_weight=0.0)
+    assert enabled(args, {0: {0: 0, 1: 2}})
+    assert not enabled(args, {0: {0: 2, 1: 2}})
+    args.rft_trainer = "layerwise_teacher"
+    assert not enabled(args, {0: {0: 0, 1: 2}})
+    args.rft_trainer = "distill_ce"
+    args.model_name = "unsupported"
+    assert not enabled(args, {0: {0: 0, 1: 2}})
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("weight, nonfinite_diagnostic", [(0.0, False), (0.0, True), (0.7, False)])
+def test_transfer_trainer_matches_reference_updates_and_logs(device, capsys, weight, nonfinite_diagnostic):
+    torch.manual_seed(8)
+    model = _TinyCausalModel().to(device=device, dtype=torch.bfloat16)
+    for layer in model.model.layers:
+        with torch.no_grad():
+            layer.mlp.gate.weight.zero_()
+            layer.mlp.gate.bias.copy_(torch.tensor([0., 4., 3., 2.], device=device))
+    reference = copy.deepcopy(model)
+    allocation = {i: {0: 2, 1: 0, 2: 3, 3: 2} for i in range(2)}
+    for candidate in (model, reference):
+        mask_qwen3_experts(candidate, MODEL_NAME, allocation)
+    cached = TeacherTargets(
+        input_ids=torch.tensor([[1, 2, 3], [4, 5, 6], [2, 3, 4]]), attention_mask=None,
+        router_logits=None, final_hidden_states=torch.randn(3, 3, 2, dtype=torch.bfloat16), metadata={},
+    )
+    args = SimpleNamespace(model_name=MODEL_NAME, nsamples=3, rft_batch_size=1, rft_epochs=2,
+                           rft_lr=0.01, rft_wd=0.1, verbose=False)
+    config = DistillCEConfig(
+        epochs=2, batch_size=1, learning_rate=0.01, weight_decay=0.1,
+        teacher_cache_dir="unused", rebuild_teacher_cache=False, transfer_weight=weight,
+        transfer_diagnostics_enabled=True,
+    )
+    namespace = _joint_trainer_functions()
+    records = []
+
+    def consume(*values, **kwargs):
+        batch = consume_qwen3_output_reconstruction(*values, **kwargs)
+        records.append(batch.loss.requires_grad)
+        if nonfinite_diagnostic:
+            batch.loss = batch.loss * float("nan")
+        return batch
+
+    namespace["consume_qwen3_output_reconstruction"] = consume
+    namespace["finetune_routers_distill_ce"](model, cached, args, config)
+
+    # Independent reference: pure CE at zero, the original weighted update at
+    # positive weight, with identical masked rows frozen after AdamW.
+    for param in reference.parameters():
+        param.requires_grad = False
+    routers = [p for layer in reference.model.layers for p in layer.mlp.gate.parameters()]
+    for param in routers:
+        param.requires_grad = True
+    snapshots = snapshot_pruned_router_rows(reference, MODEL_NAME)
+    optimizer = torch.optim.AdamW(routers, lr=args.rft_lr, weight_decay=args.rft_wd)
+    for _ in range(args.rft_epochs):
+        for index in range(args.nsamples):
+            if weight > 0:
+                set_qwen3_output_reconstruction(reference, MODEL_NAME, True)
+            output = reference(cached.input_ids[index:index+1].to(device))
+            with torch.no_grad():
+                teacher_logits = reference.lm_head(cached.final_hidden_states[index:index+1].to(device))
+            loss = compute_causal_output_distill_ce(output.logits, teacher_logits)
+            optimizer.zero_grad(set_to_none=True)
+            if weight > 0:
+                transfer = consume_qwen3_output_reconstruction(reference, MODEL_NAME).loss
+                if index % 32 == 0:
+                    ce_grads = torch.autograd.grad(loss, routers, retain_graph=True, allow_unused=True)
+                    transfer_grads = torch.autograd.grad(transfer, routers, allow_unused=True)
+                    for param, ce_grad, transfer_grad in zip(routers, ce_grads, transfer_grads):
+                        if ce_grad is None and transfer_grad is None:
+                            continue
+                        param.grad = torch.zeros_like(param) if ce_grad is None else ce_grad
+                        if transfer_grad is not None:
+                            param.grad = param.grad + weight * transfer_grad
+                else:
+                    (loss + weight * transfer).backward()
+            else:
+                loss.backward()
+            optimizer.step()
+            restore_pruned_router_rows(snapshots)
+    assert records == ([True] * 6 if weight > 0 else [True, False, False, True, False, False])
+    for actual, expected in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.isfinite(actual).all()
+    logs = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[epoch")]
+    assert len(logs) == 2
+    for line in logs:
+        fields = dict(item.split("=", 1) for item in line.split("] ")[1].split(", "))
+        assert float(fields["transfer_weight"]) == weight
+        if weight == 0:
+            assert fields["total"] == fields["distill_ce"]
+            assert float(fields["grad_ratio_weighted"]) == 0
+        else:
+            assert float(fields["total"]) == pytest.approx(
+                float(fields["distill_ce"]) + weight * float(fields["transfer_kl"]), abs=2e-6
+            )
+        for key in ("transfer_kl", "grad_ratio_raw", "fit_error", "lost_mass", "pruned_hit_rate",
+                    "layer_error_before", "layer_error_after", "relative_improvement"):
+            assert key in fields
+        if not nonfinite_diagnostic:
+            assert math.isfinite(float(fields["transfer_kl"]))
+            assert float(fields["pruned_hit_rate"]) > 0

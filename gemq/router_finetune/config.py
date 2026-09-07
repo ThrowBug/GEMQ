@@ -1,4 +1,12 @@
 from dataclasses import dataclass
+import math
+
+
+def validate_transfer_weight(value):
+    weight = float(value)
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("--rft_transfer_weight must be non-negative and finite.")
+    return weight
 
 
 ROUTER_LOSS_TYPES = ("kd", "kd_tail", "l2", "l2_center")
@@ -17,9 +25,15 @@ class DistillCEConfig:
     teacher_cache_dir: str
     rebuild_teacher_cache: bool
     transfer_weight: float
+    # Runtime eligibility, derived from model/trainer and the actual allocation.
+    # Not another user-facing hyperparameter.
+    transfer_diagnostics_enabled: bool = False
 
     @classmethod
-    def from_args(cls, args):
+    def from_args(cls, args, *, transfer_diagnostics_enabled=None):
+        weight = validate_transfer_weight(getattr(args, "rft_transfer_weight", 0.0))
+        if transfer_diagnostics_enabled is None:
+            transfer_diagnostics_enabled = weight > 0.0
         config = cls(
             epochs=args.rft_epochs,
             batch_size=args.rft_batch_size,
@@ -27,7 +41,8 @@ class DistillCEConfig:
             weight_decay=args.rft_wd,
             teacher_cache_dir=args.rft_teacher_cache_dir,
             rebuild_teacher_cache=args.rft_rebuild_teacher_cache,
-            transfer_weight=float(getattr(args, "rft_transfer_weight", 0.0)),
+            transfer_weight=weight,
+            transfer_diagnostics_enabled=transfer_diagnostics_enabled,
         )
         config.validate()
         return config
@@ -41,11 +56,11 @@ class DistillCEConfig:
             raise ValueError("--rft_lr must be positive.")
         if self.weight_decay < 0.0:
             raise ValueError("--rft_wd must be non-negative.")
-        if self.transfer_weight < 0.0:
-            raise ValueError("--rft_transfer_weight must be non-negative.")
+        validate_transfer_weight(self.transfer_weight)
 
     @property
     def transfer_enabled(self):
+        """Whether the auxiliary gradient contributes to optimization (legacy API)."""
         return self.transfer_weight > 0.0
 
     @property

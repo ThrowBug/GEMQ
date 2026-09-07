@@ -101,6 +101,40 @@ dataset, bit-width, and cache controls as environment variables near the top of 
 They save dequantized approximate weights as standard BF16 Hugging Face checkpoints under
 `results/fake_quant_models/`, which vLLM can load without a GEMQ runtime patch.
 
+### Zero-weight transfer diagnostics on the prune-mask workflow
+
+For Qwen3-MoE mixed allocations that **actually contain zero-bit experts**, joint
+`distill_ce` fine-tuning collects output-reconstruction diagnostics even when
+`RFT_TRANSFER_WEIGHT=0.0`:
+
+```bash
+RFT_TRAINER=distill_ce RFT_TRANSFER_WEIGHT=0.0 LOAD_GPTQ_CHECKPOINT=true \
+    bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize.sh
+```
+
+This reuses a matching `_PruneMask` GPTQ checkpoint. Omit
+`LOAD_GPTQ_CHECKPOINT=true` for a fresh GPTQ run. An already physically pruned
+checkpoint cannot supply the removed experts' outputs and is rejected for this
+workflow. Both zero and positive transfer weights keep the full expert/router
+topology masked until fine-tuning finishes, then physically prune for export.
+
+At zero weight, optimization uses **only distilled CE gradients**. Transfer KL
+and reconstruction diagnostics are still measured every batch, preserving the
+existing log fields and averaging: losses are epoch-running batch means, whereas
+fit errors and hit/mass statistics describe the current logged batch. Auxiliary
+gradients are computed only on logging steps to report a real `grad_ratio_raw`;
+they never update parameters, and `grad_ratio_weighted` is exactly zero. Masked
+router rows remain fixed against AdamW weight decay. Diagnostic-only runs still
+incur reconstruction and logging-step gradient overhead.
+
+The final zero-weight result uses `_RFT-distill_ce-ReconKL-w0p0-const`, separate
+from historical `_RFT-distill_ce` results. `router_ft_config.json` records the
+derived `transfer_diagnostics_enabled` state (not an extra hyperparameter).
+No-zero allocations and other trainers retain their existing behavior. Serving
+and benchmarking can infer distilled-CE paths from the matching allocation file;
+use `FQ_MODEL_PATH` explicitly for old/moved results or when that file is unavailable.
+Keep `BPE` and other quantization settings consistent with the training run.
+
 ### vLLM serving, benchmarking, and evaluation
 
 Start OLMoE on one GPU:

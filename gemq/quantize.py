@@ -30,6 +30,7 @@ from gemq.router_finetune.config import (
     RFT_TRAINERS,
     ROUTER_LOSS_TYPES,
     RouterFinetuneConfig,
+    validate_transfer_weight,
 )
 from gemq.router_finetune.losses import compute_causal_output_distill_ce
 from gemq.router_finetune.targets import (
@@ -180,12 +181,28 @@ def _global_gradient_norm(gradients, reduction_device=None):
     return float(squared_norm.sqrt().item())
 
 
+def _output_reconstruction_diagnostics_enabled(args, expert_bit_cfg):
+    """Derive mask/diagnostic eligibility independently of the loss coefficient."""
+    return bool(
+        getattr(args, "finetune_routers", True)
+        and getattr(args, "rft_trainer", "distill_ce") == "distill_ce"
+        and getattr(args, "mixed", False)
+        and NAME_TO_MODEL.get(args.model_name) == ModelType.QWEN3MOE
+        and has_zero_bit_experts(expert_bit_cfg)
+    )
+
+
 def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
     """Fine-tune all routers jointly using full-precision teacher soft labels."""
     if teacher_targets.final_hidden_states is None:
         raise RuntimeError("Distilled CE requires cached teacher final hidden states.")
     if config is None:
-        config = DistillCEConfig.from_args(args)
+        bit_cfg = load_expert_bit_config(args.bit_cfg) if getattr(args, "mixed", False) else None
+        config = DistillCEConfig.from_args(
+            args,
+            transfer_diagnostics_enabled=_output_reconstruction_diagnostics_enabled(args, bit_cfg),
+        )
+    diagnostics_enabled = config.transfer_diagnostics_enabled or config.transfer_enabled
 
     # Keep the optimizer, model mode, dtype, batching, and trainable parameters aligned
     # with finetune_routers(); only the hard-label CE objective changes.
@@ -226,7 +243,7 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
     transfer_collection_enabled = False
 
     try:
-        if config.transfer_enabled:
+        if diagnostics_enabled:
             set_qwen3_output_reconstruction(model, args.model_name, True)
             transfer_collection_enabled = True
             router_row_snapshots = snapshot_pruned_router_rows(
@@ -239,6 +256,12 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
             transfer_sum = 0.0
             start_time = time.time()
             for i in range(num_batches):
+                should_log = i % 32 == 0
+                if diagnostics_enabled:
+                    set_qwen3_output_reconstruction(
+                        model, args.model_name, True,
+                        track_grad=config.transfer_enabled or should_log,
+                    )
                 idx = i * args.rft_batch_size
                 end = idx + args.rft_batch_size
                 data = input_ids[idx:end].to("cuda")
@@ -261,18 +284,22 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
                 transfer_weight = (
                     config.transfer_weight if config.transfer_enabled else 0.0
                 )
-                if config.transfer_enabled:
+                if diagnostics_enabled:
                     transfer_batch = consume_qwen3_output_reconstruction(
                         model, args.model_name, loss_device=distill_loss.device
                     )
                     transfer_loss = transfer_batch.loss
-                total_loss = distill_loss + transfer_weight * transfer_loss
+                # Zero weight means pure CE optimization, not 0 * a potentially
+                # non-finite diagnostic value/gradient.
+                total_loss = (
+                    distill_loss + transfer_weight * transfer_loss
+                    if config.transfer_enabled else distill_loss
+                )
 
-                should_log = i % 32 == 0
                 optimizer.zero_grad(set_to_none=True)
                 grad_ratio_raw = None
                 grad_ratio_weighted = None
-                if config.transfer_enabled and should_log:
+                if diagnostics_enabled and should_log:
                     distill_gradients = torch.autograd.grad(
                         distill_loss,
                         router_params,
@@ -287,6 +314,11 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
                     for parameter, distill_gradient, transfer_gradient in zip(
                         router_params, distill_gradients, transfer_gradients
                     ):
+                        if not config.transfer_enabled:
+                            # Preserve None gradients as well: AdamW must behave
+                            # exactly as in a CE-only update, including decay.
+                            parameter.grad = distill_gradient
+                            continue
                         if distill_gradient is None and transfer_gradient is None:
                             continue
                         combined = (
@@ -304,7 +336,10 @@ def finetune_routers_distill_ce(model, teacher_targets, args, config=None):
                         transfer_gradients, reduction_device=distill_loss.device
                     )
                     grad_ratio_raw = transfer_norm / (distill_norm + 1e-12)
-                    grad_ratio_weighted = transfer_weight * grad_ratio_raw
+                    grad_ratio_weighted = (
+                        transfer_weight * grad_ratio_raw if config.transfer_enabled else 0.0
+                    )
+                    del distill_gradients, transfer_gradients
                 else:
                     total_loss.backward()
 
@@ -862,9 +897,7 @@ if __name__ == "__main__":
             f"{args.gptq_checkpoint_path}"
         )
 
-    transfer_enabled = args.rft_transfer_weight > 0.0
-    if args.rft_transfer_weight < 0.0:
-        raise ValueError("--rft_transfer_weight must be non-negative.")
+    transfer_enabled = validate_transfer_weight(args.rft_transfer_weight) > 0.0
     if transfer_enabled and (
         not args.finetune_routers or args.rft_trainer != "distill_ce"
     ):
@@ -911,6 +944,7 @@ if __name__ == "__main__":
         raise ValueError(
             "Output-reconstruction transfer requires at least one 0-bit expert."
         )
+    transfer_diagnostics_enabled = _output_reconstruction_diagnostics_enabled(args, expert_bit_cfg)
 
     router_ft_config = None
     teacher_targets = None
@@ -918,7 +952,9 @@ if __name__ == "__main__":
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
         if args.rft_trainer == "distill_ce":
-            router_ft_config = DistillCEConfig.from_args(args)
+            router_ft_config = DistillCEConfig.from_args(
+                args, transfer_diagnostics_enabled=transfer_diagnostics_enabled
+            )
         else:
             router_ft_config = RouterFinetuneConfig.from_args(args)
 
@@ -937,7 +973,7 @@ if __name__ == "__main__":
         loaded_checkpoint_metadata = load_gptq_checkpoint_metadata(
             args.gptq_checkpoint_path,
             checkpoint_identity,
-            expected_expert_pruning_state="masked" if transfer_enabled else None,
+            expected_expert_pruning_state="masked" if transfer_diagnostics_enabled else None,
         )
         pruning_metadata = loaded_checkpoint_metadata.get("pruning")
 
@@ -979,7 +1015,7 @@ if __name__ == "__main__":
             and expert_bit_cfg is not None
             and has_zero_bit_experts(expert_bit_cfg)
         ):
-            if transfer_enabled:
+            if transfer_diagnostics_enabled:
                 pruning_result = mask_qwen3_experts(
                     model, args.model_name, expert_bit_cfg
                 )

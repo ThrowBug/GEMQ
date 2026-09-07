@@ -123,3 +123,25 @@ def test_checkpoint_records_and_validates_masked_pruning_state(tmp_path):
         load_gptq_checkpoint_metadata(
             checkpoint, identity, expected_expert_pruning_state="physical"
         )
+
+
+def test_zero_transfer_weight_reuses_masked_checkpoint_but_rejects_physical(tmp_path):
+    input_ids = torch.arange(12).reshape(2, 6)
+    positive = build_gptq_checkpoint_identity(_args(rft_transfer_weight=1.0), input_ids, None)
+    zero = build_gptq_checkpoint_identity(_args(rft_transfer_weight=0.0), input_ids, None)
+    assert zero == positive
+    model = _FakeModel()
+    for state in ("masked", "physical"):
+        metadata = build_gptq_checkpoint_metadata(
+            positive, model, {"original_num_experts": 4, "num_experts": 3},
+            expert_pruning_state=state,
+        )
+        checkpoint = tmp_path / state
+        save_gptq_checkpoint(model, _FakeTokenizer(), checkpoint, metadata)
+        if state == "masked":
+            assert load_gptq_checkpoint_metadata(
+                checkpoint, zero, expected_expert_pruning_state="masked"
+            )["expert_pruning_state"] == "masked"
+        else:
+            with pytest.raises(ValueError, match="pruning state differs"):
+                load_gptq_checkpoint_metadata(checkpoint, zero, expected_expert_pruning_state="masked")

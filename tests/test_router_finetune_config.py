@@ -89,3 +89,16 @@ def test_distill_ce_does_not_validate_layerwise_loss_arguments():
         )
     )
     assert config.needs_output_targets
+
+
+def test_zero_weight_can_collect_diagnostics_without_auxiliary_updates():
+    config = DistillCEConfig.from_args(_args(), transfer_diagnostics_enabled=True)
+    assert config.transfer_diagnostics_enabled
+    assert not config.transfer_enabled
+    assert config.transfer_weight == 0.0
+
+
+@pytest.mark.parametrize("weight", [float("nan"), float("inf"), float("-inf")])
+def test_transfer_weight_must_be_finite(weight):
+    with pytest.raises(ValueError, match="finite"):
+        DistillCEConfig.from_args(_args(rft_transfer_weight=weight))

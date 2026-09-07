@@ -28,7 +28,7 @@ fi
 finetune_routers="${FINETUNE_ROUTERS:-true}"
 rft_trainer="${RFT_TRAINER:-layerwise_teacher}"
 rft_transfer_weight="${RFT_TRANSFER_WEIGHT:-0.0}"
-transfer_enabled="$(awk -v value="${rft_transfer_weight}" 'BEGIN { print ((value + 0) > 0) ? "true" : "false" }')"
+transfer_enabled="$(python -c 'import sys; from gemq.router_finetune.config import validate_transfer_weight; print("true" if validate_transfer_weight(sys.argv[1]) > 0 else "false")' "${rft_transfer_weight}")"
 if [[ "${transfer_enabled}" == "true" && ( "${finetune_routers}" != "true" || "${rft_trainer}" != "distill_ce" ) ]]; then
     echo "RFT_TRANSFER_WEIGHT>0 requires FINETUNE_ROUTERS=true and RFT_TRAINER=distill_ce." >&2
     exit 1
@@ -57,6 +57,11 @@ if [[ "${finetune_routers}" == "true" ]]; then
     esac
 fi
 default_fq_path="results/fake_quant_models/${model_name}/GEMQ/${allocation_tag}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
+if [[ "${model_variant}" == "FQ" && -z "${FQ_MODEL_PATH:-}" && "${finetune_routers}" == "true" && "${rft_trainer}" == "distill_ce" ]]; then
+    default_fq_path="$(python -m gemq.utils.qwen3_distill_path \
+        --model "${model_name}" --allocation_tag "${allocation_tag}" --bpe "${bpe}" \
+        --attn_bits "${attn_wbits}" --dense_bits "${dense_wbits}" --weight "${rft_transfer_weight}")"
+fi
 
 case "${model_variant}" in
     FP)

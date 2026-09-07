@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pickle
 from dataclasses import dataclass
-from pathlib import Path
 from types import MethodType
 
 import torch
@@ -18,11 +16,13 @@ from gemq.router_finetune.output_reconstruction import (
     output_reconstruction_kl,
 )
 from gemq.utils.model_utils import ModelType, NAME_TO_MODEL, get_blocks, get_moe_block
+from gemq.utils.expert_bit_config import has_zero_bit_experts, load_expert_bit_config
 
 
 _MASK_BUFFER = "_gemq_zero_bit_expert_mask"
 _ORIGINAL_FORWARD = "_gemq_unmasked_forward"
 _COLLECT_TRANSFER = "_gemq_collect_output_reconstruction"
+_TRANSFER_TRACK_GRAD = "_gemq_output_reconstruction_track_grad"
 _TRANSFER_RECORD = "_gemq_output_reconstruction_record"
 
 
@@ -31,28 +31,6 @@ class PruningResult:
     remapped_bit_config: dict[int, dict[int, int]]
     kept_expert_ids: tuple[tuple[int, ...], ...]
     metadata: dict
-
-
-def load_expert_bit_config(path):
-    path = Path(path)
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    with path.open("rb") as handle:
-        config = pickle.load(handle)
-    if not isinstance(config, dict):
-        raise TypeError(f"Bit allocation must be a dict, got {type(config)!r}")
-    normalized = {}
-    for layer_idx, experts in config.items():
-        if not isinstance(experts, dict):
-            raise TypeError(f"Allocation for layer {layer_idx!r} must be a dict")
-        normalized[int(layer_idx)] = {
-            int(expert_idx): int(bit) for expert_idx, bit in experts.items()
-        }
-    return normalized
-
-
-def has_zero_bit_experts(bit_config):
-    return any(bit == 0 for experts in bit_config.values() for bit in experts.values())
 
 
 def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
@@ -198,6 +176,7 @@ def _masked_qwen3_moe_forward(self, hidden_states):
     routing_weights = routing_probabilities.to(flat_hidden.dtype)
 
     collect_transfer = bool(getattr(self, _COLLECT_TRANSFER, False))
+    track_transfer_grad = bool(getattr(self, _TRANSFER_TRACK_GRAD, True))
     active_tokens = None
     active_lookup = None
     candidate_outputs = None
@@ -210,9 +189,10 @@ def _masked_qwen3_moe_forward(self, hidden_states):
                 "Output-reconstruction KL requires Qwen3 norm_topk_prob=True so "
                 "the routed FFN output is a convex combination."
             )
-        unmasked_probabilities, unmasked_experts = _topk_probabilities(
-            router_logits, self.top_k, True
-        )
+        with torch.no_grad():
+            unmasked_probabilities, unmasked_experts = _topk_probabilities(
+                router_logits.detach(), self.top_k, True
+            )
         lost_positions = pruned_mask[unmasked_experts]
         active_tokens = torch.where(lost_positions.any(dim=-1))[0]
         if active_tokens.numel() > 0:
@@ -246,11 +226,14 @@ def _masked_qwen3_moe_forward(self, hidden_states):
             ] = expert_output[active_route].detach()
 
     if collect_transfer:
+        loss_probabilities = (
+            routing_probabilities if track_transfer_grad else routing_probabilities.detach()
+        )
         if active_tokens is None or active_tokens.numel() == 0:
             setattr(
                 self,
                 _TRANSFER_RECORD,
-                _empty_transfer_record(routing_probabilities, flat_hidden.shape[0]),
+                _empty_transfer_record(loss_probabilities, flat_hidden.shape[0]),
             )
         else:
             with torch.no_grad():
@@ -289,7 +272,7 @@ def _masked_qwen3_moe_forward(self, hidden_states):
                 )
 
             kl = output_reconstruction_kl(
-                target, routing_probabilities[active_tokens]
+                target, loss_probabilities[active_tokens]
             )
             setattr(
                 self,
@@ -323,6 +306,7 @@ def mask_qwen3_experts(model, model_name, bit_config):
         moe.register_buffer(_MASK_BUFFER, mask, persistent=False)
         setattr(moe, _ORIGINAL_FORWARD, moe.forward)
         setattr(moe, _COLLECT_TRANSFER, False)
+        setattr(moe, _TRANSFER_TRACK_GRAD, True)
         setattr(moe, _TRANSFER_RECORD, None)
         moe.forward = MethodType(_masked_qwen3_moe_forward, moe)
 
@@ -340,12 +324,17 @@ def remove_qwen3_expert_masks(model, model_name):
         moe.forward = getattr(moe, _ORIGINAL_FORWARD)
         delattr(moe, _ORIGINAL_FORWARD)
         delattr(moe, _COLLECT_TRANSFER)
+        delattr(moe, _TRANSFER_TRACK_GRAD)
         delattr(moe, _TRANSFER_RECORD)
         delattr(moe, _MASK_BUFFER)
 
 
-def set_qwen3_output_reconstruction(model, model_name, enabled):
-    """Enable or disable collection of online transfer losses."""
+def set_qwen3_output_reconstruction(model, model_name, enabled, *, track_grad=True):
+    """Collect real transfer diagnostics, optionally without an auxiliary graph.
+
+    track_grad=False only detaches the KL branch, never the actual MoE forward.
+    At logging steps a zero-weight run still needs this graph for grad_ratio_raw.
+    """
     layers = get_blocks(model, model_name)
     masked_moes = []
     for layer in layers:
@@ -361,6 +350,7 @@ def set_qwen3_output_reconstruction(model, model_name, enabled):
         raise ValueError("Output reconstruction requires norm_topk_prob=True.")
     for moe in masked_moes:
         setattr(moe, _COLLECT_TRANSFER, bool(enabled))
+        setattr(moe, _TRANSFER_TRACK_GRAD, bool(track_grad))
         setattr(moe, _TRANSFER_RECORD, None)
 
 

@@ -97,7 +97,7 @@ rft_wd="${RFT_WD:-0.0}"
 rft_teacher_cache_dir="${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}"
 rft_rebuild_teacher_cache="${RFT_REBUILD_TEACHER_CACHE:-false}"
 rft_transfer_weight="${RFT_TRANSFER_WEIGHT:-0.0}"
-transfer_enabled="$(awk -v value="${rft_transfer_weight}" 'BEGIN { print ((value + 0) > 0) ? "true" : "false" }')"
+transfer_enabled="$(python -c 'import sys; from gemq.router_finetune.config import validate_transfer_weight; print("true" if validate_transfer_weight(sys.argv[1]) > 0 else "false")' "${rft_transfer_weight}")"
 if [[ "${transfer_enabled}" == "true" && ( "${finetune_routers}" != "true" || "${rft_trainer}" != "distill_ce" ) ]]; then
     echo "RFT_TRANSFER_WEIGHT>0 requires FINETUNE_ROUTERS=true and RFT_TRAINER=distill_ce." >&2
     exit 1
@@ -143,6 +143,16 @@ fi
 if [[ "${mixed_prec}" == "true" && ! -f "${bit_cfg}" ]]; then
     echo "Bit allocation config not found: ${bit_cfg}" >&2
     echo "Run scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh first." >&2
+    exit 1
+fi
+
+# Inspect the allocation itself, not WBITS: a candidate zero bit need not be used.
+transfer_diagnostics_enabled=false
+if [[ "${finetune_routers}" == "true" && "${rft_trainer}" == "distill_ce" && "${mixed_prec}" == "true" ]]; then
+    transfer_diagnostics_enabled="$(python -m gemq.utils.expert_bit_config "${bit_cfg}")"
+fi
+if [[ "${transfer_enabled}" == "true" && "${transfer_diagnostics_enabled}" != "true" ]]; then
+    echo "Output-reconstruction transfer requires at least one actual 0-bit expert." >&2
     exit 1
 fi
 
@@ -198,8 +208,9 @@ if [[ "${finetune_routers}" == "true" ]]; then
                 --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
                 --rft_transfer_weight "${rft_transfer_weight}"
             )
-            if [[ "${transfer_enabled}" == "true" ]]; then
+            if [[ "${transfer_diagnostics_enabled}" == "true" ]]; then
                 transfer_weight_tag="${rft_transfer_weight//./p}"
+                [[ "${transfer_enabled}" == "false" ]] && transfer_weight_tag="0p0"
                 rft_tag+="-ReconKL-w${transfer_weight_tag}-const"
             fi
             ;;
@@ -240,7 +251,7 @@ fi
 
 prefix="${quant_allocation_tag}"
 gptq_checkpoint_path="${gptq_checkpoint_root}/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}"
-if [[ "${transfer_enabled}" == "true" ]]; then
+if [[ "${transfer_diagnostics_enabled}" == "true" ]]; then
     gptq_checkpoint_path+="_PruneMask"
 fi
 checkpoint_args=()
@@ -297,8 +308,11 @@ if [[ "${rft_trainer}" == "legacy_ce" ]]; then
     echo " Router objective: hard-label autoregressive CE"
 elif [[ "${rft_trainer}" == "distill_ce" ]]; then
     echo " Router objective: teacher soft-label autoregressive CE"
-    if [[ "${transfer_enabled}" == "true" ]]; then
+    if [[ "${transfer_diagnostics_enabled}" == "true" ]]; then
         echo " Transfer objective: output reconstruction KL (constant weight=${rft_transfer_weight})"
+        if [[ "${transfer_enabled}" == "false" ]]; then
+            echo " Transfer mode:    diagnostics only; optimizer uses CE gradients only"
+        fi
     fi
 else
     echo " RFT timing:       ${rft_timing}"
