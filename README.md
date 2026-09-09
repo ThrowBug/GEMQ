@@ -15,6 +15,7 @@ GEMQ is a post-training quantization framework for Mixture-of-Experts (MoE) LLMs
 ### What's in this repo
 * An ILP solver for global expert-level bit allocation
 * GPTQ-based quantization and router fine-tuning pipelines
+* An optional Qwen3-MoE AWQ fake-quantization pipeline with expert-level mixed bits
 * Efficient low-bit MoE triton kernels for **real** quantized inference
 
 
@@ -58,6 +59,40 @@ Active workflows are grouped by model:
 
 The old paper-reproduction and packed real-quant workflows are available under
 `scripts/deprecated/`.
+
+### Qwen3-MoE AWQ workflow
+
+The AWQ workflow is additive: it does not replace the existing GPTQ or RTN entry points.
+It is currently fixed to C4 calibration, a W2 sequential expert context, a 2.0-bit
+budget over the original experts, and a maximum physical-pruning ratio of 0.1 (12 of
+128 experts per layer). Cost collection always records `{0,1,2,3}`. The allocation
+script selects `{0,2,3}` from those stored columns by default, so 1-bit remains available
+for later allocation experiments but is not a decision in the default IP. Router
+fine-tuning and packed integer saving are intentionally excluded from this first AWQ path.
+
+Place the C4 shard at `data/c4-train.00000-of-01024.json`, then run:
+
+```bash
+bash scripts/Qwen3-30B-A3B-Instruct-2507/compute_expert_costs_awq.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/allocate_awq.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize_awq.sh
+```
+
+Set `BIT_CANDIDATES=0,1,2,3` (consistently for allocation and quantization), or set
+`BIT_CFG_PATH` for quantization, to use another subset of the stored cost candidates.
+Allocation filenames include the selected subset (for example `B0,2,3`), so a new
+subset does not overwrite an earlier result.
+
+Cost collection searches a shared W2 MoE input scale and per-expert internal scale,
+then searches independent clipping thresholds for W1, W2, and W3. A zero-bit cost is
+the local zero-output proxy used by the optimizer; the final model physically removes
+zero-bit experts before its mixed-bit AWQ search. Attention uses W4 AWQ and routers stay
+in BF16. All downstream layer searches consume the actual fake-quantized upstream output.
+
+AWQ artifacts, allocations, and model directories carry `Quant-awq` or `GEMQ-AWQ` in
+their names. The AWQ commands refuse to overwrite an existing target. The final directory
+is a standard BF16 Hugging Face checkpoint whose values are already fake-quantized; the
+additional `gemq_awq_metadata.json` is descriptive and is not a packed-AWQ runtime config.
 
 ### Calibration, allocation, and quantization
 
@@ -137,7 +172,7 @@ remains reserved for request generation.
 Released under the [MIT License](LICENSE).
 
 ## Acknowledgements
-This repository builds upon several excellent open-source projects, including [MC-MoE](https://github.com/Aaronhuang-778/Mixture-Compressor-MoE), [GPTQ](https://github.com/IST-DASLab/gptq), [HQQ](https://github.com/dropbox/hqq), [GemLite](https://github.com/dropbox/gemlite), and [gpt-fast](https://github.com/meta-pytorch/gpt-fast). We sincerely thank the authors and contributors for making their code publicly available.
+This repository builds upon several excellent open-source projects, including [MC-MoE](https://github.com/Aaronhuang-778/Mixture-Compressor-MoE), [GPTQ](https://github.com/IST-DASLab/gptq), [llm-awq](https://github.com/mit-han-lab/llm-awq), [HQQ](https://github.com/dropbox/hqq), [GemLite](https://github.com/dropbox/gemlite), and [gpt-fast](https://github.com/meta-pytorch/gpt-fast). We sincerely thank the authors and contributors for making their code publicly available. The locally adapted AWQ search code retains its upstream MIT notice under `gemq/quantizers/awq/LICENSE.llm-awq`.
 
 ## Citation
 If you find GEMQ useful for your research or project, please consider citing:

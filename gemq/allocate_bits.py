@@ -88,8 +88,12 @@ def _auto_save_path(args, source_path, bit_cands, solver):
             f"{constraint_tag}{model_str}.pkl"
         )
     else:
+        quantizer_id = str(solver.artifact_metadata.get("quantizer_id", "")).lower()
+        # Old RTN artifacts and newly generated RTN artifacts keep the legacy
+        # filename contract. Only the new AWQ workflow gets a separate tag.
+        quantizer_tag = "-Quant-awq" if quantizer_id == "awq" else ""
         filename = (
-            f"{common}-{_context_tag(solver.artifact_metadata)}"
+            f"{common}{quantizer_tag}-{_context_tag(solver.artifact_metadata)}"
             f"_E{args.bit_budget:.1f}_B{bc_str}"
         )
         if 0 in bit_cands:
@@ -146,6 +150,30 @@ def run_solver(args):
                 f"Expert-cost artifact has {global_solver.num_experts} experts/layer, "
                 f"but {args.model_name} expects {m.num_routed_experts_per_layer}."
             )
+        quantizer_id = str(
+            global_solver.artifact_metadata.get("quantizer_id", "")
+        ).lower()
+        if quantizer_id == "awq":
+            source_candidate_bits = global_solver.artifact_candidate_bits
+            if source_candidate_bits != [0, 1, 2, 3]:
+                raise ValueError(
+                    "GEMQ-AWQ expert costs must contain source candidates "
+                    "[0, 1, 2, 3]."
+                )
+            if not set(bit_cands).issubset(source_candidate_bits):
+                raise ValueError(
+                    "GEMQ-AWQ allocation candidates must be a subset of the "
+                    f"source candidates {source_candidate_bits}, got {bit_cands}."
+                )
+            if not math.isclose(args.max_prune_ratio, 0.1, abs_tol=1e-12):
+                raise ValueError(
+                    "GEMQ-AWQ allocation requires --max_prune_ratio=0.1."
+                )
+            if not math.isclose(args.bit_budget, 2.0, abs_tol=1e-12):
+                raise ValueError(
+                    "GEMQ-AWQ allocation requires --bit_budget=2.0 over the "
+                    "original experts."
+                )
         total_bits = math.floor(
             args.bit_budget
             * global_solver.num_moe_layers
@@ -160,9 +188,22 @@ def run_solver(args):
     save_dir = osp.dirname(osp.abspath(save_path))
     os.makedirs(save_dir, exist_ok=True)
 
+    artifact_quantizer = str(
+        getattr(global_solver, "artifact_metadata", {}).get("quantizer_id", "")
+    ).lower()
+    sidecar_path = osp.splitext(save_path)[0] + ".json"
+    if artifact_quantizer == "awq":
+        existing = [path for path in (save_path, sidecar_path) if osp.exists(path)]
+        if existing:
+            raise FileExistsError(
+                "AWQ allocation outputs already exist and will not be overwritten: "
+                + ", ".join(existing)
+            )
+
     # Preserve GEMQ's downstream contract exactly:
     # {layer_idx: {original_expert_idx: bit}}.
-    with open(save_path, "wb") as handle:
+    open_mode = "xb" if artifact_quantizer == "awq" else "wb"
+    with open(save_path, open_mode) as handle:
         pickle.dump(opt_set, handle)
 
     used_bits = sum(bit for experts in opt_set.values() for bit in experts.values())
@@ -171,7 +212,7 @@ def run_solver(args):
         for layer_idx, experts in opt_set.items()
     }
     sidecar = {
-        "format_version": 1,
+        "format_version": 2 if artifact_quantizer == "awq" else 1,
         "allocation_metric": args.allocation_metric,
         "source_path": source_path,
         "model_name": args.model_name,
@@ -179,18 +220,51 @@ def run_solver(args):
         "total_bit_budget": total_bits,
         "used_bits": used_bits,
         "candidate_bits": bit_cands,
+        "source_candidate_bits": (
+            global_solver.artifact_candidate_bits
+            if artifact_quantizer == "awq"
+            else None
+        ),
         "ilp_backend": args.ilp_backend,
         "objective": (
             float(global_solver.last_objective)
             if global_solver.last_objective is not None
             else None
         ),
-        "max_prune_ratio": args.max_prune_ratio if 0 in bit_cands else None,
+        # For AWQ retain the configured safety cap even when a selected subset
+        # omits bit 0 (in that case the cap is recorded but inactive).
+        "max_prune_ratio": (
+            args.max_prune_ratio
+            if 0 in bit_cands or artifact_quantizer == "awq"
+            else None
+        ),
         "equal_prune_count_across_layers": 0 in bit_cands,
         "pruned_experts_per_layer": pruned_per_layer,
+        "source_quantizer": artifact_quantizer or None,
+        "source_input_ids_sha256": getattr(
+            global_solver, "artifact_metadata", {}
+        ).get("input_ids_sha256"),
+        "source_awq_config": (
+            {
+                key: getattr(global_solver, "artifact_metadata", {}).get(key)
+                for key in (
+                    "model_name",
+                    "model_dtype",
+                    "groupsize",
+                    "attn_wbits",
+                    "dense_wbits",
+                    "awq_search_options",
+                    "one_bit_definition",
+                    "zero_bit_definition",
+                )
+            }
+            if artifact_quantizer == "awq"
+            else None
+        ),
+        "budget_denominator": "original_experts",
     }
-    sidecar_path = osp.splitext(save_path)[0] + ".json"
-    with open(sidecar_path, "w", encoding="utf-8") as handle:
+    json_mode = "x" if artifact_quantizer == "awq" else "w"
+    with open(sidecar_path, json_mode, encoding="utf-8") as handle:
         json.dump(sidecar, handle, indent=2, ensure_ascii=False)
 
     print("Bit config file saved to:", save_path)

@@ -300,6 +300,9 @@ class ExpertCostSolver(GEMQSolver):
             raise ValueError("x_space must contain at least one positive bit-width")
 
         artifact = load_expert_cost_artifact(expert_cost_path)
+        self.artifact_candidate_bits = [
+            int(bit) for bit in artifact["candidate_bits"].tolist()
+        ]
         self.coef = select_candidate_costs(artifact, self.x_space).double().numpy()
         self.counts = artifact["counts"].numpy()
         self.imputed_mask = artifact["imputed_mask"].numpy()

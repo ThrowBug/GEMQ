@@ -13,6 +13,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, logging
 from hqq.models.hf.base import AutoHQQHFModel
 
 from gemq.quantizers.gptq import MCMoeGPTQWeightQuantizer, GPTQWeightQuantizer
+from gemq.awq_quantize import (
+    calibration_input_hash,
+    quantize_weights_awq,
+    validate_awq_allocation_sidecar,
+)
 from gemq.utils.data_utils import get_calib_loader
 from gemq.utils.gptq_checkpoint import (
     build_gptq_checkpoint_identity,
@@ -561,6 +566,34 @@ def parse_args():
         "--reproduce_mcmoe", action="store_true",
         help="Whether to use the GPTQ implementation from MC-MoE"
     )
+    parser.add_argument(
+        "--awq_scale_n_grid", type=int, default=20,
+        help="Number of activation-scale ratios evaluated by GEMQ-AWQ",
+    )
+    parser.add_argument(
+        "--awq_clip_n_grid", type=int, default=20,
+        help="Number of clipping grid intervals used by GEMQ-AWQ",
+    )
+    parser.add_argument(
+        "--awq_clip_max_shrink", type=float, default=0.5,
+        help="Largest fraction of the original range searched by AWQ clipping",
+    )
+    parser.add_argument(
+        "--awq_clip_n_sample_token", type=int, default=512,
+        help="Maximum activation tokens used for each AWQ clipping search",
+    )
+    parser.add_argument(
+        "--awq_search_batch_size", type=int, default=1,
+        help="Calibration batch size used inside AWQ scale search",
+    )
+    parser.add_argument(
+        "--expert_batch_size", type=int, default=4096,
+        help="Maximum active expert tokens forwarded together by GEMQ-AWQ",
+    )
+    parser.add_argument(
+        "--max_prune_ratio", type=float, default=0.1,
+        help="Final physical-pruning cap revalidated by GEMQ-AWQ",
+    )
 
     # router fine-tuning args
     parser.add_argument(
@@ -673,6 +706,51 @@ if __name__ == "__main__":
     # parse args
     args = parse_args()
     print(json.dumps(vars(args), indent=4))
+    quantizer_name = args.quantizer.lower().split("-")[0]
+
+    if not args.eval_fp and quantizer_name not in {"gptq", "awq"}:
+        raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
+    if quantizer_name == "awq" and not args.eval_fp:
+        if NAME_TO_MODEL.get(args.model_name) != ModelType.QWEN3MOE:
+            raise ValueError("GEMQ-AWQ currently supports Qwen3-MoE only.")
+        if args.calib_dataset != "c4":
+            raise ValueError("GEMQ-AWQ is intentionally fixed to C4 calibration.")
+        if not args.mixed or not args.bit_cfg:
+            raise ValueError("GEMQ-AWQ requires --mixed and an IP --bit_cfg file.")
+        if args.finetune_routers:
+            raise ValueError("Router fine-tuning is not part of the GEMQ-AWQ path yet.")
+        if args.real_quant:
+            raise ValueError("GEMQ-AWQ currently saves fake-quantized weights only.")
+        if args.save_gptq_checkpoint or args.load_gptq_checkpoint:
+            raise ValueError("GPTQ checkpoint flags cannot be used with GEMQ-AWQ.")
+        if not math.isclose(args.max_prune_ratio, 0.1, abs_tol=1e-12):
+            raise ValueError("GEMQ-AWQ requires --max_prune_ratio=0.1.")
+        if args.attn_wbits >= 16 or args.dense_wbits >= 16:
+            raise ValueError("GEMQ-AWQ attention/dense bit-widths must be below 16.")
+        if any(
+            value <= 0
+            for value in (
+                args.groupsize,
+                args.awq_scale_n_grid,
+                args.awq_clip_n_grid,
+                args.awq_clip_n_sample_token,
+                args.awq_search_batch_size,
+                args.expert_batch_size,
+            )
+        ):
+            raise ValueError("GEMQ-AWQ group, grid, token, and batch sizes must be positive.")
+        if not 0 < args.awq_clip_max_shrink <= 1:
+            raise ValueError("--awq_clip_max_shrink must be in (0, 1].")
+        if args.batch_size != 1 or args.awq_search_batch_size != 1:
+            raise ValueError(
+                "GEMQ-AWQ currently requires --batch_size=1 and "
+                "--awq_search_batch_size=1."
+            )
+        if args.save_path and os.path.exists(args.save_path):
+            raise FileExistsError(
+                "AWQ model output already exists and will not be overwritten: "
+                f"{args.save_path}"
+            )
 
     if args.cuda_diagnostics:
         original_excepthook = sys.excepthook
@@ -757,10 +835,36 @@ if __name__ == "__main__":
     # Load the allocation before collecting teacher signals, but do not mutate the
     # model yet: pruning-aware distillation uses the original full model as teacher.
     expert_bit_cfg = None
+    original_expert_bit_cfg = None
     pruning_result = None
     pruning_metadata = None
     if args.mixed:
         expert_bit_cfg = load_expert_bit_config(args.bit_cfg)
+        original_expert_bit_cfg = {
+            layer_idx: dict(experts)
+            for layer_idx, experts in expert_bit_cfg.items()
+        }
+        if quantizer_name == "awq" and not args.eval_fp:
+            validate_awq_allocation_sidecar(
+                args.bit_cfg,
+                expected_input_hash=calibration_input_hash(dataloader),
+                expected_model_name=args.model_name,
+                expected_model_dtype=args.model_dtype,
+                expected_awq_config={
+                    "groupsize": args.groupsize,
+                    "attn_wbits": args.attn_wbits,
+                    "dense_wbits": args.dense_wbits,
+                    "awq_search_options": {
+                        "groupsize": args.groupsize,
+                        "scale_n_grid": args.awq_scale_n_grid,
+                        "clip_n_grid": args.awq_clip_n_grid,
+                        "clip_max_shrink": args.awq_clip_max_shrink,
+                        "clip_n_sample_token": args.awq_clip_n_sample_token,
+                        "search_batch_size": args.awq_search_batch_size,
+                    },
+                },
+                expert_bit_config=expert_bit_cfg,
+            )
 
     router_ft_config = None
     teacher_targets = None
@@ -820,7 +924,12 @@ if __name__ == "__main__":
             and expert_bit_cfg is not None
             and has_zero_bit_experts(expert_bit_cfg)
         ):
-            pruning_result = prune_qwen3_experts(model, args.model_name, expert_bit_cfg)
+            pruning_result = prune_qwen3_experts(
+                model,
+                args.model_name,
+                expert_bit_cfg,
+                max_prune_ratio=(0.1 if quantizer_name == "awq" else None),
+            )
             expert_bit_cfg = pruning_result.remapped_bit_config
             pruning_metadata = dict(pruning_result.metadata)
             pruning_metadata["source_bit_config"] = args.bit_cfg
@@ -832,8 +941,8 @@ if __name__ == "__main__":
     if not args.eval_fp and not args.load_gptq_checkpoint:
         # quantize and get a name-module mapping of quantized modules
         print(f"Start quantizing model weights ...")
-        quantizer = args.quantizer.lower().split("-")[0]
-        if quantizer == "gptq":
+        awq_metadata = None
+        if quantizer_name == "gptq":
             layerwise_config = (
                 router_ft_config if args.rft_trainer == "layerwise_teacher" else None
             )
@@ -845,8 +954,13 @@ if __name__ == "__main__":
                 teacher_targets,
                 expert_bit_cfg,
             )
-        else:
-            raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
+        elif quantizer_name == "awq":
+            awq_metadata = quantize_weights_awq(
+                model,
+                dataloader,
+                args,
+                expert_bit_cfg,
+            )
 
         if args.save_gptq_checkpoint:
             checkpoint_metadata = build_gptq_checkpoint_metadata(
@@ -940,7 +1054,10 @@ if __name__ == "__main__":
     # save model
     if args.save_path:
         print("Saving model ...")
-        os.makedirs(args.save_path, exist_ok=True)
+        os.makedirs(
+            args.save_path,
+            exist_ok=(quantizer_name != "awq" or args.eval_fp),
+        )
         if pruning_metadata is not None:
             with open(
                 os.path.join(args.save_path, "expert_pruning_map.json"),
@@ -948,6 +1065,20 @@ if __name__ == "__main__":
                 encoding="utf-8",
             ) as f:
                 json.dump(pruning_metadata, f, indent=2, ensure_ascii=False)
+        if quantizer_name == "awq" and not args.eval_fp:
+            with open(
+                os.path.join(args.save_path, "gemq_awq_metadata.json"),
+                "x",
+                encoding="utf-8",
+            ) as f:
+                awq_metadata["allocation"] = {
+                    "source_bit_config": args.bit_cfg,
+                    "original_bit_config": original_expert_bit_cfg,
+                    "remapped_bit_config": expert_bit_cfg,
+                    "budget_denominator": "original_experts",
+                    "max_prune_ratio": 0.1,
+                }
+                json.dump(awq_metadata, f, indent=2, ensure_ascii=False)
         if router_ft_config is not None:
             with open(
                 os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"

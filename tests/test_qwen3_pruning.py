@@ -80,3 +80,23 @@ def test_teacher_router_logits_are_projected_without_changing_final_targets():
     torch.testing.assert_close(projected.router_logits[0], logits[0][..., [0, 2, 3]])
     torch.testing.assert_close(projected.router_logits[1], logits[1][..., [1, 2, 3]])
     assert projected.final_hidden_states is final_hidden
+
+
+def test_qwen3_pruning_revalidates_requested_ratio_cap():
+    model = _TinyModel()
+    allocation = {
+        0: {0: 0, 1: 2, 2: 2, 3: 2},
+        1: {0: 2, 1: 0, 2: 2, 3: 2},
+    }
+
+    try:
+        prune_qwen3_experts(
+            model,
+            MODEL_NAME,
+            allocation,
+            max_prune_ratio=0.1,
+        )
+    except ValueError as error:
+        assert "exceeding max_prune_ratio" in str(error)
+    else:
+        raise AssertionError("Expected the physical-pruning ratio cap to be enforced")

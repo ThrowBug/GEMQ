@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,7 +42,13 @@ def has_zero_bit_experts(bit_config):
     return any(bit == 0 for experts in bit_config.values() for bit in experts.values())
 
 
-def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
+def _build_pruning_result(
+    bit_config,
+    num_layers,
+    num_experts,
+    top_k,
+    max_prune_ratio=None,
+):
     expected_layers = set(range(num_layers))
     if set(bit_config) != expected_layers:
         raise ValueError(
@@ -82,6 +89,16 @@ def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
             f"of experts, got counts {[len(ids) for ids in pruned_by_layer]}."
         )
     pruned_count = prune_counts.pop()
+    if max_prune_ratio is not None:
+        max_prune_ratio = float(max_prune_ratio)
+        if not 0 <= max_prune_ratio <= 1:
+            raise ValueError("max_prune_ratio must be in [0, 1]")
+        max_pruned = math.floor(max_prune_ratio * num_experts + 1e-12)
+        if pruned_count > max_pruned:
+            raise ValueError(
+                f"Allocation prunes {pruned_count} experts/layer, exceeding "
+                f"max_prune_ratio={max_prune_ratio:g} ({max_pruned}/{num_experts})."
+            )
     remaining = num_experts - pruned_count
     metadata = {
         "format_version": 1,
@@ -90,6 +107,7 @@ def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
         "original_num_experts": num_experts,
         "num_experts": remaining,
         "pruned_experts_per_layer": pruned_count,
+        "max_prune_ratio": max_prune_ratio,
         "layers": {
             str(layer_idx): {
                 "kept_old_ids": list(kept_by_layer[layer_idx]),
@@ -116,7 +134,7 @@ def _slice_linear_output_rows(linear, kept_ids):
         linear.out_features = len(kept_ids)
 
 
-def prune_qwen3_experts(model, model_name, bit_config):
+def prune_qwen3_experts(model, model_name, bit_config, max_prune_ratio=None):
     """Delete zero-bit experts and remap each layer's survivors contiguously."""
     if NAME_TO_MODEL.get(model_name) != ModelType.QWEN3MOE:
         raise NotImplementedError("Physical zero-bit pruning currently supports Qwen3-MoE only.")
@@ -133,7 +151,13 @@ def prune_qwen3_experts(model, model_name, bit_config):
             getattr(model.config, "num_experts_per_tok", 1),
         )
     )
-    result = _build_pruning_result(bit_config, len(layers), num_experts, top_k)
+    result = _build_pruning_result(
+        bit_config,
+        len(layers),
+        num_experts,
+        top_k,
+        max_prune_ratio=max_prune_ratio,
+    )
     remaining = result.metadata["num_experts"]
     if remaining == num_experts:
         return result

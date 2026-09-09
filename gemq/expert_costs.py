@@ -20,6 +20,18 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from gemq.quantizers.rtn import MCMoeRTNWeightQuantizer
+from gemq.quantizers.awq.policy import Qwen3MoeAWQPolicy
+from gemq.quantizers.awq.qwen3 import (
+    AWQSearchOptions,
+    clip_and_quantize_attention,
+    compute_expert_down_inputs,
+    install_expert_fake_quant,
+    search_and_apply_attention_scales,
+    search_and_apply_expert_internal_scale,
+    search_and_apply_moe_input_scale,
+    search_expert_clips,
+    validate_qwen3_moe_layer,
+)
 from gemq.utils.model_utils import (
     ModelType,
     NAME_TO_MODEL,
@@ -224,6 +236,57 @@ def _forward_layer_batches(
         output = layer(hidden_states, *args, **kwargs)
         outputs.append(_to_cpu(_first_tensor(output)))
     return outputs
+
+
+@torch.inference_mode()
+def _capture_qwen3_attention_inputs(
+    layer,
+    hidden_batches,
+    positional_batches,
+    keyword_batches,
+    device,
+):
+    """Capture QKV and output-projection inputs from the current FP layer."""
+    features = {"self_attn.q_proj": [], "self_attn.o_proj": []}
+
+    def capture(module, inputs, output, name):
+        features[name].append(_to_cpu(inputs[0]))
+
+    handles = [
+        layer.self_attn.q_proj.register_forward_hook(
+            lambda module, inputs, output: capture(
+                module, inputs, output, "self_attn.q_proj"
+            )
+        ),
+        layer.self_attn.o_proj.register_forward_hook(
+            lambda module, inputs, output: capture(
+                module, inputs, output, "self_attn.o_proj"
+            )
+        ),
+    ]
+    try:
+        for hidden_states, args, kwargs in zip(
+            hidden_batches, positional_batches, keyword_batches
+        ):
+            layer(
+                hidden_states.to(device=device, non_blocking=True),
+                *_to_device(args, device),
+                **_to_device(kwargs, device),
+            )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    expected = len(hidden_batches)
+    if any(len(values) != expected for values in features.values()):
+        raise RuntimeError("Did not capture exactly one attention input per batch")
+    qkv_input = torch.cat(features["self_attn.q_proj"], dim=0)
+    return {
+        "self_attn.q_proj": qkv_input,
+        "self_attn.k_proj": qkv_input,
+        "self_attn.v_proj": qkv_input,
+        "self_attn.o_proj": torch.cat(features["self_attn.o_proj"], dim=0),
+    }
 
 
 def _get_qwen3_expert(moe_block, expert_idx):
@@ -559,3 +622,320 @@ def compute_qwen3_expert_costs(
         model.config.use_cache = original_use_cache
 
     return costs, counts
+
+
+def _clone_expert_weights(expert):
+    return tuple(linear.weight.detach().clone() for linear in _expert_linears(expert))
+
+
+@torch.inference_mode()
+def _compute_awq_expert_candidates(
+    expert,
+    active_inputs,
+    active_gates,
+    down_inputs,
+    candidate_bits,
+    average_bits,
+    options,
+    expert_batch_size,
+    device,
+):
+    """Evaluate candidates independently and leave the expert at context W2."""
+    costs = torch.full((len(candidate_bits),), torch.nan, dtype=torch.float64)
+    bit_to_column = {bit: column for column, bit in enumerate(candidate_bits)}
+    reference_outputs = _reference_outputs(
+        expert, active_inputs, expert_batch_size, device
+    )
+    count = active_inputs.shape[0]
+
+    if 0 in bit_to_column:
+        numerator = _weighted_deviation_sum(
+            expert,
+            active_inputs,
+            active_gates,
+            reference_outputs,
+            expert_batch_size,
+            device,
+            zero_output=True,
+        )
+        costs[bit_to_column[0]] = numerator / count
+
+    scaled_weights = _clone_expert_weights(expert)
+    context_weights = None
+    try:
+        for bit in (candidate for candidate in candidate_bits if candidate > 0):
+            _restore_weights(_expert_linears(expert), scaled_weights)
+            clips = search_expert_clips(
+                expert, active_inputs, down_inputs, bit, options
+            )
+            install_expert_fake_quant(
+                expert,
+                bit=bit,
+                groupsize=options.groupsize,
+                clips=clips,
+            )
+            numerator = _weighted_deviation_sum(
+                expert,
+                active_inputs,
+                active_gates,
+                reference_outputs,
+                expert_batch_size,
+                device,
+            )
+            costs[bit_to_column[bit]] = numerator / count
+            if bit == average_bits:
+                context_weights = _clone_expert_weights(expert)
+    finally:
+        if context_weights is None:
+            _restore_weights(_expert_linears(expert), scaled_weights)
+        else:
+            _restore_weights(_expert_linears(expert), context_weights)
+
+    if context_weights is None:
+        raise RuntimeError(
+            f"Context bit W{average_bits} was not evaluated for an active expert"
+        )
+    return costs
+
+
+@torch.inference_mode()
+def _compute_awq_layer_costs(
+    layer,
+    moe_input_batches,
+    selected_expert_batches,
+    routing_weight_batches,
+    candidate_bits,
+    average_bits,
+    policy,
+    options,
+    expert_batch_size,
+    device,
+):
+    moe = layer.mlp
+    concatenated_moe_input = torch.cat(moe_input_batches, dim=0)
+    common_scale, common_error = search_and_apply_moe_input_scale(
+        layer, concatenated_moe_input, policy, options
+    )
+    scaled_moe_inputs = [
+        batch.div_(
+            common_scale.to(batch.device, batch.dtype).view(
+                *([1] * (batch.ndim - 1)), -1
+            )
+        )
+        for batch in moe_input_batches
+    ]
+    del concatenated_moe_input
+
+    num_experts = len(moe.experts)
+    costs = torch.full(
+        (num_experts, len(candidate_bits)), torch.nan, dtype=torch.float64
+    )
+    counts = torch.zeros(num_experts, dtype=torch.long)
+    unhit_experts = []
+    internal_errors = {}
+
+    for expert_idx in tqdm(
+        range(num_experts), desc="AWQ experts", leave=False, dynamic_ncols=True
+    ):
+        expert = _get_qwen3_expert(moe, expert_idx)
+        active_inputs, active_gates = _collect_active_inputs(
+            expert_idx,
+            scaled_moe_inputs,
+            selected_expert_batches,
+            routing_weight_batches,
+        )
+        if active_inputs is None:
+            # The common scale is valid for all experts. With no routed tokens,
+            # neither the internal scale nor activation-conditioned clipping is
+            # identifiable, so use unclipped W2 for the sequential context.
+            install_expert_fake_quant(
+                expert, average_bits, options.groupsize, clips=None
+            )
+            unhit_experts.append(expert_idx)
+            continue
+
+        counts[expert_idx] = active_inputs.shape[0]
+        down_inputs = compute_expert_down_inputs(
+            expert, active_inputs, expert_batch_size, device
+        )
+        _, internal_error, scaled_down_inputs = (
+            search_and_apply_expert_internal_scale(
+                expert,
+                down_inputs,
+                average_bits,
+                options,
+            )
+        )
+        internal_errors[str(expert_idx)] = internal_error
+        costs[expert_idx] = _compute_awq_expert_candidates(
+            expert,
+            active_inputs,
+            active_gates,
+            scaled_down_inputs,
+            candidate_bits,
+            average_bits,
+            options,
+            expert_batch_size,
+            device,
+        )
+        del active_inputs, active_gates, down_inputs, scaled_down_inputs
+
+    metadata = {
+        "moe_input_scale_error": common_error,
+        "expert_internal_scale_errors": internal_errors,
+        "unhit_experts": unhit_experts,
+    }
+    return costs, counts, metadata
+
+
+@torch.inference_mode()
+def compute_qwen3_awq_expert_costs(
+    model,
+    dataloader,
+    model_name,
+    candidate_bits,
+    average_bits=2,
+    expert_batch_size=4096,
+    device="cuda",
+    groupsize=128,
+    scale_n_grid=20,
+    clip_n_grid=20,
+    clip_max_shrink=0.5,
+    clip_n_sample_token=512,
+    search_batch_size=1,
+    attention_bits=4,
+    dense_bits=4,
+):
+    """Collect AWQ-conditioned expert costs in a sequential W2 context."""
+    if NAME_TO_MODEL.get(model_name) != ModelType.QWEN3MOE:
+        raise NotImplementedError("GEMQ-AWQ expert costs support Qwen3-MoE only")
+    if not candidate_bits or len(set(candidate_bits)) != len(candidate_bits):
+        raise ValueError("candidate_bits must be a non-empty list without duplicates")
+    if any(not isinstance(bit, int) or bit < 0 or bit > 16 for bit in candidate_bits):
+        raise ValueError("candidate_bits must contain integers in [0, 16]")
+    if average_bits not in candidate_bits or average_bits <= 0:
+        raise ValueError("average_bits must be a positive candidate bit-width")
+    if attention_bits >= 16 or dense_bits >= 16:
+        raise ValueError("The AWQ cost context expects quantized attention/dense bits")
+
+    options = AWQSearchOptions(
+        groupsize=groupsize,
+        scale_n_grid=scale_n_grid,
+        clip_n_grid=clip_n_grid,
+        clip_max_shrink=clip_max_shrink,
+        clip_n_sample_token=clip_n_sample_token,
+        search_batch_size=search_batch_size,
+    )
+    device = torch.device(device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required but is not available to PyTorch")
+
+    original_use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = get_blocks(model, model_name)
+    hidden_batches, positional_batches, keyword_batches = _capture_decoder_inputs(
+        model, dataloader, model_name, device
+    )
+    num_layers = len(layers)
+    num_experts = len(get_moe_block(layers[0], model_name).experts)
+    costs = torch.full(
+        (num_layers, num_experts, len(candidate_bits)),
+        torch.nan,
+        dtype=torch.float64,
+    )
+    counts = torch.zeros((num_layers, num_experts), dtype=torch.long)
+    search_metadata = []
+
+    try:
+        for layer_idx in tqdm(
+            range(num_layers), desc="AWQ expert cost layers", dynamic_ncols=True
+        ):
+            layer = layers[layer_idx].to(device)
+            policy = Qwen3MoeAWQPolicy.uniform(
+                num_experts,
+                expert_bits=average_bits,
+                attention_bits=attention_bits,
+                dense_bits=dense_bits,
+            )
+            validate_qwen3_moe_layer(layer, policy)
+
+            attention_inputs = _capture_qwen3_attention_inputs(
+                layer,
+                hidden_batches,
+                positional_batches,
+                keyword_batches,
+                device,
+            )
+            attention_metadata = search_and_apply_attention_scales(
+                layer,
+                attention_inputs,
+                keyword_batches[0],
+                policy,
+                options,
+            )
+            attention_metadata["clip_means"] = clip_and_quantize_attention(
+                layer, attention_inputs, policy, options
+            )
+
+            (
+                moe_input_batches,
+                selected_expert_batches,
+                routing_weight_batches,
+                _,
+            ) = _capture_qwen3_moe_inputs(
+                layer,
+                layer.mlp,
+                hidden_batches,
+                positional_batches,
+                keyword_batches,
+                device,
+                stop_at_moe=True,
+            )
+            layer_costs, layer_counts, moe_metadata = _compute_awq_layer_costs(
+                layer,
+                moe_input_batches,
+                selected_expert_batches,
+                routing_weight_batches,
+                candidate_bits,
+                average_bits,
+                policy,
+                options,
+                expert_batch_size,
+                device,
+            )
+            costs[layer_idx] = layer_costs
+            counts[layer_idx] = layer_counts
+            search_metadata.append(
+                {
+                    "layer": layer_idx,
+                    "attention": attention_metadata,
+                    "moe": moe_metadata,
+                }
+            )
+
+            hidden_batches = _forward_layer_batches(
+                layer,
+                hidden_batches,
+                positional_batches,
+                keyword_batches,
+                device,
+            )
+            layers[layer_idx] = layer.to("cpu")
+            del (
+                attention_inputs,
+                moe_input_batches,
+                selected_expert_batches,
+                routing_weight_batches,
+                layer_costs,
+                layer_counts,
+            )
+            _empty_cuda_cache(device)
+    finally:
+        model.config.use_cache = original_use_cache
+
+    return costs, counts, {
+        "search_options": options.to_dict(),
+        "attention_bits": attention_bits,
+        "dense_bits": dense_bits,
+        "layers": search_metadata,
+    }

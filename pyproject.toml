@@ -34,6 +34,9 @@ gurobi = ["gurobipy>=12.0.3"]
 [tool.setuptools.packages.find]
 include = ["gemq*"]
 
+[tool.setuptools.package-data]
+"gemq.quantizers.awq" = ["LICENSE.llm-awq"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
