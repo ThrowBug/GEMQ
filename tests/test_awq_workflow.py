@@ -141,6 +141,45 @@ def test_mixed_bit_awq_workflow_runs_sequentially_on_tiny_qwen_model():
     assert all(parameter.device.type == "cpu" for parameter in model.parameters())
 
 
+def test_uniform_awq_workflow_does_not_require_bit_config():
+    torch.manual_seed(5)
+    model = _TinyLM()
+    dataloader = [
+        (torch.tensor([[1, 2, 3]]), None),
+        (torch.tensor([[4, 5, 6]]), None),
+    ]
+    args = SimpleNamespace(
+        model_name=MODEL_NAME,
+        groupsize=2,
+        awq_scale_n_grid=2,
+        awq_clip_n_grid=2,
+        awq_clip_max_shrink=0.5,
+        awq_clip_n_sample_token=8,
+        awq_search_batch_size=1,
+        expert_batch_size=8,
+        expert_wbits=3,
+        attn_wbits=2,
+        dense_wbits=2,
+        calib_dataset="c4",
+        nsamples=2,
+        seqlen=3,
+        seed=0,
+        awq_device="cpu",
+    )
+
+    metadata = quantize_weights_awq(model, dataloader, args, None)
+
+    assert metadata["expert_precision"] == {
+        "mode": "uniform",
+        "uniform_expert_bits": 3,
+    }
+    assert all(
+        layer["policy"]["expert_bits"] == [3, 3]
+        for layer in metadata["layers"]
+    )
+    assert all(parameter.device.type == "cpu" for parameter in model.parameters())
+
+
 def test_awq_expert_costs_cover_all_candidates_and_keep_w2_context():
     torch.manual_seed(4)
     model = _TinyLM()

@@ -13,6 +13,16 @@ seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
 groupsize="${GROUPSIZE:-128}"
 allocation_bits="${BIT_CANDIDATES:-0,2,3}"
+mixed_prec="${MIXED_PREC:-true}"
+expert_wbits="${EXPERT_WBITS:-2}"
+
+case "${mixed_prec}" in
+    true|false) ;;
+    *)
+        echo "MIXED_PREC must be true or false, got: ${mixed_prec}" >&2
+        exit 1
+        ;;
+esac
 
 c4_path="data/c4-train.00000-of-01024.json"
 if [[ ! -f "${c4_path}" ]]; then
@@ -20,16 +30,24 @@ if [[ ! -f "${c4_path}" ]]; then
     exit 1
 fi
 
-allocation_name="C4-Seed${seed}_Metric-expert_cost-Quant-awq-Ctxuniform2_E2.0_B${allocation_bits}_Pmax0.1_EqPrune"
-default_bit_cfg="configs/${model_name}/GEMQ/${allocation_name}.pkl"
-bit_cfg="${BIT_CFG_PATH:-${default_bit_cfg}}"
-if [[ ! -f "${bit_cfg}" || ! -f "${bit_cfg%.pkl}.json" ]]; then
-    echo "Complete AWQ allocation not found: ${bit_cfg}" >&2
-    echo "Run allocate_awq.sh first." >&2
-    exit 1
+precision_args=(--expert_wbits "${expert_wbits}")
+if [[ "${mixed_prec}" == "true" ]]; then
+    quantization_name="C4-Seed${seed}_Metric-expert_cost-Quant-awq-Ctxuniform2_E2.0_B${allocation_bits}_Pmax0.1_EqPrune"
+    output_name="${quantization_name}_A4-G16-D4-E2.0"
+    default_bit_cfg="configs/${model_name}/GEMQ/${quantization_name}.pkl"
+    bit_cfg="${BIT_CFG_PATH:-${default_bit_cfg}}"
+    if [[ ! -f "${bit_cfg}" || ! -f "${bit_cfg%.pkl}.json" ]]; then
+        echo "Complete AWQ allocation not found: ${bit_cfg}" >&2
+        echo "Run allocate_awq.sh first." >&2
+        exit 1
+    fi
+    precision_args+=(--mixed --bit_cfg "${bit_cfg}")
+else
+    quantization_name="C4-Seed${seed}_UniformE${expert_wbits}"
+    output_name="${quantization_name}_A4-G16-D4"
 fi
 
-default_save_path="results/fake_quant_models/${model_name}/GEMQ-AWQ/${allocation_name}_A4-G16-D4-E2.0"
+default_save_path="results/fake_quant_models/${model_name}/GEMQ-AWQ/${output_name}"
 save_path="${SAVE_PATH:-${default_save_path}}"
 if [[ -e "${save_path}" ]]; then
     echo "AWQ model output already exists and will not be overwritten: ${save_path}" >&2
@@ -48,8 +66,7 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.quantize \
     --batch_size "${FORWARD_BATCH_SIZE:-1}" \
     --seed "${seed}" \
     --quantizer awq \
-    --mixed \
-    --bit_cfg "${bit_cfg}" \
+    "${precision_args[@]}" \
     --groupsize "${groupsize}" \
     --attn_wbits 4 \
     --dense_wbits 4 \

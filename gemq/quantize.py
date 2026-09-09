@@ -715,8 +715,12 @@ if __name__ == "__main__":
             raise ValueError("GEMQ-AWQ currently supports Qwen3-MoE only.")
         if args.calib_dataset != "c4":
             raise ValueError("GEMQ-AWQ is intentionally fixed to C4 calibration.")
-        if not args.mixed or not args.bit_cfg:
-            raise ValueError("GEMQ-AWQ requires --mixed and an IP --bit_cfg file.")
+        if args.mixed and not args.bit_cfg:
+            raise ValueError("Mixed-precision GEMQ-AWQ requires an IP --bit_cfg file.")
+        if not args.mixed and not 1 <= args.expert_wbits < 16:
+            raise ValueError(
+                "Uniform GEMQ-AWQ requires --expert_wbits in [1, 15]."
+            )
         if args.finetune_routers:
             raise ValueError("Router fine-tuning is not part of the GEMQ-AWQ path yet.")
         if args.real_quant:
@@ -1072,11 +1076,17 @@ if __name__ == "__main__":
                 encoding="utf-8",
             ) as f:
                 awq_metadata["allocation"] = {
-                    "source_bit_config": args.bit_cfg,
+                    "mode": "mixed" if args.mixed else "uniform",
+                    "source_bit_config": args.bit_cfg if args.mixed else None,
                     "original_bit_config": original_expert_bit_cfg,
                     "remapped_bit_config": expert_bit_cfg,
-                    "budget_denominator": "original_experts",
-                    "max_prune_ratio": 0.1,
+                    "uniform_expert_bits": (
+                        None if args.mixed else args.expert_wbits
+                    ),
+                    "budget_denominator": (
+                        "original_experts" if args.mixed else None
+                    ),
+                    "max_prune_ratio": 0.1 if args.mixed else None,
                 }
                 json.dump(awq_metadata, f, indent=2, ensure_ascii=False)
         if router_ft_config is not None:

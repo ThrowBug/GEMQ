@@ -83,6 +83,15 @@ Set `BIT_CANDIDATES=0,1,2,3` (consistently for allocation and quantization), or 
 Allocation filenames include the selected subset (for example `B0,2,3`), so a new
 subset does not overwrite an earlier result.
 
+`quantize_awq.sh` defaults to `MIXED_PREC=true`. Set `MIXED_PREC=false` to skip the
+IP allocation and physical pruning and quantize every expert uniformly; the uniform
+expert width is controlled by `EXPERT_WBITS` and defaults to 2:
+
+```bash
+MIXED_PREC=false EXPERT_WBITS=2 \
+  bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize_awq.sh
+```
+
 Cost collection searches a shared W2 MoE input scale and per-expert internal scale,
 then searches independent clipping thresholds for W1, W2, and W3. A zero-bit cost is
 the local zero-output proxy used by the optimizer; the final model physically removes

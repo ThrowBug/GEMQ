@@ -137,11 +137,12 @@ def validate_awq_allocation_sidecar(
 
 @torch.inference_mode()
 def quantize_weights_awq(model, dataloader, args, expert_bit_config):
-    """Search, absorb, clip, and fake-quantize a physically pruned model."""
+    """Search, absorb, clip, and fake-quantize a mixed or uniform model."""
     if NAME_TO_MODEL.get(args.model_name) != ModelType.QWEN3MOE:
         raise NotImplementedError("GEMQ-AWQ final quantization supports Qwen3-MoE only")
-    if expert_bit_config is None:
-        raise ValueError("GEMQ-AWQ requires an IP allocation via --mixed --bit_cfg")
+    mixed_precision = expert_bit_config is not None
+    if not mixed_precision and not 1 <= int(args.expert_wbits) < 16:
+        raise ValueError("Uniform GEMQ-AWQ requires expert_wbits in [1, 15]")
 
     options = AWQSearchOptions(
         groupsize=args.groupsize,
@@ -156,7 +157,7 @@ def quantize_weights_awq(model, dataloader, args, expert_bit_config):
         raise RuntimeError("CUDA is required for GEMQ-AWQ final quantization")
     layers = get_blocks(model, args.model_name)
     expected_layers = set(range(len(layers)))
-    if set(expert_bit_config) != expected_layers:
+    if mixed_precision and set(expert_bit_config) != expected_layers:
         raise ValueError(
             "AWQ allocation layer IDs do not match the model after pruning: "
             f"expected {sorted(expected_layers)}, got {sorted(expert_bit_config)}"
@@ -172,8 +173,15 @@ def quantize_weights_awq(model, dataloader, args, expert_bit_config):
     try:
         for layer_idx in tqdm(range(len(layers)), desc="AWQ Quantizing"):
             layer = layers[layer_idx].to(device)
+            if mixed_precision:
+                layer_bit_config = expert_bit_config[layer_idx]
+            else:
+                layer_bit_config = {
+                    expert_idx: int(args.expert_wbits)
+                    for expert_idx in range(len(layer.mlp.experts))
+                }
             policy = layer_policy_from_bit_config(
-                expert_bit_config[layer_idx],
+                layer_bit_config,
                 attention_bits=args.attn_wbits,
                 dense_bits=args.dense_wbits,
             )
@@ -305,6 +313,12 @@ def quantize_weights_awq(model, dataloader, args, expert_bit_config):
         "fake_quantized": True,
         "packed_integer_weights": False,
         "model_name": args.model_name,
+        "expert_precision": {
+            "mode": "mixed" if mixed_precision else "uniform",
+            "uniform_expert_bits": (
+                None if mixed_precision else int(args.expert_wbits)
+            ),
+        },
         "calibration": {
             "dataset": args.calib_dataset,
             "nsamples": args.nsamples,
