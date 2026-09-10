@@ -133,7 +133,9 @@ def get_stats(model, enc, args):
                 quantizers[e][b] = {}
                 for l, lname in enumerate(sublinear_names):
                     m = named_linears[f"{expert_name}.{lname}"]
-                    quantizers[e][b][l] = MCMoeRTNWeightQuantizer(m.weight.data, nbits=b)
+                    quantizers[e][b][l] = MCMoeRTNWeightQuantizer(
+                        m.weight.data, nbits=b, blocksize=args.blocksize
+                    )
 
         # compute reconstruction loss of block output caused by quantization (i.e., perturbation)
         layer_quant_loss = defaultdict(dict)
@@ -203,6 +205,23 @@ def compute_mcmoe_stats(model, dataloader, args):
         pickle.dump(act_counts, f)
     with open(osp.join(args.mcmoe_stats_dir, "experts_quant_loss.pkl"), "wb") as f:
         pickle.dump(quant_loss, f)
+    metadata = {
+        "format_version": 1,
+        "method": "MC-MoE PMQ statistics",
+        "model": args.model,
+        "model_name": args.model_name,
+        "model_dtype": args.model_dtype,
+        "attention_implementation": args.attn_impl,
+        "calibration_dataset": args.calib_dataset,
+        "nsamples": args.nsamples,
+        "seqlen": args.seqlen,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "candidate_bits": list(map(int, args.wbits.split(","))),
+        "blocksize": args.blocksize,
+    }
+    with open(osp.join(args.mcmoe_stats_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
     print("Model stats saved to:", args.mcmoe_stats_dir)
 
 

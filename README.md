@@ -101,6 +101,36 @@ dataset, bit-width, and cache controls as environment variables near the top of 
 They save dequantized approximate weights as standard BF16 Hugging Face checkpoints under
 `results/fake_quant_models/`, which vLLM can load without a GEMQ runtime patch.
 
+### PMQ baseline for Qwen3-MoE
+
+The Qwen3-30B-A3B-Instruct-2507 workflow also includes an isolated MC-MoE PMQ
+baseline. It uses C4 with seed 0, the released PMQ objective and per-layer ILP,
+and expert bit candidates `{1,2,3}` without pruning. Final quantization uses the
+same GEMQ GPTQ implementation as the GEMQ method: attention projections are 4-bit,
+routers remain BF16, experts average 2 bits, and the dequantized approximate weights
+are saved as a standard BF16 Hugging Face checkpoint.
+
+Place `c4-train.00000-of-01024.json` under `data/`, then run the complete workflow:
+
+```bash
+bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_pipeline.sh
+```
+
+The three stages can also be run separately:
+
+```bash
+bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_compute_stats.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_allocate.sh
+bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_quantize.sh
+```
+
+By default, PMQ statistics are written below `cache/.../PMQ/`, the independent
+allocation and its JSON metadata below `configs/.../PMQ/`, and the loadable model
+below `results/fake_quant_models/.../PMQ/`. `MODEL`, `CUDA_VISIBLE_DEVICES`,
+`PMQ_STATS_DIR`, `PMQ_BIT_CONFIG`, and `PMQ_SAVE_PATH` can override their respective
+locations. This baseline intentionally does not pass `--reproduce_mcmoe`,
+`--finetune_routers`, or `--real_quant`.
+
 ### vLLM serving, benchmarking, and evaluation
 
 Start OLMoE on one GPU:
