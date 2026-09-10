@@ -3,6 +3,7 @@
 from gemq.pruning.qwen3 import (
     PruningResult,
     has_zero_bit_experts,
+    kept_expert_ids_from_pruning_metadata,
     load_expert_bit_config,
     prune_qwen3_experts,
 )
@@ -10,6 +11,7 @@ from gemq.pruning.qwen3 import (
 __all__ = [
     "PruningResult",
     "has_zero_bit_experts",
+    "kept_expert_ids_from_pruning_metadata",
     "load_expert_bit_config",
     "prune_qwen3_experts",
 ]

@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
-from gemq.pruning.qwen3 import prune_qwen3_experts
+from gemq.pruning.qwen3 import (
+    kept_expert_ids_from_pruning_metadata,
+    prune_qwen3_experts,
+)
 from gemq.router_finetune.targets import TeacherTargets, project_teacher_router_logits
 
 
@@ -60,6 +64,10 @@ def test_qwen3_physical_pruning_remaps_experts_and_router_rows():
         model.model.layers[1].mlp.gate.weight, old_weights[1][[1, 2, 3]]
     )
     assert all(len(layer.mlp.experts) == 3 for layer in model.model.layers)
+    assert kept_expert_ids_from_pruning_metadata(result.metadata) == (
+        (0, 2, 3),
+        (1, 2, 3),
+    )
 
 
 def test_teacher_router_logits_are_projected_without_changing_final_targets():
@@ -80,3 +88,14 @@ def test_teacher_router_logits_are_projected_without_changing_final_targets():
     torch.testing.assert_close(projected.router_logits[0], logits[0][..., [0, 2, 3]])
     torch.testing.assert_close(projected.router_logits[1], logits[1][..., [1, 2, 3]])
     assert projected.final_hidden_states is final_hidden
+
+
+def test_kept_expert_ids_reject_incomplete_pruning_metadata():
+    metadata = {
+        "original_num_experts": 4,
+        "num_experts": 3,
+        "layers": {"1": {"kept_old_ids": [0, 2, 3]}},
+    }
+
+    with pytest.raises(ValueError, match="contiguous from zero"):
+        kept_expert_ids_from_pruning_metadata(metadata)

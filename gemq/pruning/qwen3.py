@@ -105,6 +105,72 @@ def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
     return PruningResult(remapped, tuple(kept_by_layer), metadata)
 
 
+def kept_expert_ids_from_pruning_metadata(metadata):
+    """Restore original expert IDs retained by a physically pruned checkpoint."""
+    if not isinstance(metadata, dict):
+        raise ValueError("Pruning metadata must be a dictionary.")
+
+    layers = metadata.get("layers")
+    if not isinstance(layers, dict) or not layers:
+        raise ValueError("Pruning metadata must contain a non-empty 'layers' mapping.")
+
+    indexed_layers = {}
+    for raw_layer_idx, layer_metadata in layers.items():
+        try:
+            layer_idx = int(raw_layer_idx)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Invalid layer ID in pruning metadata: {raw_layer_idx!r}"
+            ) from error
+        if layer_idx in indexed_layers:
+            raise ValueError(f"Duplicate layer ID in pruning metadata: {layer_idx}")
+        indexed_layers[layer_idx] = layer_metadata
+
+    expected_layers = list(range(len(indexed_layers)))
+    if sorted(indexed_layers) != expected_layers:
+        raise ValueError(
+            "Pruning metadata layer IDs must be contiguous from zero: "
+            f"expected {expected_layers}, got {sorted(indexed_layers)}"
+        )
+
+    expected_kept = metadata.get("num_experts")
+    original_num_experts = metadata.get("original_num_experts")
+    kept_by_layer = []
+    for layer_idx in expected_layers:
+        layer_metadata = indexed_layers[layer_idx]
+        if not isinstance(layer_metadata, dict):
+            raise ValueError(
+                f"Pruning metadata for layer {layer_idx} must be a dictionary."
+            )
+        raw_kept_ids = layer_metadata.get("kept_old_ids")
+        if not isinstance(raw_kept_ids, (list, tuple)) or not raw_kept_ids:
+            raise ValueError(
+                f"Pruning metadata for layer {layer_idx} must contain kept_old_ids."
+            )
+        try:
+            kept_ids = tuple(int(expert_id) for expert_id in raw_kept_ids)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Layer {layer_idx} contains an invalid kept expert ID."
+            ) from error
+        if len(set(kept_ids)) != len(kept_ids):
+            raise ValueError(f"Layer {layer_idx} contains duplicate kept expert IDs.")
+        if expected_kept is not None and len(kept_ids) != int(expected_kept):
+            raise ValueError(
+                f"Layer {layer_idx} keeps {len(kept_ids)} experts, but pruning metadata "
+                f"declares {expected_kept}."
+            )
+        if original_num_experts is not None and (
+            min(kept_ids) < 0 or max(kept_ids) >= int(original_num_experts)
+        ):
+            raise ValueError(
+                f"Layer {layer_idx} kept expert IDs are outside the original expert range."
+            )
+        kept_by_layer.append(kept_ids)
+
+    return tuple(kept_by_layer)
+
+
 def _slice_linear_output_rows(linear, kept_ids):
     index = torch.tensor(kept_ids, dtype=torch.long, device=linear.weight.device)
     weight = linear.weight.detach().index_select(0, index).clone()

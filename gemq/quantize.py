@@ -39,6 +39,7 @@ from gemq.router_finetune.targets import (
 )
 from gemq.pruning import (
     has_zero_bit_experts,
+    kept_expert_ids_from_pruning_metadata,
     load_expert_bit_config,
     prune_qwen3_experts,
 )
@@ -723,10 +724,12 @@ if __name__ == "__main__":
         checkpoint_enabled
         and args.finetune_routers
         and args.rft_trainer == "layerwise_teacher"
+        and args.rft_timing != "after_all_quantization"
     ):
         raise ValueError(
-            "Reusable GPTQ checkpoints currently support legacy_ce and distill_ce, "
-            "not layerwise_teacher."
+            "Reusable GPTQ checkpoints support layerwise_teacher only with "
+            "--rft_timing after_all_quantization; interleaved router fine-tuning "
+            "requires quantizing the layers in the same run."
         )
     if args.save_gptq_checkpoint and os.path.exists(args.gptq_checkpoint_path):
         raise FileExistsError(
@@ -803,6 +806,15 @@ if __name__ == "__main__":
         )
         if args.cuda_diagnostics:
             report_cuda_diagnostics("after collecting teacher targets", model=model)
+
+        # A reusable checkpoint already contains the physically pruned student. Its
+        # teacher was collected in the original expert-ID space, so restore the
+        # checkpoint's survivor mapping before layer-wise router fine-tuning.
+        if args.load_gptq_checkpoint and pruning_metadata is not None:
+            teacher_targets = project_teacher_router_logits(
+                teacher_targets,
+                kept_expert_ids_from_pruning_metadata(pruning_metadata),
+            )
 
     quant_modules = {}
     if args.load_gptq_checkpoint:
