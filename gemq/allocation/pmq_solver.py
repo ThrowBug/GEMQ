@@ -171,7 +171,7 @@ class PMQSolver:
             coefficients[layer_id] = layer_coefficients
         return coefficients
 
-    def _build_constraints(self, budget_per_layer):
+    def _build_constraints(self, budget_per_layer, *, require_full_budget):
         experts = self.num_experts
         num_bits = len(self.candidate_bits)
         num_vars = experts * num_bits
@@ -179,9 +179,12 @@ class PMQSolver:
         budget_row = np.tile(
             np.asarray(self.candidate_bits, dtype=np.float64), experts
         )
+        budget_lower_bound = (
+            float(budget_per_layer) if require_full_budget else -np.inf
+        )
         budget = LinearConstraint(
             sp.csr_matrix(budget_row.reshape(1, num_vars)),
-            -np.inf,
+            budget_lower_bound,
             float(budget_per_layer),
         )
         one_bit_per_expert = LinearConstraint(
@@ -224,7 +227,9 @@ class PMQSolver:
             raise RuntimeError(f"HiGHS failed to solve the PMQ ILP: {result.message}")
         return result.x
 
-    def _solve_gurobi(self, objective, budget_per_layer):
+    def _solve_gurobi(
+        self, objective, budget_per_layer, *, require_full_budget
+    ):
         try:
             import gurobipy as gp
             from gurobipy import GRB
@@ -242,7 +247,14 @@ class PMQSolver:
         )
         model.setObjective(objective @ variables, GRB.MINIMIZE)
         bit_values = np.tile(np.asarray(self.candidate_bits), experts)
-        model.addConstr(bit_values @ variables <= budget_per_layer, name="budget")
+        if require_full_budget:
+            model.addConstr(
+                bit_values @ variables == budget_per_layer, name="budget"
+            )
+        else:
+            model.addConstr(
+                bit_values @ variables <= budget_per_layer, name="budget"
+            )
         for expert_id in range(experts):
             start = expert_id * num_bits
             model.addConstr(
@@ -290,7 +302,9 @@ class PMQSolver:
                 f"expected [{min_feasible}, {max_feasible}]."
             )
 
-        constraints = self._build_constraints(budget_per_layer)
+        constraints = self._build_constraints(
+            budget_per_layer, require_full_budget=require_full_budget
+        )
         allocation = {}
         objectives = {}
         used_bits = {}
@@ -300,7 +314,11 @@ class PMQSolver:
             if self.backend == "highs":
                 solution = self._solve_highs(objective, constraints)
             else:
-                solution = self._solve_gurobi(objective, budget_per_layer)
+                solution = self._solve_gurobi(
+                    objective,
+                    budget_per_layer,
+                    require_full_budget=require_full_budget,
+                )
 
             selected = np.asarray(solution).reshape(self.num_experts, num_bits)
             selected = np.rint(selected)
@@ -321,9 +339,8 @@ class PMQSolver:
                 )
             if require_full_budget and layer_used_bits != budget_per_layer:
                 raise RuntimeError(
-                    f"Layer {layer_id} used {layer_used_bits}/{budget_per_layer} bits. "
-                    "The source ILP uses a <= constraint, but this run requested an "
-                    "exact average-bit checkpoint."
+                    f"Layer {layer_id} violates its exact PMQ budget: "
+                    f"{layer_used_bits} != {budget_per_layer}."
                 )
             if 2 not in layer_allocation.values() or 3 not in layer_allocation.values():
                 raise RuntimeError(

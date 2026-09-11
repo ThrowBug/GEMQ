@@ -58,6 +58,22 @@ def test_pmq_solves_each_layer_at_exact_two_bpe_without_pruning():
     assert solver.used_bits_per_layer == {0: 8, 1: 8}
 
 
+def test_pmq_exact_budget_is_enforced_inside_the_ilp():
+    counts, weights, quant_loss = _toy_stats(num_layers=1)
+    for expert_loss in quant_loss[0].values():
+        expert_loss.update({1: 1.0, 2: 10.0, 3: 100.0})
+
+    exact_solver = PMQSolver(counts, weights, quant_loss, backend="highs")
+    exact_allocation = exact_solver.solve(bits_per_expert=2.0)
+    assert sum(exact_allocation[0].values()) == 8
+
+    source_solver = PMQSolver(counts, weights, quant_loss, backend="highs")
+    source_allocation = source_solver.solve(
+        bits_per_expert=2.0, require_full_budget=False
+    )
+    assert sum(source_allocation[0].values()) == 7
+
+
 def test_pmq_rejects_non_source_candidate_bits():
     counts, weights, quant_loss = _toy_stats(num_layers=1)
 
@@ -71,4 +87,3 @@ def test_pmq_rejects_mismatched_statistics():
 
     with pytest.raises(ValueError, match="same layer IDs"):
         PMQSolver(counts, weights, quant_loss)
-

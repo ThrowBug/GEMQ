@@ -158,7 +158,9 @@ def run(args):
         "beta": args.beta,
         "gama": args.gama,
         "gama_is_unused_for_source_compatibility": True,
-        "per_layer_budget_constraint": "<=",
+        "per_layer_budget_constraint": (
+            "<=" if args.allow_under_budget else "=="
+        ),
         "requires_at_least_one_2bit_and_3bit_expert_per_layer": True,
         "require_full_budget": not args.allow_under_budget,
         "ilp_backend": args.ilp_backend,
