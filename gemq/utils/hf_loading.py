@@ -18,6 +18,28 @@ import torch
 import transformers
 
 
+def load_causal_lm_checkpoint(
+    model_path,
+    model_dtype="bfloat16",
+    attn_implementation="eager",
+    trust_remote_code=False,
+    device_map="cpu",
+):
+    """Load a standard Hugging Face causal-LM checkpoint for GEMQ workflows."""
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device_map,
+        torch_dtype=model_dtype,
+        attn_implementation=attn_implementation,
+        trust_remote_code=trust_remote_code,
+    )
+    # This is a no-op for Qwen and for implementations that already apply the
+    # correction, while keeping standalone evaluation aligned with quantize.py.
+    align_deepseek_softmax_scale(model)
+    model.eval()
+    return model
+
+
 def _as_module_dir(path):
     """hqq passes `<checkpoint>/config.json`; resolving an auto_map needs the directory."""
     if not isinstance(path, (str, os.PathLike)):

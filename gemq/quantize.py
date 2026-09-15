@@ -9,7 +9,7 @@ from functools import partial
 from tqdm import tqdm
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, logging
+from transformers import AutoTokenizer, logging
 from hqq.models.hf.base import AutoHQQHFModel
 
 from gemq.quantizers.gptq import MCMoeGPTQWeightQuantizer, GPTQWeightQuantizer
@@ -23,7 +23,7 @@ from gemq.utils.gptq_checkpoint import (
 from gemq.utils.model_utils import *
 from gemq.utils.quant_utils import *
 from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
-from gemq.utils.hf_loading import align_deepseek_softmax_scale
+from gemq.utils.hf_loading import load_causal_lm_checkpoint
 from gemq.router_finetune.config import (
     DistillCEConfig,
     RFT_TIMINGS,
@@ -53,18 +53,14 @@ logging.set_verbosity_error()
 
 def load_causal_lm(model_path, args, description="model"):
     print(f"Loading {description} ...")
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_causal_lm_checkpoint(
         model_path,
-        device_map="cpu",
-        torch_dtype=args.model_dtype,
+        model_dtype=args.model_dtype,
         attn_implementation=args.attn_impl,
         trust_remote_code=args.trust_remote_code,
+        device_map="cpu",
     )
-    # HF's built-in DeepSeek-V2 omits the YaRN mscale on the attention scale; no-op on
-    # the official implementation, which already applies it.
-    align_deepseek_softmax_scale(model)
     model.seqlen = args.seqlen
-    model.eval()
     if args.cuda_diagnostics:
         report_cuda_diagnostics(f"{description} loaded", model=model)
     return model
