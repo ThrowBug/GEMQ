@@ -94,6 +94,25 @@ def compute_router_loss(loss_type, student_logits, teacher_logits, top_m, token_
     raise ValueError(f"Unsupported router loss: {loss_type}")
 
 
+def compute_sparse_router_kl(student_logits, target_indices, target_weights, token_mask=None):
+    """KL from a normalized sparse teacher distribution to full student softmax."""
+    if student_logits.shape[:-1] != target_indices.shape[:-1]:
+        raise ValueError("Sparse router targets do not match student token dimensions.")
+    if target_indices.shape != target_weights.shape:
+        raise ValueError("Sparse router target indices and weights must have equal shapes.")
+    if (target_weights < 0).any():
+        raise ValueError("Sparse router weights must be non-negative.")
+    student = student_logits.float()
+    indices = target_indices.to(device=student.device, dtype=torch.long)
+    weights = target_weights.to(device=student.device, dtype=torch.float32)
+    if not torch.allclose(weights.sum(dim=-1), torch.ones_like(weights[..., 0]), atol=1e-4):
+        raise ValueError("Sparse router weights must sum to one per token.")
+    selected_log_probs = F.log_softmax(student, dim=-1).gather(-1, indices)
+    log_weights = weights.clamp_min(torch.finfo(weights.dtype).tiny).log()
+    per_token = (weights * (log_weights - selected_log_probs)).sum(dim=-1)
+    return _masked_mean(per_token.reshape(-1), token_mask)
+
+
 def compute_output_kl(student_logits, teacher_logits, token_mask=None):
     if student_logits.shape != teacher_logits.shape:
         raise ValueError(

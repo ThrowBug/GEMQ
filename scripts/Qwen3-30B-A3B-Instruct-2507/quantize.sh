@@ -84,8 +84,11 @@ dense_wbits="${DENSE_WBITS:-4}"
 #  Router fine-tuning
 # ===============================
 finetune_routers="${FINETUNE_ROUTERS:-true}"
-rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | layerwise_teacher
+rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | layerwise_teacher | pruned_expert_reroute | pruned_expert_reroute_then_distill
 rft_timing="${RFT_TIMING:-after_each_layer_quantization}" # after_all_quantization | after_each_layer_quantization
+if [[ -z "${RFT_TIMING:-}" && "${rft_trainer}" == pruned_expert_reroute* ]]; then
+    rft_timing="after_all_quantization"
+fi
 rft_router_loss="${RFT_ROUTER_LOSS:-kd_tail}" # kd | kd_tail | l2 | l2_center
 rft_router_alpha="${RFT_ROUTER_ALPHA:-1.0}"
 rft_router_loss_weight="${RFT_ROUTER_LOSS_WEIGHT:-1.0}"
@@ -96,6 +99,8 @@ rft_lr="${RFT_LR:-1e-4}"
 rft_wd="${RFT_WD:-0.0}"
 rft_teacher_cache_dir="${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}"
 rft_rebuild_teacher_cache="${RFT_REBUILD_TEACHER_CACHE:-false}"
+rft_screen_tokens_per_expert="${RFT_SCREEN_TOKENS_PER_EXPERT:-64}"
+rft_cost_tokens_per_expert="${RFT_COST_TOKENS_PER_EXPERT:-256}"
 
 # ===============================
 #  Evaluation settings
@@ -201,6 +206,23 @@ if [[ "${finetune_routers}" == "true" ]]; then
                 --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
             )
             ;;
+        pruned_expert_reroute|pruned_expert_reroute_then_distill)
+            if [[ "${rft_timing}" != "after_all_quantization" ]]; then
+                echo "${rft_trainer} requires RFT_TIMING=after_all_quantization." >&2
+                exit 1
+            fi
+            if [[ "${mixed_prec}" != "true" ]]; then
+                echo "${rft_trainer} requires MIXED_PREC=true and a 0-bit allocation." >&2
+                exit 1
+            fi
+            rft_tag="_RFT-${rft_trainer}"
+            quant_args+=(
+                --rft_timing "${rft_timing}"
+                --rft_screen_tokens_per_expert "${rft_screen_tokens_per_expert}"
+                --rft_cost_tokens_per_expert "${rft_cost_tokens_per_expert}"
+                --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
+            )
+            ;;
         *)
             echo "Unsupported rft_trainer: ${rft_trainer}" >&2
             exit 1
@@ -277,6 +299,10 @@ if [[ "${rft_trainer}" == "legacy_ce" ]]; then
     echo " Router objective: hard-label autoregressive CE"
 elif [[ "${rft_trainer}" == "distill_ce" ]]; then
     echo " Router objective: teacher soft-label autoregressive CE"
+elif [[ "${rft_trainer}" == "pruned_expert_reroute" || "${rft_trainer}" == "pruned_expert_reroute_then_distill" ]]; then
+    echo " RFT timing:       ${rft_timing}"
+    echo " Router objective: pruned-expert rerouting${rft_trainer#pruned_expert_reroute}"
+    echo " Reroute samples:  screen=${rft_screen_tokens_per_expert}, cost=${rft_cost_tokens_per_expert} per pruned expert"
 else
     echo " RFT timing:       ${rft_timing}"
     echo " Router objective: ${rft_router_loss} (alpha=${rft_router_alpha}, weight=${rft_router_loss_weight})"

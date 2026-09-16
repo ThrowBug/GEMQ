@@ -32,6 +32,8 @@ if [[ "${finetune_routers}" == "true" ]]; then
     case "${rft_trainer}" in
         legacy_ce) rft_tag="_RFT-legacy_ce" ;;
         distill_ce) rft_tag="_RFT-distill_ce" ;;
+        pruned_expert_reroute|pruned_expert_reroute_then_distill)
+            rft_tag="_RFT-${rft_trainer}" ;;
         layerwise_teacher)
             rft_timing="${RFT_TIMING:-after_each_layer_quantization}"
             timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"

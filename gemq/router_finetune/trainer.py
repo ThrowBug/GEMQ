@@ -3,12 +3,21 @@ import time
 
 import torch
 
-from gemq.router_finetune.losses import compute_causal_output_kl, compute_router_loss
+from gemq.router_finetune.losses import (
+    compute_causal_output_kl,
+    compute_router_loss,
+    compute_sparse_router_kl,
+)
+from gemq.router_finetune.pruned_expert_reroute import (
+    build_sparse_targets,
+    compute_layer_transfer,
+)
 from gemq.utils.model_utils import (
     compute_decoder_inputs,
     extract_router_logits,
     get_blocks,
     get_model_info,
+    get_moe_block,
     get_router_module,
     get_router_modules,
 )
@@ -294,3 +303,126 @@ def finetune_routers_after_all_quantization(model, dataloader, teacher_targets, 
         _finetune_after_all_router_only(model, dataloader, teacher_targets, args, config)
     else:
         _finetune_after_all_with_output(model, teacher_targets, args, config)
+
+
+def _train_router_from_sparse_targets(
+    router, router_inputs, target_indices, target_weights, token_mask, config, layer_idx
+):
+    parameters = list(router.parameters())
+    if not parameters:
+        raise ValueError(f"Layer {layer_idx} router has no parameters.")
+    _set_requires_grad(parameters, True)
+    optimizer = torch.optim.AdamW(
+        parameters, lr=config.learning_rate, weight_decay=config.weight_decay
+    )
+    try:
+        with torch.enable_grad():
+            for epoch in range(config.epochs):
+                started = time.time()
+                loss_sum = 0.0
+                steps = 0
+                for start in range(0, router_inputs.shape[0], config.batch_size):
+                    end = min(start + config.batch_size, router_inputs.shape[0])
+                    inputs = router_inputs[start:end].detach()
+                    logits = extract_router_logits(router(inputs))
+                    logits = logits.reshape(*target_indices[start:end].shape[:-1], -1)
+                    loss = compute_sparse_router_kl(
+                        logits,
+                        target_indices[start:end],
+                        target_weights[start:end],
+                        token_mask[start:end] if token_mask is not None else None,
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+                    loss_sum += loss.detach().item()
+                    steps += 1
+                print(
+                    f"[reroute layer {layer_idx:>2} | epoch {epoch:>2}] "
+                    f"loss={loss_sum / max(steps, 1):.6f}, "
+                    f"elapsed={time.time() - started:.2f}s"
+                )
+    finally:
+        optimizer.zero_grad(set_to_none=True)
+        _set_requires_grad(parameters, False)
+
+
+def finetune_routers_pruned_expert_reroute(
+    model, dataloader, teacher_store, kept_expert_ids, args, config
+):
+    """Replay quantized survivors and train routers on actual student hidden states."""
+    original_training = model.training
+    original_use_cache = model.config.use_cache
+    original_requires_grad = [parameter.requires_grad for parameter in model.parameters()]
+    model.eval()
+    model.config.use_cache = False
+    _set_requires_grad(model.parameters(), False)
+    report = {"trainer": args.rft_trainer, "layers": []}
+    started = time.time()
+    try:
+        with torch.no_grad():
+            inps, layer_kwargs = compute_decoder_inputs(model, dataloader, args.model_name, "cuda")
+        layers = get_blocks(model, args.model_name)
+        if len(layers) != teacher_store.num_layers or len(kept_expert_ids) != len(layers):
+            raise ValueError("Student, teacher cache, and pruning map have different layer counts.")
+        outs = torch.empty_like(inps)
+        for layer_idx, layer in enumerate(layers):
+            layer = layer.to("cuda")
+            layers[layer_idx] = layer
+            moe = get_moe_block(layer, args.model_name)
+            layer_data = teacher_store.load_layer(layer_idx)
+            transfer, layer_report = compute_layer_transfer(
+                moe, layer_data, kept_expert_ids[layer_idx], layer_idx
+            )
+            target_indices, target_weights = build_sparse_targets(
+                layer_data["route_indices"], layer_data["route_weights"],
+                transfer, int(moe.top_k),
+            )
+            if target_indices.shape[:2] != inps.shape[:2]:
+                raise ValueError(f"Layer {layer_idx} teacher routes and student tokens differ.")
+
+            _, router = get_router_module(layer, args.model_name)
+            current_sample = {"index": None, "calls": 0}
+
+            def capture_router_input(_module, inputs):
+                sample_idx = current_sample["index"]
+                if sample_idx is None:
+                    raise RuntimeError("Router hook fired outside calibration forward.")
+                outs[sample_idx].copy_(inputs[0].detach().reshape_as(outs[sample_idx]))
+                current_sample["calls"] += 1
+
+            handle = router.register_forward_pre_hook(capture_router_input)
+            try:
+                with torch.no_grad():
+                    for sample_idx in range(inps.shape[0]):
+                        current_sample["index"] = sample_idx
+                        layer(inps[sample_idx:sample_idx + 1], **layer_kwargs)
+            finally:
+                current_sample["index"] = None
+                handle.remove()
+            if current_sample["calls"] != inps.shape[0]:
+                raise RuntimeError(f"Layer {layer_idx} router input capture is incomplete.")
+
+            train_started = time.time()
+            _train_router_from_sparse_targets(
+                router, outs, target_indices, target_weights,
+                teacher_store.attention_mask, config, layer_idx,
+            )
+            layer_report["router_train_seconds"] = time.time() - train_started
+            with torch.no_grad():
+                for sample_idx in range(inps.shape[0]):
+                    output = layer(inps[sample_idx:sample_idx + 1], **layer_kwargs)
+                    outs[sample_idx] = _extract_layer_hidden(output)
+            inps, outs = outs, inps
+            layers[layer_idx] = layer.to("cpu")
+            report["layers"].append(layer_report)
+            del layer_data, transfer, target_indices, target_weights
+            gc.collect()
+            torch.cuda.empty_cache()
+        report["elapsed_seconds"] = time.time() - started
+        return report
+    finally:
+        for parameter, original in zip(model.parameters(), original_requires_grad):
+            parameter.requires_grad = original
+        model.config.use_cache = original_use_cache
+        model.train(original_training)

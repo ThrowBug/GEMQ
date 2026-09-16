@@ -26,12 +26,14 @@ from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
 from gemq.utils.hf_loading import load_causal_lm_checkpoint
 from gemq.router_finetune.config import (
     DistillCEConfig,
+    PrunedExpertRerouteConfig,
     RFT_TIMINGS,
     RFT_TRAINERS,
     ROUTER_LOSS_TYPES,
     RouterFinetuneConfig,
 )
 from gemq.router_finetune.losses import compute_causal_output_distill_ce
+from gemq.router_finetune.pruned_expert_reroute import get_or_collect_reroute_teacher
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
@@ -46,6 +48,7 @@ from gemq.pruning import (
 from gemq.router_finetune.trainer import (
     finetune_router_after_layer_quantization,
     finetune_routers_after_all_quantization,
+    finetune_routers_pruned_expert_reroute,
 )
 
 logging.set_verbosity_error()
@@ -222,7 +225,7 @@ def finetune_routers_distill_ce(model, teacher_targets, args):
             del outputs, teacher_hidden, teacher_output_logits, loss
         elapsed = time.time() - start_time
         print(
-            f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, "
+            f"epoch {epoch:>2} loss: {loss_sum / max(args.nsamples // args.rft_batch_size, 1):.6f}, "
             f"elapse: {elapsed:.2f} seconds"
         )
 
@@ -618,6 +621,14 @@ def parse_args():
         "--rft_rebuild_teacher_cache", action="store_true",
         help="Recompute teacher targets even when a matching cache exists"
     )
+    parser.add_argument(
+        "--rft_screen_tokens_per_expert", type=int, default=64,
+        help="Teacher tokens per pruned expert for screening surviving replacement experts"
+    )
+    parser.add_argument(
+        "--rft_cost_tokens_per_expert", type=int, default=256,
+        help="Disjoint teacher tokens per pruned expert for final replacement costs"
+    )
 
     # evaluation args
     parser.add_argument(
@@ -733,11 +744,30 @@ if __name__ == "__main__":
             f"{args.gptq_checkpoint_path}"
         )
 
+    reroute_trainers = {
+        "pruned_expert_reroute", "pruned_expert_reroute_then_distill"
+    }
+    reroute_mode = args.finetune_routers and args.rft_trainer in reroute_trainers
+    if reroute_mode:
+        if NAME_TO_MODEL.get(args.model_name) != ModelType.QWEN3MOE:
+            raise ValueError("Pruned-expert rerouting currently supports Qwen3 MoE only.")
+        if not args.mixed or not args.bit_cfg:
+            raise ValueError("Pruned-expert rerouting requires --mixed and --bit_cfg.")
+        if args.quantizer.lower().split("-")[0] != "gptq":
+            raise ValueError("Pruned-expert rerouting currently requires GPTQ.")
+        if args.eval_fp or args.real_quant:
+            raise ValueError("Pruned-expert rerouting requires fake-quantized student weights.")
+        if args.save_path and os.path.exists(args.save_path):
+            raise FileExistsError(
+                "Rerouted model output already exists and will not be overwritten: "
+                f"{args.save_path}"
+            )
+
     # The tokenizer and calibration inputs always retain the original model identity,
     # even when the student weights are loaded from a post-GPTQ checkpoint.
     needs_teacher_targets = (
         args.finetune_routers
-        and args.rft_trainer in {"distill_ce", "layerwise_teacher"}
+        and args.rft_trainer in ({"distill_ce", "layerwise_teacher"} | reroute_trainers)
     )
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, use_fast=args.use_fast, trust_remote_code=args.trust_remote_code
@@ -760,14 +790,19 @@ if __name__ == "__main__":
     pruning_metadata = None
     if args.mixed:
         expert_bit_cfg = load_expert_bit_config(args.bit_cfg)
+    if reroute_mode and not has_zero_bit_experts(expert_bit_cfg):
+        raise ValueError("Pruned-expert rerouting requires at least one 0-bit expert.")
 
     router_ft_config = None
     teacher_targets = None
+    reroute_store = None
     if needs_teacher_targets:
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
         if args.rft_trainer == "distill_ce":
             router_ft_config = DistillCEConfig.from_args(args)
+        elif reroute_mode:
+            router_ft_config = PrunedExpertRerouteConfig.from_args(args)
         else:
             router_ft_config = RouterFinetuneConfig.from_args(args)
 
@@ -787,26 +822,29 @@ if __name__ == "__main__":
             args.gptq_checkpoint_path, checkpoint_identity
         )
         pruning_metadata = loaded_checkpoint_metadata.get("pruning")
+        if reroute_mode and pruning_metadata is None:
+            raise ValueError("Rerouting requires pruning metadata in the GPTQ checkpoint.")
 
     if needs_teacher_targets:
         if args.cuda_diagnostics:
             report_cuda_diagnostics("before collecting teacher targets", model=model)
-        teacher_targets = get_or_collect_teacher_targets(
-            model,
-            tokenizer,
-            dataloader,
-            calibration_input_ids,
-            calibration_attention_mask,
-            args,
-            router_ft_config,
-        )
+        if reroute_mode:
+            reroute_store = get_or_collect_reroute_teacher(
+                model, tokenizer, dataloader, calibration_input_ids,
+                calibration_attention_mask, expert_bit_cfg, args, router_ft_config,
+            )
+        else:
+            teacher_targets = get_or_collect_teacher_targets(
+                model, tokenizer, dataloader, calibration_input_ids,
+                calibration_attention_mask, args, router_ft_config,
+            )
         if args.cuda_diagnostics:
             report_cuda_diagnostics("after collecting teacher targets", model=model)
 
         # A reusable checkpoint already contains the physically pruned student. Its
         # teacher was collected in the original expert-ID space, so restore the
         # checkpoint's survivor mapping before layer-wise router fine-tuning.
-        if args.load_gptq_checkpoint and pruning_metadata is not None:
+        if not reroute_mode and args.load_gptq_checkpoint and pruning_metadata is not None:
             teacher_targets = project_teacher_router_logits(
                 teacher_targets,
                 kept_expert_ids_from_pruning_metadata(pruning_metadata),
@@ -832,9 +870,10 @@ if __name__ == "__main__":
             expert_bit_cfg = pruning_result.remapped_bit_config
             pruning_metadata = dict(pruning_result.metadata)
             pruning_metadata["source_bit_config"] = args.bit_cfg
-            teacher_targets = project_teacher_router_logits(
-                teacher_targets, pruning_result.kept_expert_ids
-            )
+            if not reroute_mode:
+                teacher_targets = project_teacher_router_logits(
+                    teacher_targets, pruning_result.kept_expert_ids
+                )
 
     # quantize model weights unless a validated post-GPTQ student was loaded
     if not args.eval_fp and not args.load_gptq_checkpoint:
@@ -867,6 +906,7 @@ if __name__ == "__main__":
                 checkpoint_metadata,
             )
     
+    reroute_report = None
     # finetune routers
     if args.finetune_routers:
         if args.rft_trainer == "legacy_ce":
@@ -899,6 +939,25 @@ if __name__ == "__main__":
                     "before distilled-CE router fine-tuning", model=model
                 )
             finetune_routers_distill_ce(model, teacher_targets, args)
+        elif reroute_mode:
+            print("Evaluating quantized model before pruned-expert rerouting ...")
+            evaluate_perplexity(
+                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=True
+            )
+            kept_expert_ids = kept_expert_ids_from_pruning_metadata(pruning_metadata)
+            print("Screening replacements and fine-tuning routers layer by layer ...")
+            reroute_report = finetune_routers_pruned_expert_reroute(
+                model, dataloader, reroute_store, kept_expert_ids, args,
+                router_ft_config,
+            )
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
+            if router_ft_config.then_distill:
+                print("Fine-tuning routers with distilled autoregressive CE ...")
+                distill_started = time.time()
+                finetune_routers_distill_ce(
+                    model, reroute_store.as_distill_targets(), args
+                )
+                reroute_report["distill_seconds"] = time.time() - distill_started
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
             evaluate_perplexity(
@@ -961,6 +1020,12 @@ if __name__ == "__main__":
                 os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"
             ) as f:
                 json.dump({"trainer": args.rft_trainer, **vars(router_ft_config)}, f, indent=4)
+        if reroute_report is not None:
+            with open(
+                os.path.join(args.save_path, "pruned_expert_reroute_report.json"),
+                "w", encoding="utf-8",
+            ) as f:
+                json.dump(reroute_report, f, indent=4, ensure_ascii=False)
 
         if args.real_quant:
             # for real quant, replace nn.Linear to HQQLinear for weight packing and saving

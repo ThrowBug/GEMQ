@@ -3,7 +3,51 @@ from dataclasses import dataclass
 
 ROUTER_LOSS_TYPES = ("kd", "kd_tail", "l2", "l2_center")
 RFT_TIMINGS = ("after_all_quantization", "after_each_layer_quantization")
-RFT_TRAINERS = ("legacy_ce", "distill_ce", "layerwise_teacher")
+RFT_TRAINERS = (
+    "legacy_ce", "distill_ce", "layerwise_teacher",
+    "pruned_expert_reroute", "pruned_expert_reroute_then_distill",
+)
+
+
+@dataclass(frozen=True)
+class PrunedExpertRerouteConfig:
+    timing: str
+    screen_tokens_per_expert: int
+    cost_tokens_per_expert: int
+    epochs: int
+    batch_size: int
+    learning_rate: float
+    weight_decay: float
+    teacher_cache_dir: str
+    rebuild_teacher_cache: bool
+    then_distill: bool
+
+    @classmethod
+    def from_args(cls, args):
+        config = cls(
+            timing=args.rft_timing,
+            screen_tokens_per_expert=args.rft_screen_tokens_per_expert,
+            cost_tokens_per_expert=args.rft_cost_tokens_per_expert,
+            epochs=args.rft_epochs,
+            batch_size=args.rft_batch_size,
+            learning_rate=args.rft_lr,
+            weight_decay=args.rft_wd,
+            teacher_cache_dir=args.rft_teacher_cache_dir,
+            rebuild_teacher_cache=args.rft_rebuild_teacher_cache,
+            then_distill=args.rft_trainer == "pruned_expert_reroute_then_distill",
+        )
+        config.validate()
+        return config
+
+    def validate(self):
+        if self.timing != "after_all_quantization":
+            raise ValueError("Pruned-expert rerouting requires --rft_timing after_all_quantization.")
+        if self.screen_tokens_per_expert <= 0 or self.cost_tokens_per_expert <= 0:
+            raise ValueError("Rerouting screen and cost tokens per expert must be positive.")
+        if self.epochs <= 0 or self.batch_size <= 0 or self.learning_rate <= 0:
+            raise ValueError("Rerouting epochs, batch size, and learning rate must be positive.")
+        if self.weight_decay < 0:
+            raise ValueError("Rerouting weight decay must be non-negative.")
 
 
 @dataclass(frozen=True)

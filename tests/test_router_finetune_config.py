@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from gemq.router_finetune.config import DistillCEConfig, RFT_TRAINERS, RouterFinetuneConfig
+from gemq.router_finetune.config import (
+    DistillCEConfig,
+    PrunedExpertRerouteConfig,
+    RFT_TRAINERS,
+    RouterFinetuneConfig,
+)
 
 
 def _args(**overrides):
@@ -18,6 +23,9 @@ def _args(**overrides):
         "rft_wd": 1e-4,
         "rft_teacher_cache_dir": "cache/router_finetune",
         "rft_rebuild_teacher_cache": False,
+        "rft_screen_tokens_per_expert": 64,
+        "rft_cost_tokens_per_expert": 256,
+        "rft_trainer": "pruned_expert_reroute",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -79,3 +87,29 @@ def test_distill_ce_does_not_validate_layerwise_loss_arguments():
         )
     )
     assert config.needs_output_targets
+
+
+def test_pruned_expert_reroute_config_and_combined_mode():
+    assert "pruned_expert_reroute" in RFT_TRAINERS
+    assert "pruned_expert_reroute_then_distill" in RFT_TRAINERS
+    config = PrunedExpertRerouteConfig.from_args(_args())
+    assert config.screen_tokens_per_expert == 64
+    assert config.cost_tokens_per_expert == 256
+    assert not config.then_distill
+    combined = PrunedExpertRerouteConfig.from_args(
+        _args(rft_trainer="pruned_expert_reroute_then_distill")
+    )
+    assert combined.then_distill
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rft_timing": "after_each_layer_quantization"},
+        {"rft_screen_tokens_per_expert": 0},
+        {"rft_cost_tokens_per_expert": 0},
+    ],
+)
+def test_pruned_expert_reroute_rejects_invalid_settings(overrides):
+    with pytest.raises(ValueError):
+        PrunedExpertRerouteConfig.from_args(_args(**overrides))

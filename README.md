@@ -101,6 +101,18 @@ dataset, bit-width, and cache controls as environment variables near the top of 
 They save dequantized approximate weights as standard BF16 Hugging Face checkpoints under
 `results/fake_quant_models/`, which vLLM can load without a GEMQ runtime patch.
 
+For pruning-aware router adaptation on a Qwen3 zero-bit allocation, run the same
+`quantize.sh` with `RFT_TRAINER=pruned_expert_reroute` (or
+`pruned_expert_reroute_then_distill` for a subsequent teacher-logit CE stage).
+The new trainer requires mixed precision and runs after all GPTQ quantization.
+Up to `RFT_SCREEN_TOKENS_PER_EXPERT` tokens (default 64) screen all surviving experts;
+up to `RFT_COST_TOKENS_PER_EXPERT` disjoint tokens (default 256) estimate costs for the
+shortlist. It caches full-precision teacher routes and pruned-expert samples separately
+from legacy router targets. To reuse a validated post-GPTQ checkpoint, set
+`LOAD_GPTQ_CHECKPOINT=true` with the same allocation and calibration settings. The
+new trainer writes to a distinct `_RFT-pruned_expert_reroute*` output directory and
+refuses to overwrite an existing result.
+
 ### PMQ baseline for Qwen3-MoE
 
 The Qwen3-30B-A3B-Instruct-2507 workflow also includes an isolated MC-MoE PMQ
