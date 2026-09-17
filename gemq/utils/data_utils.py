@@ -84,7 +84,7 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, model="", use_fast=Fals
         return get_c4_new(nsamples, seed, seqlen, model, use_fast)
 
 
-def build_calib_loader(dataset: str, tokenizer, max_block_size: int, n_blocks_for_stat: int, batch_size: int, num_workers: int, seed: int = 41):
+def build_calib_loader(dataset: str, tokenizer, max_block_size: int, n_blocks_for_stat: int, batch_size: int, num_workers: int, seed: int = 41, document_offset: int = 0):
     DATASETS = {
         "c4": lambda: load_dataset("json", data_files={"train": "data/c4-train.00000-of-01024.json"}),
         "math": lambda: load_dataset("json", data_files={"train": "data/math_pretrain_style.json"}),
@@ -101,10 +101,17 @@ def build_calib_loader(dataset: str, tokenizer, max_block_size: int, n_blocks_fo
         )
         block_size = max_block_size
 
+    if document_offset < 0:
+        raise ValueError("document_offset must be non-negative.")
     if n_blocks_for_stat > 0:
+        end = document_offset + n_blocks_for_stat * 16
+        if document_offset and end > len(all_set["train"]):
+            raise ValueError("Not enough disjoint documents for the requested holdout.")
         calib_set = all_set["train"].shuffle(seed=seed).select(
-            range(min(n_blocks_for_stat * 16, len(all_set["train"]))))
+            range(document_offset, min(end, len(all_set["train"]))))
     else:
+        if document_offset:
+            raise ValueError("document_offset requires a positive n_blocks_for_stat.")
         print("n_blocks_for_stat <= 0, using the whole dataset.")
         calib_set = all_set["train"].shuffle(seed=seed)
 

@@ -113,7 +113,7 @@ cuda_diagnostics="${CUDA_DIAGNOSTICS:-false}"
 # ===============================
 # Save dequantized approximate weights (W_hat) as a standard BF16 checkpoint for vLLM.
 real_quant=false
-save_model=true
+save_model="${SAVE_MODEL:-true}"
 save_dtype="bfloat16"
 save_gptq_checkpoint="${SAVE_GPTQ_CHECKPOINT:-false}"
 load_gptq_checkpoint="${LOAD_GPTQ_CHECKPOINT:-false}"
