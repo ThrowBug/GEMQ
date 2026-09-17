@@ -114,6 +114,8 @@ def validate_checkpoint(args, input_ids, attention_mask):
 
 
 def validate_pruning_shapes(teacher, student, model_name, pruning, max_prune_ratio):
+    if not 0.0 <= max_prune_ratio <= 1.0:
+        raise ValueError("--max_prune_ratio must be in [0, 1]")
     teacher_layers = get_blocks(teacher, model_name)
     student_layers = get_blocks(student, model_name)
     if len(teacher_layers) != len(student_layers):
@@ -131,8 +133,6 @@ def validate_pruning_shapes(teacher, student, model_name, pruning, max_prune_rat
     kept = kept_expert_ids_from_pruning_metadata(pruning)
     if len(kept) != len(student_layers):
         raise ValueError("Pruning map layer count differs from the student")
-    if not 0.0 <= max_prune_ratio < 1.0:
-        raise ValueError("--max_prune_ratio must be in [0, 1)")
     original_count = pruning["original_num_experts"]
     pruned_count = pruning["pruned_experts_per_layer"]
     if pruned_count / original_count > max_prune_ratio + 1e-12:

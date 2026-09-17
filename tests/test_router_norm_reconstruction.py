@@ -138,3 +138,26 @@ def test_output_is_new_and_keeps_pruning_metadata(tmp_path):
     assert output.joinpath("expert_pruning_map.json").is_file()
     with pytest.raises(FileExistsError):
         save_without_overwriting(FakeArtifact(), FakeArtifact(), output, metadata, config, {})
+
+
+def test_max_prune_ratio_one_disables_extra_ratio_cap(monkeypatch):
+    import gemq.finetune_router_norm as runner
+
+    monkeypatch.setattr(runner, "get_blocks", lambda model, _name: model.layers)
+    monkeypatch.setattr(runner, "get_moe_block", lambda layer, _name: layer.mlp)
+    monkeypatch.setattr(
+        runner, "get_router_module", lambda layer, _name: ("mlp.gate", layer.mlp.gate)
+    )
+    pruning = {
+        "original_num_experts": 3,
+        "num_experts": 2,
+        "pruned_experts_per_layer": 1,
+        "layers": {"0": {"kept_old_ids": [0, 1]}},
+    }
+    teacher = ToyModel(experts=3)
+    student = ToyModel(experts=2)
+    runner.validate_pruning_shapes(teacher, student, "toy", pruning, 1.0)
+    with pytest.raises(ValueError, match="exceeds"):
+        runner.validate_pruning_shapes(teacher, student, "toy", pruning, 0.1)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        runner.validate_pruning_shapes(teacher, student, "toy", pruning, 1.1)
