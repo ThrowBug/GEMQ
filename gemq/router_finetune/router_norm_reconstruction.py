@@ -102,7 +102,7 @@ def collect_pre_moe_inputs(layer, inputs, layer_kwargs, device):
         pass
 
     def capture(_module, arguments):
-        result[current[0]].copy_(arguments[0].detach().to("cpu"))
+        result[current[0]:current[0] + 1].copy_(arguments[0].detach().to("cpu"))
         raise _CapturedPreMoe
 
     handle = layer.post_attention_layernorm.register_forward_pre_hook(capture)
@@ -125,7 +125,7 @@ def collect_teacher_moe_targets(teacher_layer, pre_moe_inputs, model_name, devic
     for index in range(pre_moe_inputs.shape[0]):
         u = pre_moe_inputs[index:index + 1].to(device)
         output = _hidden(teacher_moe(teacher_layer.post_attention_layernorm(u)))
-        targets[index].copy_(output.to("cpu"))
+        targets[index:index + 1].copy_(output.to("cpu"))
     return targets
 
 
@@ -181,7 +181,7 @@ def propagate_layer(layer, inputs, layer_kwargs, device):
     outputs = torch.empty_like(inputs, device="cpu")
     for index in range(inputs.shape[0]):
         output = _hidden(layer(inputs[index:index + 1].to(device), **layer_kwargs))
-        outputs[index].copy_(output.to("cpu"))
+        outputs[index:index + 1].copy_(output.to("cpu"))
     return outputs
 
 

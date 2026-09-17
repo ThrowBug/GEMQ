@@ -102,6 +102,18 @@ def test_capture_stops_before_expert_execution():
     assert torch.allclose(u, expected)
 
 
+def test_teacher_targets_and_layer_propagation_preserve_batch_axis():
+    layer = ToyLayer()
+    inputs = torch.randn(3, 2, 4)
+    targets = reconstruction.collect_teacher_moe_targets(layer, inputs, "toy", "cpu")
+    expected_targets = layer.mlp(layer.post_attention_layernorm(inputs))[0]
+    assert targets.shape == inputs.shape
+    assert torch.allclose(targets, expected_targets)
+    outputs = reconstruction.propagate_layer(layer, inputs, {}, "cpu")
+    assert outputs.shape == inputs.shape
+    assert torch.allclose(outputs, layer(inputs)[0])
+
+
 @pytest.mark.parametrize("stage", ["norm_only", "norm_then_router", "decoupled_joint"])
 def test_layerwise_trainer_and_rollback(stage):
     torch.manual_seed(17)
