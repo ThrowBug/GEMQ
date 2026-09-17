@@ -21,7 +21,6 @@ from gemq.pruning import kept_expert_ids_from_pruning_metadata
 from gemq.router_finetune.router_norm_reconstruction import (
     ReconstructionConfig,
     finetune_router_norm_reconstruction,
-    restore_router_norm_snapshot,
 )
 from gemq.router_finetune.targets import materialize_calibration_inputs
 from gemq.utils.data_utils import build_calib_loader, get_calib_loader
@@ -258,7 +257,7 @@ def main():
     train_inputs, layer_kwargs = _first_layer_inputs(student, train_loader, args.model_name)
     validation_loader = [(val_ids[index:index + 1], None) for index in range(val_ids.shape[0])]
     validation_inputs, _ = _first_layer_inputs(student, validation_loader, args.model_name)
-    snapshots = finetune_router_norm_reconstruction(
+    finetune_router_norm_reconstruction(
         teacher, student, train_inputs, validation_inputs, layer_kwargs,
         args.model_name, config,
     )
@@ -266,15 +265,11 @@ def main():
     gc.collect()
     print("Measuring reconstructed student on the same holdout ...")
     candidate_ppl = holdout_perplexity(student, args.model_name, val_ids, "holdout C4 candidate")
-    accepted = candidate_ppl < baseline_ppl
-    if not accepted:
-        restore_router_norm_snapshot(student, args.model_name, snapshots)
-        print("Holdout PPL did not improve; restored every original router and norm.")
-    print(f"Holdout C4 PPL: {baseline_ppl:.4f} -> {candidate_ppl:.4f}; accepted={accepted}")
+    print(f"Holdout C4 PPL: {baseline_ppl:.4f} -> {candidate_ppl:.4f} (diagnostic only)")
     student.config.use_cache = original_use_cache
     save_without_overwriting(
         student, tokenizer, args.save_path, metadata, config,
-        {"baseline_ppl": baseline_ppl, "candidate_ppl": candidate_ppl, "accepted": accepted},
+        {"baseline_ppl": baseline_ppl, "candidate_ppl": candidate_ppl},
     )
 
 

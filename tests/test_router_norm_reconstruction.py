@@ -115,7 +115,7 @@ def test_teacher_targets_and_layer_propagation_preserve_batch_axis():
 
 
 @pytest.mark.parametrize("stage", ["norm_only", "norm_then_router", "decoupled_joint"])
-def test_layerwise_trainer_and_rollback(stage):
+def test_layerwise_trainer_keeps_final_stage_even_when_holdout_worsens(stage, monkeypatch):
     torch.manual_seed(17)
     teacher = ToyModel()
     student = ToyModel(experts=2)
@@ -125,14 +125,51 @@ def test_layerwise_trainer_and_rollback(stage):
     original_gate = student.layers[0].mlp.gate.weight.detach().clone()
     original_expert = student.layers[0].mlp.experts[0].weight.detach().clone()
     config = reconstruction.ReconstructionConfig(stage=stage, epochs=1, batch_size=1)
-    snapshots = reconstruction.finetune_router_norm_reconstruction(
+    ran_stages = []
+
+    def fake_train_stage(_layer, parametrization, _inputs, _targets, _name, _config,
+                         stage_name, _layer_idx, _device):
+        ran_stages.append(stage_name)
+        with torch.no_grad():
+            if stage_name == "norm":
+                parametrization.delta.fill_(0.1)
+            elif stage_name == "router":
+                parametrization.v.fill_(0.2)
+            else:
+                parametrization.delta.fill_(0.3)
+                parametrization.v.fill_(0.4)
+
+    monkeypatch.setattr(reconstruction, "_train_stage", fake_train_stage)
+    error_calls = [0]
+
+    def worsening_holdout(*_args):
+        error_calls[0] += 1
+        return float(error_calls[0])
+
+    monkeypatch.setattr(reconstruction, "local_error", worsening_holdout)
+    result = reconstruction.finetune_router_norm_reconstruction(
         teacher, student, train, holdout, {}, "toy", config, device="cpu"
     )
-    assert len(snapshots) == 1
+    assert result is None
+    expected_stages = {
+        "norm_only": ["norm"],
+        "norm_then_router": ["norm", "router"],
+        "decoupled_joint": ["norm", "router", "joint"],
+    }[stage]
+    assert ran_stages == expected_stages
+    delta = 0.3 if stage == "decoupled_joint" else 0.1
+    expected_v = original_gate if stage == "norm_only" else torch.full_like(
+        original_gate, 0.4 if stage == "decoupled_joint" else 0.2
+    )
+    assert torch.allclose(
+        student.layers[0].post_attention_layernorm.weight,
+        original_norm * torch.exp(torch.tensor(delta)),
+    )
+    assert torch.allclose(
+        student.layers[0].mlp.gate.weight,
+        expected_v * torch.exp(torch.tensor(-delta)),
+    )
     assert torch.equal(student.layers[0].mlp.experts[0].weight, original_expert)
-    reconstruction.restore_router_norm_snapshot(student, "toy", snapshots)
-    assert torch.equal(student.layers[0].post_attention_layernorm.weight, original_norm)
-    assert torch.equal(student.layers[0].mlp.gate.weight, original_gate)
 
 
 def test_output_is_new_and_keeps_pruning_metadata(tmp_path):

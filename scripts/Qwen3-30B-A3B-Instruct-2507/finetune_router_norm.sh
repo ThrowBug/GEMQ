@@ -29,7 +29,7 @@ if [[ ! -f "${bit_cfg}" ]]; then
 fi
 
 checkpoint_name="$(basename "${checkpoint}")"
-output="${OUTPUT_PATH:-results/router_norm_models/${model}/${checkpoint_name}_RFT-router_norm_reconstruction-${stage}}"
+output="${OUTPUT_PATH:-results/router_norm_models/${model}/${checkpoint_name}_RFT-router_norm_reconstruction-${stage}-last_stage}"
 if [[ -e "${output}" || -L "${output}" ]]; then
     echo "Output already exists and will not be overwritten: ${output}" >&2
     exit 1

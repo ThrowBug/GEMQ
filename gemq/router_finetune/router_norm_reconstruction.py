@@ -195,7 +195,7 @@ def finetune_router_norm_reconstruction(
     teacher, student, train_inputs, validation_inputs, layer_kwargs, model_name, config,
     device="cuda",
 ):
-    """Tune layer by layer and return small baseline snapshots for global rollback."""
+    """Tune every layer and fold the parameters from its final training stage."""
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Qwen3-30B layerwise trainer")
     teacher_layers = get_blocks(teacher, model_name)
@@ -208,12 +208,7 @@ def finetune_router_norm_reconstruction(
         parameter.requires_grad_(False)
     teacher.eval()
     student.eval()
-    snapshots = []
     for layer_idx, (teacher_layer, student_layer) in enumerate(zip(teacher_layers, student_layers)):
-        norm = student_layer.post_attention_layernorm
-        _, gate = get_router_module(student_layer, model_name)
-        snapshots.append((norm.weight.detach().cpu().clone(), gate.weight.detach().cpu().clone()))
-
         student_layer.to(device)
         train_u = collect_pre_moe_inputs(student_layer, train_inputs, layer_kwargs, device)
         val_u = collect_pre_moe_inputs(student_layer, validation_inputs, layer_kwargs, device)
@@ -229,8 +224,6 @@ def finetune_router_norm_reconstruction(
         parametrization = DecoupledRouterNorm(student_layer, model_name)
         try:
             with parametrization:
-                best_loss = baseline
-                best_delta = best_v = None
                 stages = ["norm"]
                 if config.stage in {"norm_then_router", "decoupled_joint"}:
                     stages.append("router")
@@ -245,31 +238,13 @@ def finetune_router_norm_reconstruction(
                         student_layer, val_u, val_targets, model_name, config.batch_size, device
                     )
                     print(f"[router-norm layer {layer_idx:>2} | {stage}] holdout={stage_loss:.6f}")
-                    if stage_loss < best_loss:
-                        best_loss = stage_loss
-                        best_delta = parametrization.delta.detach().clone()
-                        best_v = parametrization.v.detach().clone()
-                candidate = best_loss
-                if best_delta is not None:
-                    with torch.no_grad():
-                        parametrization.delta.copy_(best_delta)
-                        parametrization.v.copy_(best_v)
-            if candidate < baseline:
-                parametrization.fold()
-                folded = local_error(
-                    student_layer, val_u, val_targets, model_name, config.batch_size, device
-                )
-                if folded < baseline:
-                    choice = f"accepted (folded={folded:.6f})"
-                else:
-                    norm.weight.copy_(snapshots[-1][0].to(norm.weight.device))
-                    gate.weight.copy_(snapshots[-1][1].to(gate.weight.device))
-                    choice = f"baseline retained after BF16 fold (folded={folded:.6f})"
-            else:
-                choice = "baseline retained"
+            parametrization.fold()
+            folded = local_error(
+                student_layer, val_u, val_targets, model_name, config.batch_size, device
+            )
             print(
                 f"[router-norm layer {layer_idx:>2}] holdout={baseline:.6f} -> "
-                f"{candidate:.6f} ({choice})"
+                f"{folded:.6f} (final stage: {stages[-1]})"
             )
         finally:
             del parametrization
@@ -280,15 +255,3 @@ def finetune_router_norm_reconstruction(
         _cpu_offload(student_layer)
         train_inputs, validation_inputs = next_train, next_validation
         gc.collect()
-    return snapshots
-
-
-@torch.no_grad()
-def restore_router_norm_snapshot(student, model_name, snapshots):
-    layers = get_blocks(student, model_name)
-    if len(layers) != len(snapshots):
-        raise ValueError("Snapshot layer count differs from student")
-    for layer, (norm_weight, gate_weight) in zip(layers, snapshots):
-        layer.post_attention_layernorm.weight.copy_(norm_weight)
-        _, gate = get_router_module(layer, model_name)
-        gate.weight.copy_(gate_weight)
