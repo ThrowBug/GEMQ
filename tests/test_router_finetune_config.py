@@ -65,6 +65,7 @@ def test_target_requirements_follow_nonzero_weights():
 def test_distill_ce_has_independent_target_requirements():
     config = DistillCEConfig.from_args(_args())
     assert "distill_ce" in RFT_TRAINERS
+    assert "router_compensated_norm_distill" in RFT_TRAINERS
     assert not config.needs_router_targets
     assert config.needs_output_targets
 

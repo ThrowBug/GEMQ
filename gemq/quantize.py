@@ -32,6 +32,7 @@ from gemq.router_finetune.config import (
     RouterFinetuneConfig,
 )
 from gemq.router_finetune.losses import compute_causal_output_distill_ce
+from gemq.router_finetune.norm_distill import finetune_norms_distill_ce
 from gemq.router_finetune.targets import (
     get_or_collect_teacher_targets,
     materialize_calibration_inputs,
@@ -562,14 +563,14 @@ def parse_args():
     # router fine-tuning args
     parser.add_argument(
         "--finetune_routers", action="store_true",
-        help="Whether to finetune the router modules after quantization"
+        help="Whether to run the selected post-quantization fine-tuning stage"
     )
     parser.add_argument(
         "--rft_trainer", type=str, default="legacy_ce",
         choices=RFT_TRAINERS,
         help=(
-            "Use hard-label joint CE, teacher soft-label joint CE, or teacher-guided "
-            "layer-wise router fine-tuning"
+            "Use hard-label router CE, teacher-soft-label router/norm CE, or "
+            "teacher-guided layer-wise router fine-tuning"
         )
     )
     parser.add_argument(
@@ -732,12 +733,24 @@ if __name__ == "__main__":
             "GPTQ checkpoint already exists and will not be overwritten: "
             f"{args.gptq_checkpoint_path}"
         )
+    if (
+        args.finetune_routers
+        and args.rft_trainer == "router_compensated_norm_distill"
+        and args.save_path
+        and os.path.exists(args.save_path)
+    ):
+        raise FileExistsError(
+            "Norm-distilled model output already exists and will not be overwritten: "
+            f"{args.save_path}"
+        )
 
     # The tokenizer and calibration inputs always retain the original model identity,
     # even when the student weights are loaded from a post-GPTQ checkpoint.
     needs_teacher_targets = (
         args.finetune_routers
-        and args.rft_trainer in {"distill_ce", "layerwise_teacher"}
+        and args.rft_trainer in {
+            "distill_ce", "router_compensated_norm_distill", "layerwise_teacher"
+        }
     )
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, use_fast=args.use_fast, trust_remote_code=args.trust_remote_code
@@ -766,7 +779,7 @@ if __name__ == "__main__":
     if needs_teacher_targets:
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
-        if args.rft_trainer == "distill_ce":
+        if args.rft_trainer in {"distill_ce", "router_compensated_norm_distill"}:
             router_ft_config = DistillCEConfig.from_args(args)
         else:
             router_ft_config = RouterFinetuneConfig.from_args(args)
@@ -899,6 +912,20 @@ if __name__ == "__main__":
                     "before distilled-CE router fine-tuning", model=model
                 )
             finetune_routers_distill_ce(model, teacher_targets, args)
+        elif args.rft_trainer == "router_compensated_norm_distill":
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
+
+            print("Evaluating quantized model before norm distillation ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics(
+                    "before router-compensated norm distillation", model=model
+                )
+            evaluate_perplexity(
+                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
+            )
+
+            print("Fine-tuning post-attention norms with distilled CE ...")
+            finetune_norms_distill_ce(model, teacher_targets, args)
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
             evaluate_perplexity(

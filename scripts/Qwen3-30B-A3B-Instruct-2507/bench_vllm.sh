@@ -27,11 +27,14 @@ fi
 
 finetune_routers="${FINETUNE_ROUTERS:-true}"
 rft_trainer="${RFT_TRAINER:-layerwise_teacher}"
+rft_lr="${RFT_LR:-1e-4}"
+rft_lr_tag="$(python -c 'import sys; from decimal import Decimal; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "${rft_lr}")"
 rft_tag=""
 if [[ "${finetune_routers}" == "true" ]]; then
     case "${rft_trainer}" in
         legacy_ce) rft_tag="_RFT-legacy_ce" ;;
         distill_ce) rft_tag="_RFT-distill_ce" ;;
+        router_compensated_norm_distill) rft_tag="_RFT-router_compensated_norm_distill-lr${rft_lr_tag}" ;;
         layerwise_teacher)
             rft_timing="${RFT_TIMING:-after_each_layer_quantization}"
             timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"

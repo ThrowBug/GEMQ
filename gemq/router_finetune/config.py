@@ -3,12 +3,17 @@ from dataclasses import dataclass
 
 ROUTER_LOSS_TYPES = ("kd", "kd_tail", "l2", "l2_center")
 RFT_TIMINGS = ("after_all_quantization", "after_each_layer_quantization")
-RFT_TRAINERS = ("legacy_ce", "distill_ce", "layerwise_teacher")
+RFT_TRAINERS = (
+    "legacy_ce",
+    "distill_ce",
+    "router_compensated_norm_distill",
+    "layerwise_teacher",
+)
 
 
 @dataclass(frozen=True)
 class DistillCEConfig:
-    """Configuration for joint router fine-tuning with teacher soft labels."""
+    """Configuration for a joint teacher-soft-label distillation stage."""
 
     epochs: int
     batch_size: int
