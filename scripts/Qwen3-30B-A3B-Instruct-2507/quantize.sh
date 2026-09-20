@@ -84,7 +84,7 @@ dense_wbits="${DENSE_WBITS:-4}"
 #  Router fine-tuning
 # ===============================
 finetune_routers="${FINETUNE_ROUTERS:-true}"
-rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | router_compensated_norm_distill | layerwise_teacher
+rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | norm_distill | dual_norm_distill | router_compensated_norm_distill | router_compensated_dual_norm_distill | layerwise_teacher
 rft_timing="${RFT_TIMING:-after_each_layer_quantization}" # after_all_quantization | after_each_layer_quantization
 rft_router_loss="${RFT_ROUTER_LOSS:-kd_tail}" # kd | kd_tail | l2 | l2_center
 rft_router_alpha="${RFT_ROUTER_ALPHA:-1.0}"
@@ -187,8 +187,8 @@ if [[ "${finetune_routers}" == "true" ]]; then
             rft_tag="_RFT-distill_ce"
             quant_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
             ;;
-        router_compensated_norm_distill)
-            rft_tag="_RFT-router_compensated_norm_distill-lr${rft_lr_tag}"
+        norm_distill|dual_norm_distill|router_compensated_norm_distill|router_compensated_dual_norm_distill)
+            rft_tag="_RFT-${rft_trainer}-lr${rft_lr_tag}"
             quant_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
             ;;
         layerwise_teacher)
@@ -249,10 +249,14 @@ fi
 
 if [[ "${save_model}" == "true" ]]; then
     save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
-    if [[ "${finetune_routers}" == "true" && "${rft_trainer}" == "router_compensated_norm_distill" && -e "${save_path}" ]]; then
-        echo "Norm-distilled model output already exists and will not be overwritten: ${save_path}" >&2
-        exit 1
-    fi
+    case "${rft_trainer}" in
+        norm_distill|dual_norm_distill|router_compensated_norm_distill|router_compensated_dual_norm_distill)
+            if [[ "${finetune_routers}" == "true" && -e "${save_path}" ]]; then
+                echo "Norm-distilled model output already exists and will not be overwritten: ${save_path}" >&2
+                exit 1
+            fi
+            ;;
+    esac
     io_args=(--save_path "${save_path}" --save_dtype "${save_dtype}")
 else
     save_path="None"
@@ -286,7 +290,20 @@ if [[ "${rft_trainer}" == "legacy_ce" ]]; then
     echo " Router objective: hard-label autoregressive CE"
 elif [[ "${rft_trainer}" == "distill_ce" ]]; then
     echo " Router objective: teacher soft-label autoregressive CE"
+elif [[ "${rft_trainer}" == "norm_distill" ]]; then
+    echo " Norm parameters: post-attention only"
+    echo " Norm objective:   teacher soft-label autoregressive CE"
+    echo " Router update:    none"
+elif [[ "${rft_trainer}" == "dual_norm_distill" ]]; then
+    echo " Norm parameters: input + post-attention"
+    echo " Norm objective:   teacher soft-label autoregressive CE"
+    echo " Router update:    none"
 elif [[ "${rft_trainer}" == "router_compensated_norm_distill" ]]; then
+    echo " Norm parameters: post-attention only"
+    echo " Norm objective:   teacher soft-label autoregressive CE"
+    echo " Router update:    inverse scale folding only (no optimizer)"
+elif [[ "${rft_trainer}" == "router_compensated_dual_norm_distill" ]]; then
+    echo " Norm parameters: input + post-attention"
     echo " Norm objective:   teacher soft-label autoregressive CE"
     echo " Router update:    inverse scale folding only (no optimizer)"
 else

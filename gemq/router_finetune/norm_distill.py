@@ -1,4 +1,4 @@
-"""Distilled-CE tuning of post-attention norms with router compensation."""
+"""Distilled-CE tuning of attention and MoE input norms."""
 
 import time
 
@@ -8,20 +8,55 @@ from gemq.router_finetune.losses import compute_causal_output_distill_ce
 from gemq.utils.model_utils import get_blocks, get_router_module
 
 
-class RouterCompensatedNorm:
-    """Learn a channel scale for one norm without optimizing its router."""
+class NormScale:
+    """Learn a channel scale for one norm and fold it into the norm weight."""
+
+    def __init__(self, norm):
+        self.norm = norm
+        self.delta = torch.nn.Parameter(
+            torch.zeros_like(self.norm.weight, dtype=torch.float32)
+        )
+        self._norm_hook = None
+
+    def install(self):
+        def scale_norm(_module, _inputs, output):
+            return (output.float() * self.delta.exp()).to(output.dtype)
+
+        self._norm_hook = self.norm.register_forward_hook(scale_norm)
+
+    def remove(self):
+        if self._norm_hook is not None:
+            self._norm_hook.remove()
+        self._norm_hook = None
+
+    @torch.no_grad()
+    def fold(self):
+        old_norm = self.norm.weight.detach().clone()
+        new_norm = (old_norm.float() * self.delta.exp()).to(old_norm.dtype)
+
+        # Return the scale actually representable by the stored dtype. Router
+        # compensation must use this value rather than the FP32 training scale.
+        realized_scale = torch.ones_like(self.delta)
+        nonzero = old_norm.ne(0)
+        realized_scale[nonzero] = (
+            new_norm[nonzero].float() / old_norm[nonzero].float()
+        )
+        if not torch.isfinite(realized_scale).all() or not (realized_scale > 0).all():
+            raise FloatingPointError("The learned norm scale cannot be folded safely.")
+        self.norm.weight.copy_(new_norm)
+        return realized_scale
+
+
+class RouterCompensatedNorm(NormScale):
+    """Learn a post-attention norm scale while preserving router inputs."""
 
     def __init__(self, layer, model_name):
-        self.norm = layer.post_attention_layernorm
+        super().__init__(layer.post_attention_layernorm)
         _, self.router = get_router_module(layer, model_name)
         if self.router.weight.shape[1] != self.norm.weight.numel():
             raise ValueError("Router input width differs from post-attention norm width.")
         if self.router.weight.device != self.norm.weight.device:
             raise ValueError("Router and post-attention norm must be on the same device.")
-        self.delta = torch.nn.Parameter(
-            torch.zeros_like(self.norm.weight, dtype=torch.float32)
-        )
-        self._norm_hook = None
         self._router_hook = None
         self._unscaled = None
 
@@ -48,28 +83,14 @@ class RouterCompensatedNorm:
     def remove(self):
         if self._router_hook is not None:
             self._router_hook.remove()
-        if self._norm_hook is not None:
-            self._norm_hook.remove()
-        self._router_hook = self._norm_hook = None
+        super().remove()
+        self._router_hook = None
         self._unscaled = None
 
     @torch.no_grad()
     def fold(self):
         """Fold the learned scale into normal HF norm/router weights."""
-        scale = self.delta.exp()
-        old_norm = self.norm.weight.detach().clone()
-        new_norm = (old_norm.float() * scale).to(old_norm.dtype)
-
-        # Compensate using the scale actually representable by the stored dtype.
-        realized_scale = torch.ones_like(scale)
-        nonzero = old_norm.ne(0)
-        realized_scale[nonzero] = (
-            new_norm[nonzero].float() / old_norm[nonzero].float()
-        )
-        if not torch.isfinite(realized_scale).all() or not (realized_scale > 0).all():
-            raise FloatingPointError("The learned norm scale cannot be folded safely.")
-
-        self.norm.weight.copy_(new_norm)
+        realized_scale = super().fold()
         self.router.weight.copy_(
             (
                 self.router.weight.float()
@@ -78,8 +99,15 @@ class RouterCompensatedNorm:
         )
 
 
-def finetune_norms_distill_ce(model, teacher_targets, args):
-    """Tune only post-attention norm scales with teacher soft-label CE."""
+def finetune_norms_distill_ce(
+    model,
+    teacher_targets,
+    args,
+    *,
+    optimize_input_norm=False,
+    router_compensated=True,
+):
+    """Tune selected norm scales jointly with teacher soft-label CE."""
     if teacher_targets.final_hidden_states is None:
         raise RuntimeError("Norm distillation requires teacher final hidden states.")
 
@@ -98,10 +126,14 @@ def finetune_norms_distill_ce(model, teacher_targets, args):
             f"Teacher cache has {input_ids.shape[0]} samples, but --nsamples={args.nsamples}."
         )
 
-    controllers = [
-        RouterCompensatedNorm(layer, args.model_name)
-        for layer in get_blocks(model, args.model_name)
-    ]
+    controllers = []
+    for layer in get_blocks(model, args.model_name):
+        if optimize_input_norm:
+            controllers.append(NormScale(layer.input_layernorm))
+        if router_compensated:
+            controllers.append(RouterCompensatedNorm(layer, args.model_name))
+        else:
+            controllers.append(NormScale(layer.post_attention_layernorm))
     for controller in controllers:
         controller.install()
 

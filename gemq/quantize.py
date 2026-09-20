@@ -26,6 +26,7 @@ from gemq.utils.eval_utils import evaluate_perplexity, run_lm_eval
 from gemq.utils.hf_loading import load_causal_lm_checkpoint
 from gemq.router_finetune.config import (
     DistillCEConfig,
+    NORM_DISTILL_MODES,
     RFT_TIMINGS,
     RFT_TRAINERS,
     ROUTER_LOSS_TYPES,
@@ -735,7 +736,7 @@ if __name__ == "__main__":
         )
     if (
         args.finetune_routers
-        and args.rft_trainer == "router_compensated_norm_distill"
+        and args.rft_trainer in NORM_DISTILL_MODES
         and args.save_path
         and os.path.exists(args.save_path)
     ):
@@ -748,9 +749,10 @@ if __name__ == "__main__":
     # even when the student weights are loaded from a post-GPTQ checkpoint.
     needs_teacher_targets = (
         args.finetune_routers
-        and args.rft_trainer in {
-            "distill_ce", "router_compensated_norm_distill", "layerwise_teacher"
-        }
+        and (
+            args.rft_trainer in {"distill_ce", "layerwise_teacher"}
+            or args.rft_trainer in NORM_DISTILL_MODES
+        )
     )
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, use_fast=args.use_fast, trust_remote_code=args.trust_remote_code
@@ -779,7 +781,7 @@ if __name__ == "__main__":
     if needs_teacher_targets:
         if args.eval_fp:
             raise ValueError("Teacher-guided router fine-tuning requires quantization; disable --eval_fp.")
-        if args.rft_trainer in {"distill_ce", "router_compensated_norm_distill"}:
+        if args.rft_trainer == "distill_ce" or args.rft_trainer in NORM_DISTILL_MODES:
             router_ft_config = DistillCEConfig.from_args(args)
         else:
             router_ft_config = RouterFinetuneConfig.from_args(args)
@@ -912,7 +914,8 @@ if __name__ == "__main__":
                     "before distilled-CE router fine-tuning", model=model
                 )
             finetune_routers_distill_ce(model, teacher_targets, args)
-        elif args.rft_trainer == "router_compensated_norm_distill":
+        elif args.rft_trainer in NORM_DISTILL_MODES:
+            norm_mode = NORM_DISTILL_MODES[args.rft_trainer]
             model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
             print("Evaluating quantized model before norm distillation ...")
@@ -924,8 +927,19 @@ if __name__ == "__main__":
                 model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
             )
 
-            print("Fine-tuning post-attention norms with distilled CE ...")
-            finetune_norms_distill_ce(model, teacher_targets, args)
+            norm_scope = (
+                "input and post-attention norms"
+                if norm_mode["optimize_input_norm"]
+                else "post-attention norms"
+            )
+            print(f"Fine-tuning {norm_scope} jointly with distilled CE ...")
+            finetune_norms_distill_ce(
+                model,
+                teacher_targets,
+                args,
+                optimize_input_norm=norm_mode["optimize_input_norm"],
+                router_compensated=norm_mode["router_compensated"],
+            )
         elif router_ft_config.timing == "after_all_quantization":
             print("Evaluating quantized model before layer-wise fine-tuning ...")
             evaluate_perplexity(

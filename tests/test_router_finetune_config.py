@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from gemq.router_finetune.config import DistillCEConfig, RFT_TRAINERS, RouterFinetuneConfig
+from gemq.router_finetune.config import (
+    DistillCEConfig,
+    NORM_DISTILL_MODES,
+    RFT_TRAINERS,
+    RouterFinetuneConfig,
+)
 
 
 def _args(**overrides):
@@ -65,9 +70,36 @@ def test_target_requirements_follow_nonzero_weights():
 def test_distill_ce_has_independent_target_requirements():
     config = DistillCEConfig.from_args(_args())
     assert "distill_ce" in RFT_TRAINERS
-    assert "router_compensated_norm_distill" in RFT_TRAINERS
+    for trainer in (
+        "norm_distill",
+        "dual_norm_distill",
+        "router_compensated_norm_distill",
+        "router_compensated_dual_norm_distill",
+    ):
+        assert trainer in RFT_TRAINERS
     assert not config.needs_router_targets
     assert config.needs_output_targets
+
+
+def test_norm_distill_modes_are_two_independent_options():
+    assert NORM_DISTILL_MODES == {
+        "norm_distill": {
+            "optimize_input_norm": False,
+            "router_compensated": False,
+        },
+        "dual_norm_distill": {
+            "optimize_input_norm": True,
+            "router_compensated": False,
+        },
+        "router_compensated_norm_distill": {
+            "optimize_input_norm": False,
+            "router_compensated": True,
+        },
+        "router_compensated_dual_norm_distill": {
+            "optimize_input_norm": True,
+            "router_compensated": True,
+        },
+    }
 
 
 def test_distill_ce_does_not_validate_layerwise_loss_arguments():

@@ -23,12 +23,16 @@ class _RMSNorm(nn.Module):
 class _Layer(nn.Module):
     def __init__(self, width=4):
         super().__init__()
+        self.input_layernorm = _RMSNorm(width)
         self.post_attention_layernorm = _RMSNorm(width)
+        self.attention = nn.Linear(width, width, bias=False)
         self.router = nn.Linear(width, 3, bias=False)
         self.expert = nn.Linear(width, width, bias=False)
 
     def run(self, values):
-        normalized = self.post_attention_layernorm(values)
+        attention_input = self.input_layernorm(values)
+        attention_output = self.attention(attention_input)
+        normalized = self.post_attention_layernorm(values + attention_output)
         flattened = normalized.reshape(-1, normalized.shape[-1])
         return normalized, self.router(flattened), self.expert(flattened)
 
@@ -94,3 +98,54 @@ def test_bfloat16_noop_norm_scale_does_not_change_router():
     assert torch.equal(layer.post_attention_layernorm.weight, old_norm)
     assert torch.equal(layer.router.weight, old_router)
 
+
+def test_uncompensated_post_norm_scale_changes_router():
+    torch.manual_seed(2)
+    layer = _Layer()
+    values = torch.randn(2, 3, 4)
+    _, baseline_router, _ = layer.run(values)
+    controller = norm_distill.NormScale(layer.post_attention_layernorm)
+    with torch.no_grad():
+        controller.delta.copy_(torch.tensor([0.2, -0.1, 0.3, -0.25]))
+    controller.install()
+    _, scaled_router, _ = layer.run(values)
+    controller.remove()
+
+    assert not torch.equal(scaled_router, baseline_router)
+
+
+@pytest.mark.parametrize("router_compensated", [False, True])
+def test_dual_norm_scales_train_together_and_fold(router_compensated):
+    torch.manual_seed(3)
+    layer = _Layer()
+    values = torch.randn(2, 3, 4)
+    for parameter in layer.parameters():
+        parameter.requires_grad_(False)
+
+    input_controller = norm_distill.NormScale(layer.input_layernorm)
+    if router_compensated:
+        post_controller = norm_distill.RouterCompensatedNorm(layer, "unused")
+    else:
+        post_controller = norm_distill.NormScale(layer.post_attention_layernorm)
+    with torch.no_grad():
+        input_controller.delta.copy_(torch.tensor([0.03, -0.02, 0.01, -0.04]))
+        post_controller.delta.copy_(torch.tensor([0.02, -0.03, 0.04, -0.01]))
+
+    input_controller.install()
+    post_controller.install()
+    hooked = layer.run(values)
+    hooked[-1].square().mean().backward()
+    input_controller.remove()
+    post_controller.remove()
+
+    assert input_controller.delta.grad is not None
+    assert input_controller.delta.grad.abs().sum().item() > 0
+    assert post_controller.delta.grad is not None
+    assert post_controller.delta.grad.abs().sum().item() > 0
+    assert all(parameter.grad is None for parameter in layer.parameters())
+
+    input_controller.fold()
+    post_controller.fold()
+    folded = layer.run(values)
+    for actual, expected in zip(folded, hooked):
+        torch.testing.assert_close(actual, expected)

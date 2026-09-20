@@ -3,10 +3,31 @@ from dataclasses import dataclass
 
 ROUTER_LOSS_TYPES = ("kd", "kd_tail", "l2", "l2_center")
 RFT_TIMINGS = ("after_all_quantization", "after_each_layer_quantization")
+NORM_DISTILL_MODES = {
+    "norm_distill": {
+        "optimize_input_norm": False,
+        "router_compensated": False,
+    },
+    "dual_norm_distill": {
+        "optimize_input_norm": True,
+        "router_compensated": False,
+    },
+    "router_compensated_norm_distill": {
+        "optimize_input_norm": False,
+        "router_compensated": True,
+    },
+    "router_compensated_dual_norm_distill": {
+        "optimize_input_norm": True,
+        "router_compensated": True,
+    },
+}
 RFT_TRAINERS = (
     "legacy_ce",
     "distill_ce",
+    "norm_distill",
+    "dual_norm_distill",
     "router_compensated_norm_distill",
+    "router_compensated_dual_norm_distill",
     "layerwise_teacher",
 )
 
