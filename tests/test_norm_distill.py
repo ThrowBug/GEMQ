@@ -149,3 +149,19 @@ def test_dual_norm_scales_train_together_and_fold(router_compensated):
     folded = layer.run(values)
     for actual, expected in zip(folded, hooked):
         torch.testing.assert_close(actual, expected)
+
+
+def test_scale_summary_prints_key_distribution_and_changed_ratio(capsys):
+    norm_distill._print_scale_summary(
+        "input",
+        [torch.tensor([0.9, 1.0, 1.1])],
+        [torch.tensor([1.0, 1.0, 1.125])],
+    )
+    output = capsys.readouterr().out
+
+    assert "[norm-scale input]" in output
+    assert "learned p05=" in output
+    assert "p50=1.000000" in output
+    assert "realized p05=" in output
+    assert "p95=1.112500" in output
+    assert "changed=33.33%" in output

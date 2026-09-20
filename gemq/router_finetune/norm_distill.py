@@ -97,6 +97,27 @@ class RouterCompensatedNorm(NormScale):
                 * realized_scale.reciprocal().unsqueeze(0)
             ).to(self.router.weight.dtype)
         )
+        return realized_scale
+
+
+def _print_scale_summary(label, learned_scales, realized_scales):
+    learned = torch.cat(
+        [scale.detach().float().reshape(-1).cpu() for scale in learned_scales]
+    )
+    realized = torch.cat(
+        [scale.detach().float().reshape(-1).cpu() for scale in realized_scales]
+    )
+    quantiles = torch.tensor([0.05, 0.5, 0.95])
+    learned_q = torch.quantile(learned, quantiles).tolist()
+    realized_q = torch.quantile(realized, quantiles).tolist()
+    changed = realized.ne(1.0).float().mean().item() * 100.0
+    print(
+        f"[norm-scale {label}] "
+        f"learned p05={learned_q[0]:.6f} p50={learned_q[1]:.6f} "
+        f"p95={learned_q[2]:.6f} | "
+        f"realized p05={realized_q[0]:.6f} p50={realized_q[1]:.6f} "
+        f"p95={realized_q[2]:.6f} | changed={changed:.2f}%"
+    )
 
 
 def finetune_norms_distill_ce(
@@ -127,13 +148,18 @@ def finetune_norms_distill_ce(
         )
 
     controllers = []
+    controller_groups = {"input": [], "post": []}
     for layer in get_blocks(model, args.model_name):
         if optimize_input_norm:
-            controllers.append(NormScale(layer.input_layernorm))
+            input_controller = NormScale(layer.input_layernorm)
+            controllers.append(input_controller)
+            controller_groups["input"].append(input_controller)
         if router_compensated:
-            controllers.append(RouterCompensatedNorm(layer, args.model_name))
+            post_controller = RouterCompensatedNorm(layer, args.model_name)
         else:
-            controllers.append(NormScale(layer.post_attention_layernorm))
+            post_controller = NormScale(layer.post_attention_layernorm)
+        controllers.append(post_controller)
+        controller_groups["post"].append(post_controller)
     for controller in controllers:
         controller.install()
 
@@ -197,6 +223,19 @@ def finetune_norms_distill_ce(
         model.config.use_cache = original_use_cache
 
     if completed:
+        learned_scales = {
+            id(controller): controller.delta.detach().exp()
+            for controller in controllers
+        }
+        realized_scales = {}
         for controller in controllers:
-            controller.fold()
+            realized_scales[id(controller)] = controller.fold()
+        for label in ("input", "post"):
+            group = controller_groups[label]
+            if group:
+                _print_scale_summary(
+                    label,
+                    [learned_scales[id(controller)] for controller in group],
+                    [realized_scales[id(controller)] for controller in group],
+                )
     model.to(original_dtype)
