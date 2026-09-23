@@ -10,9 +10,9 @@ from tqdm import tqdm
 
 import torch
 from transformers import AutoTokenizer, logging
-from hqq.models.hf.base import AutoHQQHFModel
 
 from gemq.quantizers.gptq import MCMoeGPTQWeightQuantizer, GPTQWeightQuantizer
+from gemq.quantizers.rtn import MCMoeRTNWeightQuantizer
 from gemq.utils.data_utils import get_calib_loader
 from gemq.utils.gptq_checkpoint import (
     build_gptq_checkpoint_identity,
@@ -43,7 +43,13 @@ from gemq.pruning import (
     has_zero_bit_experts,
     kept_expert_ids_from_pruning_metadata,
     load_expert_bit_config,
-    prune_qwen3_experts,
+    prune_zero_bit_experts,
+)
+from gemq.utils.qwen35 import (
+    get_num_routed_experts,
+    get_packed_expert_weights,
+    packed_expert_intermediate,
+    qwen35_topk_routes,
 )
 from gemq.router_finetune.trainer import (
     finetune_router_after_layer_quantization,
@@ -51,6 +57,166 @@ from gemq.router_finetune.trainer import (
 )
 
 logging.set_verbosity_error()
+
+
+def _first_tensor(output):
+    return output[0] if isinstance(output, (tuple, list)) else output
+
+
+def _new_gptq_quantizer(weight, name, wbits, groupsize, args):
+    quantizer_cls = (
+        MCMoeGPTQWeightQuantizer if args.reproduce_mcmoe else GPTQWeightQuantizer
+    )
+    return quantizer_cls(
+        weight,
+        name,
+        wbits,
+        args.blocksize,
+        args.percdamp,
+        groupsize,
+        args.actorder,
+        args.static_groups,
+        args.mse,
+    )
+
+
+def _effective_groupsize(weight, requested, name, verbose=False):
+    hidden_size = weight.shape[1]
+    if hidden_size % requested == 0:
+        return requested
+    if hidden_size % 64 != 0:
+        raise ValueError(
+            f"Neither groupsize={requested} nor fallback groupsize=64 divides "
+            f"the input dimension {hidden_size} of {name}."
+        )
+    if verbose:
+        print(f"Forcing groupsize from {requested} to 64 for module: {name}")
+    return 64
+
+
+def _collect_qwen35_active_inputs(moe_inputs, selected_batches, expert_idx):
+    active = []
+    for hidden_states, selected in zip(moe_inputs, selected_batches):
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        token_mask = selected.eq(expert_idx).any(dim=-1)
+        if token_mask.any().item():
+            active.append(flat_hidden[token_mask])
+    if not active:
+        return None
+    return torch.cat(active, dim=0)
+
+
+@torch.no_grad()
+def _quantize_qwen35_packed_experts(
+    moe_block, moe_inputs, selected_batches, expert_bits, layer_idx, args
+):
+    """GPTQ Qwen3.5 routed experts while retaining their packed HF tensors."""
+    num_experts = get_num_routed_experts(moe_block)
+    expected = set(range(num_experts))
+    if set(expert_bits) != expected:
+        raise ValueError(
+            f"Layer {layer_idx} packed-expert allocation must contain IDs "
+            f"0..{num_experts - 1}."
+        )
+
+    for expert_idx in range(num_experts):
+        wbits = int(expert_bits[expert_idx])
+        if wbits >= 16:
+            continue
+        if wbits <= 0:
+            raise ValueError(
+                f"Layer {layer_idx} expert {expert_idx} still has {wbits} bits. "
+                "Zero-bit experts must be physically pruned first."
+            )
+
+        weights = get_packed_expert_weights(moe_block, expert_idx)
+        original_gate_up = weights.gate_up_proj.detach().clone()
+        original_down = weights.down_proj.detach().clone()
+        active_inputs = _collect_qwen35_active_inputs(
+            moe_inputs, selected_batches, expert_idx
+        )
+
+        # An expert may receive no token in a small calibration set. GPTQ then
+        # has no Hessian to invert, so use the deterministic RTN fallback rather
+        # than fabricating activation statistics or failing in Cholesky.
+        if active_inputs is None:
+            weights.gate_up_proj.copy_(
+                MCMoeRTNWeightQuantizer.normal_quantize(
+                    original_gate_up, blocksize=args.blocksize, wbit=wbits
+                )
+            )
+            weights.down_proj.copy_(
+                MCMoeRTNWeightQuantizer.normal_quantize(
+                    original_down, blocksize=args.blocksize, wbit=wbits
+                )
+            )
+            if args.verbose:
+                print(
+                    f"| mlp.experts.{expert_idx}.packed | {wbits:<3} | "
+                    " RTN | active_tokens=0"
+                )
+            continue
+
+        gate_name = f"{layer_idx}.mlp.experts.{expert_idx}.gate_up_proj"
+        gate_groupsize = _effective_groupsize(
+            original_gate_up, args.groupsize, gate_name, args.verbose
+        )
+        gate_quantizer = _new_gptq_quantizer(
+            original_gate_up,
+            gate_name,
+            wbits,
+            gate_groupsize,
+            args,
+        )
+        if active_inputs is not None:
+            gate_inputs = active_inputs.to(
+                device=original_gate_up.device,
+                dtype=original_gate_up.dtype,
+                non_blocking=True,
+            )
+            gate_quantizer.add_batch(gate_inputs)
+        else:
+            gate_inputs = None
+        q, scales, zeros = gate_quantizer.quantize()
+        weights.gate_up_proj.copy_(
+            gate_quantizer.dequantize(q, scales, zeros).reshape_as(
+                weights.gate_up_proj
+            )
+        )
+
+        down_name = f"{layer_idx}.mlp.experts.{expert_idx}.down_proj"
+        down_groupsize = _effective_groupsize(
+            original_down, args.groupsize, down_name, args.verbose
+        )
+        down_quantizer = _new_gptq_quantizer(
+            original_down,
+            down_name,
+            wbits,
+            down_groupsize,
+            args,
+        )
+        down_inputs = None
+        if gate_inputs is not None:
+            # Match the legacy hook-based flow: the down-projection Hessian is
+            # collected from the full-precision gate/up activations.
+            down_inputs = packed_expert_intermediate(
+                gate_inputs, original_gate_up, moe_block.experts.act_fn
+            )
+            down_quantizer.add_batch(down_inputs)
+        q, scales, zeros = down_quantizer.quantize()
+        weights.down_proj.copy_(
+            down_quantizer.dequantize(q, scales, zeros).reshape_as(
+                weights.down_proj
+            )
+        )
+
+        if args.verbose:
+            count = 0 if active_inputs is None else int(active_inputs.shape[0])
+            print(
+                f"| mlp.experts.{expert_idx}.packed | {wbits:<3} | "
+                f"{gate_groupsize:>4} | active_tokens={count}"
+            )
+        del gate_quantizer, down_quantizer, gate_inputs, down_inputs, active_inputs
 
 
 def load_causal_lm(model_path, args, description="model"):
@@ -73,6 +239,8 @@ def save_quantized_model(model, tokenizer, save_path, save_dtype, real_quant):
     Save the real/pseudo quantized model.
     """
     if real_quant:
+        from hqq.models.hf.base import AutoHQQHFModel
+
         tokenizer.save_pretrained(save_path)
         AutoHQQHFModel.save_quantized(model, save_path)
     else:
@@ -279,11 +447,18 @@ def quantize_weights_gptq(
 
     # retrieve decoder blocks
     layers = get_blocks(model, args.model_name)
+    model_type = NAME_TO_MODEL[args.model_name]
 
     # perform quantization for each block
     quant_modules = {}
     outs = torch.zeros_like(inps)
     for i in tqdm(range(len(layers)), desc="GPTQ Quantizing"):
+        current_layer_kwargs = (
+            layer_kwargs[i] if isinstance(layer_kwargs, list) else layer_kwargs
+        )
+        current_layer_kwargs = move_tree_to_device(
+            current_layer_kwargs, torch.device("cuda")
+        )
         if args.verbose:
             print("+" + "="*57 + "+")
             print(f"| block {i:<24} | {'bit':<3} |  gs  | {'time (s)':>9} |")
@@ -303,26 +478,12 @@ def quantize_weights_gptq(
             if wbits >= 16:
                 continue
 
-            # NOTE: adjust groupsize to fit the hidden size
-            hidden_size = m.weight.shape[1]
-            if hidden_size % args.groupsize == 0:
-                groupsize = args.groupsize
-            else:
-                assert hidden_size % 64 == 0, "Currently only supports groupsize=64 as fallback."
-                groupsize = 64
-                if args.verbose:
-                    print(f"Forcing groupsize from {args.groupsize} to 64 for module: {name}")
-
-            if args.reproduce_mcmoe:
-                quantizers[name] = MCMoeGPTQWeightQuantizer(
-                    m.weight.data, name, wbits, args.blocksize, args.percdamp,
-                    groupsize, args.actorder, args.static_groups, args.mse
-                )
-            else:
-                quantizers[name] = GPTQWeightQuantizer(
-                    m.weight.data, name, wbits, args.blocksize, args.percdamp,
-                    groupsize, args.actorder, args.static_groups, args.mse
-                )
+            groupsize = _effective_groupsize(
+                m.weight, args.groupsize, name, args.verbose
+            )
+            quantizers[name] = _new_gptq_quantizer(
+                m.weight.data, name, wbits, groupsize, args
+            )
             
             # collect quantized modules for real quantization saving
             quant_modules[f"{i}.{name}"] = m
@@ -341,8 +502,23 @@ def quantize_weights_gptq(
                     partial(update_hessian_hook, quantizer=quantizers[name])
                 )
             )
+
+        qwen35_moe_inputs = []
+        qwen35_selected_experts = []
+        if model_type == ModelType.QWEN35MOE:
+            moe_block = get_moe_block(layer, args.model_name)
+
+            def capture_qwen35_routes(module, inputs):
+                hidden_states = inputs[0].detach()
+                selected, _ = qwen35_topk_routes(module, hidden_states)
+                qwen35_moe_inputs.append(hidden_states.to("cpu"))
+                qwen35_selected_experts.append(selected.detach().to("cpu"))
+
+            handles.append(moe_block.register_forward_pre_hook(capture_qwen35_routes))
         for j in range(inps.shape[0]):
-            outs[j] = layer(inps[j: j+1], **layer_kwargs)[0]
+            outs[j] = _first_tensor(
+                layer(inps[j: j+1], **current_layer_kwargs)
+            )
         for h in handles:
             h.remove()
 
@@ -374,6 +550,23 @@ def quantize_weights_gptq(
             if args.verbose:
                 print(f"| {name:<30} | {quantizers[name].nbits:<3} | {quantizers[name].groupsize:>4} | {elapse:>9.2f} |")
 
+        if model_type == ModelType.QWEN35MOE:
+            if expert_bit_cfg is None:
+                packed_bits = {
+                    expert_idx: int(args.expert_wbits)
+                    for expert_idx in range(get_num_routed_experts(moe_block))
+                }
+            else:
+                packed_bits = expert_bit_cfg[i]
+            _quantize_qwen35_packed_experts(
+                moe_block,
+                qwen35_moe_inputs,
+                qwen35_selected_experts,
+                packed_bits,
+                i,
+                args,
+            )
+
         if (
             router_ft_config is not None
             and router_ft_config.timing == "after_each_layer_quantization"
@@ -384,7 +577,7 @@ def quantize_weights_gptq(
                 i,
                 inps,
                 outs,
-                layer_kwargs,
+                current_layer_kwargs,
                 teacher_targets,
                 args.model_name,
                 router_ft_config,
@@ -394,7 +587,9 @@ def quantize_weights_gptq(
         start = time.time()
 
         for j in range(inps.shape[0]):
-            outs[j] = layer(inps[j: j+1], **layer_kwargs)[0]
+            outs[j] = _first_tensor(
+                layer(inps[j: j+1], **current_layer_kwargs)
+            )
 
         elapse = time.time() - start
         if args.verbose:
@@ -517,6 +712,14 @@ def parse_args():
     parser.add_argument(
         "--attn_wbits", type=int, default=4,
         help="#bits for quantization of attention modules"
+    )
+    parser.add_argument(
+        "--linear_attn_wbits", type=int, default=4,
+        help="Qwen3.5 bits for linear-attention in_proj_qkv/out_proj only",
+    )
+    parser.add_argument(
+        "--softmax_attn_wbits", type=int, default=4,
+        help="Qwen3.5 bits for full-attention q/k/v/o projections",
     )
     parser.add_argument(
         "--gate_wbits", type=int, default=16,
@@ -672,6 +875,32 @@ if __name__ == "__main__":
     # parse args
     args = parse_args()
     print(json.dumps(vars(args), indent=4))
+
+    if args.model_name not in NAME_TO_MODEL:
+        raise ValueError(f"Unknown --model_name: {args.model_name!r}")
+    if NAME_TO_MODEL[args.model_name] == ModelType.QWEN35MOE:
+        if args.real_quant:
+            raise ValueError(
+                "Qwen3.5 support is pseudo-quantization only; disable --real_quant."
+            )
+        if args.finetune_routers:
+            raise ValueError(
+                "Qwen3.5 router/norm fine-tuning is outside this implementation; "
+                "disable --finetune_routers."
+            )
+        if args.gate_wbits != 16:
+            raise ValueError("Qwen3.5 routers must remain full precision (gate_wbits=16).")
+        for argument_name in (
+            "linear_attn_wbits",
+            "softmax_attn_wbits",
+            "dense_wbits",
+            "expert_wbits",
+        ):
+            value = getattr(args, argument_name)
+            if not 1 <= value <= 16:
+                raise ValueError(
+                    f"Qwen3.5 --{argument_name} must be between 1 and 16; got {value}."
+                )
 
     if args.cuda_diagnostics:
         original_excepthook = sys.excepthook
@@ -843,7 +1072,9 @@ if __name__ == "__main__":
             and expert_bit_cfg is not None
             and has_zero_bit_experts(expert_bit_cfg)
         ):
-            pruning_result = prune_qwen3_experts(model, args.model_name, expert_bit_cfg)
+            pruning_result = prune_zero_bit_experts(
+                model, args.model_name, expert_bit_cfg
+            )
             expert_bit_cfg = pruning_result.remapped_bit_config
             pruning_metadata = dict(pruning_result.metadata)
             pruning_metadata["source_bit_config"] = args.bit_cfg

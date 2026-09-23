@@ -110,10 +110,7 @@ def run(args):
             f"PMQ statistics contain layers {solver.layer_ids}, but {args.model_name} "
             f"expects {expected_layer_ids}."
         )
-    expected_experts = (
-        model_info.num_routed_experts_per_layer
-        + model_info.num_shared_experts_per_layer
-    )
+    expected_experts = model_info.num_allocatable_experts_per_layer
     if solver.num_experts != expected_experts:
         raise ValueError(
             f"PMQ statistics contain {solver.num_experts} experts/layer, but "

@@ -77,6 +77,8 @@ def build_gptq_checkpoint_identity(args, input_ids, attention_mask):
             "quantizer": args.quantizer,
             "reproduce_mcmoe": bool(args.reproduce_mcmoe),
             "attn_wbits": args.attn_wbits,
+            "linear_attn_wbits": getattr(args, "linear_attn_wbits", None),
+            "softmax_attn_wbits": getattr(args, "softmax_attn_wbits", None),
             "gate_wbits": args.gate_wbits,
             "dense_wbits": args.dense_wbits,
             "expert_wbits": args.expert_wbits,

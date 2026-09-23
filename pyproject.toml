@@ -11,13 +11,12 @@ license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.8.0",
-    "transformers>=4.57.0",
+    "transformers==5.2.0",
+    "tokenizers==0.22.1",
     "accelerate>=1.10.1",
     "datasets>=4.3.0",
-    "huggingface-hub>=0.34.0,<1.0",
-    "hqq>=0.2.8",
-    "gemlite>=0.5.1",
-    "triton>=3.4.0",
+    "huggingface-hub==1.3.0",
+    "hf-xet==1.2.0",
     "numpy>=2.2.6",
     "scipy>=1.9",
     "tqdm",
@@ -27,6 +26,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# The Qwen3.5 workflow is fake-quant only. Keep the legacy HQQ stack opt-in so
+# it cannot constrain or replace the pinned Transformers 5.2 environment.
+real_quant = ["hqq>=0.2.8", "gemlite>=0.5.1", "triton>=3.4.0"]
 # Optional alternative ILP backend. The default is HiGHS, which ships with SciPy,
 # so no license is needed; Gurobi is what the committed configs/ were solved with.
 gurobi = ["gurobipy>=12.0.3"]

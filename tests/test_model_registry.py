@@ -25,3 +25,16 @@ def test_qwen3_30b_a3b_instruct_2507_registry_and_metadata():
     assert model_info.num_routed_experts_per_layer == 128
     assert model_info.num_shared_experts_per_layer == 0
     assert model_info.num_experts_per_token == 8
+
+
+def test_qwen35_35b_a3b_registry_excludes_shared_expert_from_allocation():
+    model_name = "Qwen/Qwen3.5-35B-A3B"
+
+    assert NAME_TO_MODEL[model_name] == ModelType.QWEN35MOE
+
+    model_info = get_model_info(model_name)
+    assert model_info.num_layers == 40
+    assert model_info.num_routed_experts_per_layer == 256
+    assert model_info.num_shared_experts_per_layer == 1
+    assert model_info.num_experts_per_token == 8
+    assert model_info.num_allocatable_experts_per_layer == 256

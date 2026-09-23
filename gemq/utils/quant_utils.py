@@ -1,8 +1,5 @@
 import pickle
 
-from hqq.core.quantize import HQQLinear, BaseQuantizeConfig
-from hqq.core.quantize import Quantizer
-
 from gemq.utils.model_utils import *
 
 
@@ -37,6 +34,10 @@ def build_alloc_cfg(model, args, expert_bit_cfg=None):
             mtype = get_module_type(name, args.model_name)
             if mtype == LinearModuleType.ATTN:
                 layer_bit_cfg[name] = args.attn_wbits
+            elif mtype == LinearModuleType.LINEAR_ATTN:
+                layer_bit_cfg[name] = args.linear_attn_wbits
+            elif mtype == LinearModuleType.SOFTMAX_ATTN:
+                layer_bit_cfg[name] = args.softmax_attn_wbits
             elif mtype == LinearModuleType.GATE:
                 layer_bit_cfg[name] = args.gate_wbits
             elif mtype == LinearModuleType.DENSE:
@@ -54,6 +55,11 @@ def build_alloc_cfg(model, args, expert_bit_cfg=None):
                     layer_bit_cfg[name] = expert_bit
                 else:
                     layer_bit_cfg[name] = args.expert_wbits
+            else:
+                # Explicitly record the skip instead of leaving a hole in the
+                # mapping. Qwen3.5 has auxiliary linear-attention projections
+                # which are intentionally kept full precision.
+                layer_bit_cfg[name] = 16
         bit_cfg.append(layer_bit_cfg)
 
     return bit_cfg
@@ -67,6 +73,11 @@ def create_hqq_linear_from_quantized_weights(
 
     NOTE: We assume the grouped quantization is performed at hidden_dim (i.e., axis=1).
     """
+    # HQQ is required only by the opt-in real-quantization path. Keeping this
+    # import lazy lets the standard pseudo-quantized checkpoint path remain
+    # independent of HQQ/Transformers integration details.
+    from hqq.core.quantize import BaseQuantizeConfig, HQQLinear, Quantizer
+
     # create a dummy HQQLinear layer
     # skip initialization (HQQ quantization) by passing a None linear_layer
     quant_config = BaseQuantizeConfig(nbits, group_size)

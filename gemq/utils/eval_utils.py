@@ -6,7 +6,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
 
-from gemq.utils.model_utils import get_blocks, move_embed, move_head
+from gemq.utils.model_utils import (
+    ModelType,
+    NAME_TO_MODEL,
+    compute_decoder_inputs,
+    get_blocks,
+    move_embed,
+    move_head,
+    move_tree_to_device,
+)
+
+
+def _first_tensor(output):
+    return output[0] if isinstance(output, (tuple, list)) else output
 
 
 def get_testenc(tokenizer, dataset, seqlen):
@@ -64,39 +76,55 @@ def compute_perplexity_offload(model, model_name, input_ids, dataset_name):
     # retrieve blocks that require quantization
     layers = get_blocks(model, model_name)
 
-    # get input and kwargs to the first layer decoding layer
-    inps = []
-    layer_kwargs = {}
+    if NAME_TO_MODEL[model_name] == ModelType.QWEN35MOE:
+        batches = [
+            (
+                input_ids[
+                    :, (i * model.seqlen) : ((i + 1) * model.seqlen)
+                ],
+                None,
+            )
+            for i in range(nsamples)
+        ]
+        inps, layer_kwargs = compute_decoder_inputs(
+            model, batches, model_name, "cuda"
+        )
+    else:
+        # Preserve the legacy capture path byte-for-byte for existing models.
+        inps = []
+        layer_kwargs = {}
 
-    move_embed(model, model_name, "cuda")
-    layers[0] = layers[0].to("cuda")
-    
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
+        move_embed(model, model_name, "cuda")
+        layers[0] = layers[0].to("cuda")
 
-            if hasattr(self.module, "attention_type"):
-                self.attention_type = self.module.attention_type
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
 
-        def forward(self, inp, **kwargs):
-            inps.append(inp)  # NOTE: inp is (bsz, seqlen, hidden_size)
-            layer_kwargs.update(kwargs)
-            raise ValueError  # early exit to break later inference
+                if hasattr(self.module, "attention_type"):
+                    self.attention_type = self.module.attention_type
 
-    layers[0] = Catcher(layers[0])
-    for i in range(nsamples):
-        batch = input_ids[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to("cuda")
-        try:
-            model(batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module  # restore
-    inps = torch.cat(inps, dim=0)  # (nsamples, seqlen, hidden_size)
-    
+            def forward(self, inp, **kwargs):
+                inps.append(inp)
+                layer_kwargs.update(kwargs)
+                raise ValueError
+
+        layers[0] = Catcher(layers[0])
+        for i in range(nsamples):
+            batch = input_ids[
+                :, (i * model.seqlen) : ((i + 1) * model.seqlen)
+            ].to("cuda")
+            try:
+                model(batch)
+            except ValueError:
+                pass
+        layers[0] = layers[0].module
+        inps = torch.cat(inps, dim=0)
+        move_embed(model, model_name, "cpu")
+        layers[0] = layers[0].cpu()
+
     # for memory savings
-    move_embed(model, model_name, "cpu")
-    layers[0] = layers[0].cpu()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -105,8 +133,14 @@ def compute_perplexity_offload(model, model_name, input_ids, dataset_name):
     outs = torch.zeros_like(inps)
     for i in tqdm(range(len(layers)), desc=f"Evaluating [{dataset_name}]"):
         layer = layers[i].to("cuda")
+        current_layer_kwargs = move_tree_to_device(
+            layer_kwargs[i] if isinstance(layer_kwargs, list) else layer_kwargs,
+            torch.device("cuda"),
+        )
         for j in range(nsamples):
-            outs[j] = layer(inps[j: j+1], **layer_kwargs)[0]
+            outs[j] = _first_tensor(
+                layer(inps[j: j+1], **current_layer_kwargs)
+            )
         layers[i] = layer.cpu()
         gc.collect()
         torch.cuda.empty_cache()

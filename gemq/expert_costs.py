@@ -23,9 +23,17 @@ from gemq.quantizers.rtn import MCMoeRTNWeightQuantizer
 from gemq.utils.model_utils import (
     ModelType,
     NAME_TO_MODEL,
+    capture_qwen35_decoder_context,
     get_blocks,
     get_moe_block,
     move_embed,
+)
+from gemq.utils.qwen35 import (
+    clone_packed_expert_weights,
+    copy_packed_expert_weights_,
+    forward_packed_expert,
+    get_num_routed_experts,
+    install_rtn_packed_expert_,
 )
 
 
@@ -79,6 +87,11 @@ def _empty_cuda_cache(device: torch.device):
 @torch.inference_mode()
 def _capture_decoder_inputs(model, dataloader, model_name, device):
     """Capture first-layer inputs and kwargs, offloading every batch to CPU."""
+    if NAME_TO_MODEL[model_name] == ModelType.QWEN35MOE:
+        return capture_qwen35_decoder_context(
+            model, dataloader, model_name, device
+        )
+
     layers = get_blocks(model, model_name)
     hidden_batches = []
     positional_batches = []
@@ -95,6 +108,8 @@ def _capture_decoder_inputs(model, dataloader, model_name, device):
             # the per-layer attention mask.
             if hasattr(module, "attention_type"):
                 self.attention_type = module.attention_type
+            if hasattr(module, "layer_type"):
+                self.layer_type = module.layer_type
 
         def forward(self, hidden_states, *args, **kwargs):
             hidden_batches.append(_to_cpu(hidden_states))
@@ -126,9 +141,12 @@ def _capture_decoder_inputs(model, dataloader, model_name, device):
 
 
 def _qwen3_topk_routes(moe_block, hidden_states):
-    """Reproduce Qwen3-MoE's token-level router decision."""
+    """Reproduce Qwen3/Qwen3.5-MoE's token-level router decision."""
     flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
-    router_logits = moe_block.gate(flat_hidden)
+    router_output = moe_block.gate(flat_hidden)
+    if isinstance(router_output, (tuple, list)) and len(router_output) >= 3:
+        return router_output[2], router_output[1]
+    router_logits = router_output
     routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(
         routing_weights, moe_block.top_k, dim=-1
@@ -226,7 +244,18 @@ def _forward_layer_batches(
     return outputs
 
 
+class _PackedExpertHandle:
+    def __init__(self, moe_block, expert_idx):
+        self.moe_block = moe_block
+        self.expert_idx = expert_idx
+
+    def __call__(self, hidden_states):
+        return forward_packed_expert(self.moe_block, self.expert_idx, hidden_states)
+
+
 def _get_qwen3_expert(moe_block, expert_idx):
+    if hasattr(moe_block.experts, "gate_up_proj"):
+        return _PackedExpertHandle(moe_block, expert_idx)
     try:
         expert = moe_block.experts[expert_idx]
     except (AttributeError, IndexError, TypeError) as error:
@@ -245,6 +274,37 @@ def _get_qwen3_expert(moe_block, expert_idx):
 
 def _expert_linears(expert):
     return [getattr(expert, name) for name in _EXPERT_LINEAR_NAMES]
+
+
+def _snapshot_expert(expert):
+    if isinstance(expert, _PackedExpertHandle):
+        return clone_packed_expert_weights(expert.moe_block, expert.expert_idx)
+    linears = _expert_linears(expert)
+    return tuple(linear.weight.data for linear in linears)
+
+
+def _restore_expert(expert, original):
+    if isinstance(expert, _PackedExpertHandle):
+        copy_packed_expert_weights_(expert.moe_block, expert.expert_idx, original)
+    else:
+        _restore_weights(_expert_linears(expert), original)
+
+
+def _install_quantized_expert(expert, original, bit, blocksize):
+    if isinstance(expert, _PackedExpertHandle):
+        install_rtn_packed_expert_(
+            expert.moe_block, expert.expert_idx, original, bit, blocksize
+        )
+    else:
+        _install_quantized_weights(
+            _expert_linears(expert), original, bit, blocksize
+        )
+
+
+def _num_routed_experts(moe_block):
+    if hasattr(moe_block.experts, "gate_up_proj"):
+        return get_num_routed_experts(moe_block)
+    return int(moe_block.num_experts)
 
 
 def _restore_weights(linears, original_weights):
@@ -345,7 +405,7 @@ def _compute_layer_costs(
     expert_batch_size,
     device,
 ):
-    num_experts = moe_block.num_experts
+    num_experts = _num_routed_experts(moe_block)
     num_bits = len(candidate_bits)
     costs = torch.full((num_experts, num_bits), torch.nan, dtype=torch.float64)
     counts = torch.zeros(num_experts, dtype=torch.long)
@@ -355,8 +415,7 @@ def _compute_layer_costs(
         range(num_experts), desc="experts", leave=False, dynamic_ncols=True
     ):
         expert = _get_qwen3_expert(moe_block, expert_idx)
-        linears = _expert_linears(expert)
-        original_weights = tuple(linear.weight.data for linear in linears)
+        original_weights = _snapshot_expert(expert)
 
         active_inputs, active_gates = _collect_active_inputs(
             expert_idx,
@@ -370,8 +429,8 @@ def _compute_layer_costs(
             # In uniform mode we still quantize the expert so the subsequent full
             # layer forward represents an entirely uniform-bit MoE layer.
             if context_mode == "uniform_bit":
-                _install_quantized_weights(
-                    linears, original_weights, average_bits, blocksize
+                _install_quantized_expert(
+                    expert, original_weights, average_bits, blocksize
                 )
             continue
 
@@ -404,8 +463,8 @@ def _compute_layer_costs(
         keep_quantized = False
         try:
             for bit in nonzero_bits:
-                _install_quantized_weights(
-                    linears, original_weights, bit, blocksize
+                _install_quantized_expert(
+                    expert, original_weights, bit, blocksize
                 )
                 numerator = _weighted_deviation_sum(
                     expert,
@@ -423,10 +482,10 @@ def _compute_layer_costs(
                 if keep_this_bit:
                     keep_quantized = True
                 else:
-                    _restore_weights(linears, original_weights)
+                    _restore_expert(expert, original_weights)
         finally:
             if not keep_quantized:
-                _restore_weights(linears, original_weights)
+                _restore_expert(expert, original_weights)
 
         del active_inputs, active_gates, reference_outputs
 
@@ -446,9 +505,13 @@ def compute_qwen3_expert_costs(
     device="cuda",
 ):
     """Compute ``[layer, expert, candidate_bit]`` costs and active counts."""
-    if NAME_TO_MODEL.get(model_name) != ModelType.QWEN3MOE:
+    model_type = NAME_TO_MODEL.get(model_name)
+    if model_type not in {
+        ModelType.QWEN3MOE,
+        ModelType.QWEN35MOE,
+    }:
         raise NotImplementedError(
-            "The first expert-cost implementation supports Qwen3-MoE only; "
+            "Expert-cost collection supports Qwen3/Qwen3.5-MoE only; "
             f"got model_name={model_name!r}."
         )
     if context_mode not in {"fp", "uniform_bit"}:
@@ -486,7 +549,7 @@ def compute_qwen3_expert_costs(
 
     num_layers = len(layers)
     first_moe = get_moe_block(layers[0], model_name)
-    num_experts = first_moe.num_experts
+    num_experts = _num_routed_experts(first_moe)
     costs = torch.full(
         (num_layers, num_experts, len(candidate_bits)),
         torch.nan,
@@ -500,11 +563,23 @@ def compute_qwen3_expert_costs(
         ):
             layer = layers[layer_idx].to(device)
             moe_block = get_moe_block(layer, model_name)
-            if moe_block.num_experts != num_experts:
+            layer_num_experts = _num_routed_experts(moe_block)
+            if layer_num_experts != num_experts:
                 raise ValueError(
-                    f"Layer {layer_idx} has {moe_block.num_experts} experts; "
+                    f"Layer {layer_idx} has {layer_num_experts} experts; "
                     f"expected {num_experts}."
                 )
+
+            layer_positional_batches = (
+                positional_batches[layer_idx]
+                if model_type == ModelType.QWEN35MOE
+                else positional_batches
+            )
+            layer_keyword_batches = (
+                keyword_batches[layer_idx]
+                if model_type == ModelType.QWEN35MOE
+                else keyword_batches
+            )
 
             (
                 moe_input_batches,
@@ -515,8 +590,8 @@ def compute_qwen3_expert_costs(
                 layer,
                 moe_block,
                 hidden_batches,
-                positional_batches,
-                keyword_batches,
+                layer_positional_batches,
+                layer_keyword_batches,
                 device,
                 stop_at_moe=(context_mode == "uniform_bit"),
             )
@@ -545,8 +620,8 @@ def compute_qwen3_expert_costs(
                 hidden_batches = _forward_layer_batches(
                     layer,
                     hidden_batches,
-                    positional_batches,
-                    keyword_batches,
+                    layer_positional_batches,
+                    layer_keyword_batches,
                     device,
                 )
             else:

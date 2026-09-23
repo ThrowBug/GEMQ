@@ -11,13 +11,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+try:
+    from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+except ImportError:
+    MixtralSparseMoeBlock = ()
 
-from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
-from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2MoE
-from transformers.models.olmoe.modeling_olmoe import OlmoeSparseMoeBlock
-from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+try:
+    from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2MoE
+except ImportError:
+    try:
+        # Transformers 5 renamed this class without changing the model key.
+        from transformers.models.deepseek_v2.modeling_deepseek_v2 import (
+            DeepseekV2Moe as DeepseekV2MoE,
+        )
+    except ImportError:
+        DeepseekV2MoE = ()
+
+try:
+    from transformers.models.olmoe.modeling_olmoe import OlmoeSparseMoeBlock
+except ImportError:
+    OlmoeSparseMoeBlock = ()
+
+try:
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+        Qwen3MoeSparseMoeBlock,
+    )
+except ImportError:
+    Qwen3MoeSparseMoeBlock = ()
+
+try:
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
+        Qwen3_5MoeSparseMoeBlock,
+    )
+except ImportError:  # Keeps legacy environments able to import the Qwen3 code.
+    Qwen3_5MoeSparseMoeBlock = ()
 
 from accelerate import infer_auto_device_map, dispatch_model
 from accelerate.utils.modeling import get_balanced_memory
@@ -33,10 +60,13 @@ class ModelType(Enum):
     DEEPSEEKV2 = auto()
     OLMOE = auto()
     QWEN3MOE = auto()
+    QWEN35MOE = auto()
     
 
 class LinearModuleType(Enum):
     ATTN = auto()
+    LINEAR_ATTN = auto()
+    SOFTMAX_ATTN = auto()
     GATE = auto()
     EXPERT = auto()
     DENSE = auto()
@@ -53,6 +83,7 @@ NAME_TO_MODEL = {
     "allenai/OLMoE-1B-7B-0125-Instruct": ModelType.OLMOE,
     "Qwen/Qwen3-30B-A3B": ModelType.QWEN3MOE,
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelType.QWEN3MOE,
+    "Qwen/Qwen3.5-35B-A3B": ModelType.QWEN35MOE,
 }
 
 
@@ -63,6 +94,16 @@ class ModelInfo:
     num_routed_experts_per_layer: int
     num_shared_experts_per_layer: int
     num_experts_per_token: int
+    shared_experts_participate_in_allocation: bool = True
+
+    @property
+    def num_allocatable_experts_per_layer(self):
+        shared = (
+            self.num_shared_experts_per_layer
+            if self.shared_experts_participate_in_allocation
+            else 0
+        )
+        return self.num_routed_experts_per_layer + shared
 
 
 def _format_memory_size(num_bytes):
@@ -215,6 +256,7 @@ def dispatch_model_to_all_devices(model, cuda_diagnostics=False):
             "DeepseekV2DecoderLayer",
             "OlmoeDecoderLayer",
             "Qwen3MoeDecoderLayer",
+            "Qwen3_5MoeDecoderLayer",
         ],
         max_memory=get_balanced_memory(model),
     )
@@ -269,6 +311,15 @@ def get_model_info(model_name):
             num_shared_experts_per_layer=0,
             num_experts_per_token=8,
         )
+    elif model_type == ModelType.QWEN35MOE:
+        model_info = ModelInfo(
+            num_layers=40,
+            first_k_dense_layers=0,
+            num_routed_experts_per_layer=256,
+            num_shared_experts_per_layer=1,
+            num_experts_per_token=8,
+            shared_experts_participate_in_allocation=False,
+        )
     else:
         raise NotImplementedError(f"Model type {model_type} not supported for getting model info.")
 
@@ -282,7 +333,8 @@ def get_blocks(model, model_name):
     model_type = NAME_TO_MODEL[model_name]
     if model_type in (
         ModelType.LLAMA2, ModelType.QWEN3, 
-        ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE, ModelType.QWEN3MOE,
+        ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE,
+        ModelType.QWEN3MOE, ModelType.QWEN35MOE,
     ):
         blocks = model.model.layers
     else:
@@ -297,9 +349,15 @@ def move_embed(model, model_name, device):
     model_type = NAME_TO_MODEL[model_name]
     if model_type in (
         ModelType.LLAMA2, ModelType.QWEN3,
-        ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE, ModelType.QWEN3MOE,
+        ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE,
+        ModelType.QWEN3MOE, ModelType.QWEN35MOE,
     ):
         model.model.embed_tokens = model.model.embed_tokens.to(device)
+        if (
+            model_type == ModelType.QWEN35MOE
+            and hasattr(model.model, "rotary_emb")
+        ):
+            model.model.rotary_emb = model.model.rotary_emb.to(device)
 
 
 def move_head(model, model_name, device):
@@ -309,7 +367,8 @@ def move_head(model, model_name, device):
     model_type = NAME_TO_MODEL[model_name]
     if model_type in (
         ModelType.LLAMA2, ModelType.QWEN3,
-        ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE, ModelType.QWEN3MOE,
+        ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE,
+        ModelType.QWEN3MOE, ModelType.QWEN35MOE,
     ):
         model.model.norm = model.model.norm.to(device)
         model.lm_head = model.lm_head.to(device)
@@ -340,6 +399,8 @@ def get_moe_block(layer, model_name):
         moe_block = layer.mlp
     elif model_type == ModelType.QWEN3MOE:
         moe_block = layer.mlp
+    elif model_type == ModelType.QWEN35MOE:
+        moe_block = layer.mlp
     return moe_block
 
 
@@ -350,6 +411,8 @@ def get_shared_expert_block(moe_block, model_name):
     model_type = NAME_TO_MODEL[model_name]
     if model_type == ModelType.DEEPSEEKV2:
         shared_expert = moe_block.shared_experts
+    elif model_type == ModelType.QWEN35MOE:
+        shared_expert = moe_block.shared_expert
     else:
         raise NotImplementedError(f"Model type {model_type} does not have shared experts.")
     return shared_expert
@@ -362,7 +425,12 @@ def get_sublinear_names(model_name):
     model_type = NAME_TO_MODEL[model_name]
     if model_type == ModelType.MIXTRAL:
         sublinear_names = ["w1", "w2", "w3"]
-    elif model_type in (ModelType.DEEPSEEKV2, ModelType.OLMOE, ModelType.QWEN3MOE):
+    elif model_type in (
+        ModelType.DEEPSEEKV2,
+        ModelType.OLMOE,
+        ModelType.QWEN3MOE,
+        ModelType.QWEN35MOE,
+    ):
         sublinear_names = ["gate_proj", "up_proj", "down_proj"]
     
     return sublinear_names
@@ -428,6 +496,29 @@ def get_module_type(module_name, model_name):
         else:
             mtype = LinearModuleType.OTHERS
 
+    elif model_type == ModelType.QWEN35MOE:
+        if module_name in {"linear_attn.in_proj_qkv", "linear_attn.out_proj"}:
+            mtype = LinearModuleType.LINEAR_ATTN
+        elif module_name.startswith("linear_attn."):
+            # in_proj_z/in_proj_a/in_proj_b and any future auxiliary projections
+            # remain full precision by design.
+            mtype = LinearModuleType.OTHERS
+        elif module_name in {
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+        }:
+            mtype = LinearModuleType.SOFTMAX_ATTN
+        elif module_name.startswith("mlp.shared_expert."):
+            mtype = LinearModuleType.DENSE
+        elif module_name == "mlp.gate":
+            mtype = LinearModuleType.GATE
+        else:
+            # In particular, shared_expert_gate is deliberately kept at full
+            # precision and packed routed experts are handled outside this map.
+            mtype = LinearModuleType.OTHERS
+
     return mtype
 
 
@@ -458,6 +549,13 @@ def get_all_expert_names(model_name):
         all_expert_names = [f"mlp.experts.{i}" for i in range(model_info.num_routed_experts_per_layer)]
     elif model_type == ModelType.QWEN3MOE:
         all_expert_names = [f"mlp.experts.{i}" for i in range(model_info.num_routed_experts_per_layer)]
+    elif model_type == ModelType.QWEN35MOE:
+        # These are logical names. Transformers stores their weights in packed
+        # tensors rather than actual child modules.
+        all_expert_names = [
+            f"mlp.experts.{i}"
+            for i in range(model_info.num_routed_experts_per_layer)
+        ]
 
     return all_expert_names
 
@@ -508,11 +606,135 @@ def extract_router_logits(router_output):
     raise TypeError(f"Could not extract router logits from output type {type(router_output)!r}.")
 
 
+class _Qwen35DecoderContextCaptured(RuntimeError):
+    pass
+
+
+def _tree_to_cpu(value):
+    if torch.is_tensor(value):
+        return value.detach().to("cpu")
+    if isinstance(value, tuple):
+        return tuple(_tree_to_cpu(item) for item in value)
+    if isinstance(value, list):
+        return [_tree_to_cpu(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _tree_to_cpu(item) for key, item in value.items()}
+    return value
+
+
+def move_tree_to_device(value, device):
+    """Move tensors nested in decoder arguments without changing structure."""
+    if torch.is_tensor(value):
+        return value.to(device=device, non_blocking=True)
+    if isinstance(value, tuple):
+        return tuple(move_tree_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [move_tree_to_device(item, device) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: move_tree_to_device(item, device) for key, item in value.items()
+        }
+    return value
+
+
+@torch.inference_mode()
+def capture_qwen35_decoder_context(model, batches, model_name, device="cuda"):
+    """Capture text inputs and the per-layer masks built by the HF model.
+
+    Qwen3.5 alternates linear and full attention, so a single kwargs dictionary
+    cannot be shared by every layer. All decoder layers are temporarily replaced
+    by identity recorders; this lets the text model build the authoritative mask
+    for each layer without loading the vision tower or executing decoder weights.
+    """
+    if NAME_TO_MODEL[model_name] != ModelType.QWEN35MOE:
+        raise ValueError("Per-layer decoder-context capture is Qwen3.5-specific.")
+    layers = get_blocks(model, model_name)
+    originals = list(layers)
+    hidden_batches = []
+    positional_templates = [None for _ in originals]
+    keyword_templates = [None for _ in originals]
+    context_by_layer_type = {}
+
+    class Recorder(nn.Module):
+        def __init__(self, module, layer_idx):
+            super().__init__()
+            self.layer_idx = layer_idx
+            for attribute in ("layer_type", "attention_type"):
+                if hasattr(module, attribute):
+                    setattr(self, attribute, getattr(module, attribute))
+
+        def forward(self, hidden_states, *args, **kwargs):
+            if self.layer_idx == 0:
+                hidden_batches.append(_tree_to_cpu(hidden_states))
+            # For fixed-length text calibration, Transformers passes identical
+            # positions/cache arguments to every layer and one mask per attention
+            # type. Keep just the first CPU copy for each type; copying rotary
+            # embeddings and a 2048x2048 causal mask for every sample/layer would
+            # otherwise consume many gigabytes of host memory.
+            context_key = getattr(self, "layer_type", self.layer_idx)
+            if context_key not in context_by_layer_type:
+                context_by_layer_type[context_key] = (
+                    _tree_to_cpu(args),
+                    _tree_to_cpu(kwargs),
+                )
+            positional_templates[self.layer_idx], keyword_templates[self.layer_idx] = (
+                context_by_layer_type[context_key]
+            )
+            if self.layer_idx == len(originals) - 1:
+                raise _Qwen35DecoderContextCaptured
+            return hidden_states
+
+    move_embed(model, model_name, device)
+    try:
+        for layer_idx, module in enumerate(originals):
+            layers[layer_idx] = Recorder(module, layer_idx)
+        for batch in batches:
+            input_ids = batch[0] if isinstance(batch, (tuple, list)) else batch
+            try:
+                model(input_ids.to(device=device, non_blocking=True))
+            except _Qwen35DecoderContextCaptured:
+                pass
+    finally:
+        for layer_idx, module in enumerate(originals):
+            layers[layer_idx] = module
+        move_embed(model, model_name, "cpu")
+
+    expected = len(hidden_batches)
+    if expected == 0:
+        raise ValueError("The calibration loader did not produce any batches.")
+    for layer_idx in range(len(originals)):
+        if (
+            positional_templates[layer_idx] is None
+            or keyword_templates[layer_idx] is None
+        ):
+            raise RuntimeError(
+                f"Incomplete Qwen3.5 decoder context for layer {layer_idx}."
+            )
+    positional_by_layer = [
+        [template] * expected for template in positional_templates
+    ]
+    keyword_by_layer = [[template] * expected for template in keyword_templates]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return hidden_batches, positional_by_layer, keyword_by_layer
+
+
 def compute_decoder_inputs(model, dataloader, model_name, device="cuda"):
     """
     Prepare input data for the first decoder block, and shared kwargs for all blocks.
     """
     layers = get_blocks(model, model_name)
+    if NAME_TO_MODEL[model_name] == ModelType.QWEN35MOE:
+        hidden, positional, keywords = capture_qwen35_decoder_context(
+            model, dataloader, model_name, device
+        )
+        if any(any(args for args in layer_args) for layer_args in positional):
+            raise RuntimeError("Unexpected positional decoder arguments for Qwen3.5.")
+        # Calibration batches have a fixed shape, so masks/positions are equal in
+        # shape and semantics. Keep one kwargs dictionary per decoder layer.
+        layer_kwargs = [layer_keywords[0] for layer_keywords in keywords]
+        return torch.cat(hidden, dim=0), layer_kwargs
 
     # get input and kwargs to the first layer decoding layer
     # NOTE: kwargs are shared across all layers
@@ -530,6 +752,8 @@ def compute_decoder_inputs(model, dataloader, model_name, device="cuda"):
             # NOTE: ad-hoc for Qwen3
             if hasattr(self.module, "attention_type"):
                 self.attention_type = self.module.attention_type
+            if hasattr(self.module, "layer_type"):
+                self.layer_type = self.module.layer_type
 
         def forward(self, inp, **kwargs):
             inps.append(inp)  # NOTE: inp is (bsz, seqlen, hidden_size)
@@ -700,6 +924,27 @@ def compute_gate_stats_hook_qwen3moe(m, x, y, inps, outs, weights, counts):
     outs.append(y[0])  # (bsz, seqlen, hidden_size)
 
 
+def compute_gate_stats_hook_qwen35moe(m, x, y, inps, outs, weights, counts):
+    if Qwen3_5MoeSparseMoeBlock and not isinstance(m, Qwen3_5MoeSparseMoeBlock):
+        raise TypeError(f"Expected Qwen3_5MoeSparseMoeBlock, got {type(m)!r}.")
+    from gemq.utils.qwen35 import qwen35_topk_routes
+
+    selected_experts, routing_weights = qwen35_topk_routes(m, x[0])
+    num_experts = int(m.experts.num_experts)
+    actw = torch.zeros(num_experts, device=routing_weights.device)
+    actw.scatter_add_(0, selected_experts.reshape(-1), routing_weights.reshape(-1))
+    actc = torch.zeros(num_experts, dtype=torch.long, device=routing_weights.device)
+    actc.scatter_add_(
+        0,
+        selected_experts.reshape(-1),
+        torch.ones_like(selected_experts.reshape(-1)),
+    )
+    weights.append(actw.to("cpu"))
+    counts.append(actc.to("cpu"))
+    inps.append(x[0])
+    outs.append(y[0] if isinstance(y, (tuple, list)) else y)
+
+
 def get_gate_stats_hook_fn(model_name):
     """
     Get the appropriate hook function for computing router statistics based on model type.
@@ -713,6 +958,8 @@ def get_gate_stats_hook_fn(model_name):
         hook_fn = compute_gate_stats_hook_olmoe
     elif model_type == ModelType.QWEN3MOE:
         hook_fn = compute_gate_stats_hook_qwen3moe
+    elif model_type == ModelType.QWEN35MOE:
+        hook_fn = compute_gate_stats_hook_qwen35moe
     else:
         raise NotImplementedError(f"Model type {model_type} not supported for gate stats computation.")
 

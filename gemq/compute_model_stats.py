@@ -18,8 +18,76 @@ from gemq.utils.data_utils import get_calib_loader
 from gemq.utils.model_utils import *
 from gemq.quantizers.rtn import MCMoeRTNWeightQuantizer
 from gemq.utils.hf_loading import align_deepseek_softmax_scale
+from gemq.utils.qwen35 import (
+    clone_packed_expert_weights,
+    copy_packed_expert_weights_,
+    get_num_routed_experts,
+    install_rtn_packed_expert_,
+)
 
 logging.set_verbosity_error()
+
+
+def _first_tensor(output):
+    return output[0] if isinstance(output, (tuple, list)) else output
+
+
+@torch.inference_mode()
+def _compute_qwen35_mcmoe_losses(
+    moe_block, block_inps, block_outs, bit_cfg, blocksize
+):
+    """Source-faithful PMQ perturbations for packed routed experts only."""
+    layer_quant_loss = defaultdict(dict)
+    for expert_idx in range(get_num_routed_experts(moe_block)):
+        original = clone_packed_expert_weights(moe_block, expert_idx)
+        try:
+            for bit in bit_cfg:
+                install_rtn_packed_expert_(
+                    moe_block, expert_idx, original, bit, blocksize
+                )
+                loss = 0.0
+                for block_input, block_output in zip(block_inps, block_outs):
+                    quant_output = _first_tensor(moe_block(block_input))
+                    loss += torch.norm(
+                        block_output.double() - quant_output.double()
+                    ).item()
+                layer_quant_loss[expert_idx][bit] = loss
+                copy_packed_expert_weights_(moe_block, expert_idx, original)
+        finally:
+            copy_packed_expert_weights_(moe_block, expert_idx, original)
+    return layer_quant_loss
+
+
+@torch.inference_mode()
+def _compute_qwen35_layer_re_losses(
+    moe_block,
+    block_inps,
+    block_outs,
+    layer_sq_grads,
+    bit_cfg,
+    blocksize,
+    forward_batch_size,
+):
+    layer_quant_loss = defaultdict(dict)
+    num_samples = block_inps.shape[0]
+    for expert_idx in range(get_num_routed_experts(moe_block)):
+        original = clone_packed_expert_weights(moe_block, expert_idx)
+        try:
+            for bit in bit_cfg:
+                install_rtn_packed_expert_(
+                    moe_block, expert_idx, original, bit, blocksize
+                )
+                loss = 0.0
+                for start in range(0, num_samples, forward_batch_size):
+                    end = min(start + forward_batch_size, num_samples)
+                    quant_output = _first_tensor(moe_block(block_inps[start:end]))
+                    delta = block_outs[start:end].double() - quant_output.double()
+                    loss += (layer_sq_grads[start:end] * delta.pow(2)).sum().item()
+                layer_quant_loss[expert_idx][bit] = loss
+                copy_packed_expert_weights_(moe_block, expert_idx, original)
+        finally:
+            copy_packed_expert_weights_(moe_block, expert_idx, original)
+    return layer_quant_loss
 
 
 def get_inout_hook(m, x, y, inps, outs):
@@ -52,36 +120,55 @@ def get_stats(model, enc, args):
     # retrieve blocks that require quantization
     layers = get_blocks(model, model_name)
 
-    # get input and kwargs to the first layer decoding layer
-    inps = []
-    layer_kwargs = {}
+    # Qwen3.5 constructs a different mask for linear- and full-attention
+    # decoder layers. Capture one authoritative kwargs dictionary per layer.
+    if model_type == ModelType.QWEN35MOE:
+        hidden_batches, positional_batches, keyword_batches = (
+            capture_qwen35_decoder_context(
+                model,
+                [enc[i] for i in range(num_batches)],
+                model_name,
+                "cuda",
+            )
+        )
+        if any(any(args for args in layer_args) for layer_args in positional_batches):
+            raise RuntimeError("Unexpected positional decoder arguments for Qwen3.5.")
+        inps = torch.stack(hidden_batches, dim=0)
+        layer_kwargs = [items[0] for items in keyword_batches]
+    else:
+        inps = []
+        layer_kwargs = {}
 
-    move_embed(model, model_name, "cuda")
-    layers[0] = layers[0].to("cuda")
-    
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
+        move_embed(model, model_name, "cuda")
+        layers[0] = layers[0].to("cuda")
 
-        def forward(self, inp, **kwargs):
-            inps.append(inp)  # NOTE: inp is (bsz, seqlen, hidden_size)
-            layer_kwargs.update(kwargs)
-            raise ValueError  # early exit to break later inference
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+                if hasattr(module, "layer_type"):
+                    self.layer_type = module.layer_type
+                if hasattr(module, "attention_type"):
+                    self.attention_type = module.attention_type
 
-    layers[0] = Catcher(layers[0])
-    for i in range(num_batches):
-        batch = enc[i].to("cuda")  # (bsz, seqlen)
-        try:
-            model(batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module  # restore
-    inps = torch.stack(inps, dim=0)  # (num_batches, bsz, seqlen, hidden_size)
-    
+            def forward(self, inp, **kwargs):
+                inps.append(inp)
+                layer_kwargs.update(kwargs)
+                raise ValueError
+
+        layers[0] = Catcher(layers[0])
+        for i in range(num_batches):
+            batch = enc[i].to("cuda")
+            try:
+                model(batch)
+            except ValueError:
+                pass
+        layers[0] = layers[0].module
+        inps = torch.stack(inps, dim=0)
+        move_embed(model, model_name, "cpu")
+        layers[0] = layers[0].cpu()
+
     # for memory savings
-    move_embed(model, model_name, "cpu")
-    layers[0] = layers[0].cpu()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -90,13 +177,17 @@ def get_stats(model, enc, args):
     act_weights, act_counts, quant_loss = {}, {}, {}
     for i in tqdm(range(len(layers)), desc="Computing stats"):
         layer = layers[i].to("cuda")
+        current_layer_kwargs = move_tree_to_device(
+            layer_kwargs[i] if isinstance(layer_kwargs, list) else layer_kwargs,
+            torch.device("cuda"),
+        )
 
         # NOTE: we skip computing stats for the first dense layer of deepseekv2
         if model_type == ModelType.DEEPSEEKV2 and i == 0:
             
             # still need to forward it to get inputs for the next layer
             for j in range(num_batches):
-                outs[j] = layer(inps[j], **layer_kwargs)[0]  # (bsz, seqlen, hidden_size)
+                outs[j] = _first_tensor(layer(inps[j], **current_layer_kwargs))
             layers[i] = layer.to("cpu")
             gc.collect()
             torch.cuda.empty_cache()
@@ -115,11 +206,22 @@ def get_stats(model, enc, args):
             partial(gate_stats_hook_fn, inps=block_inps, outs=block_outs, weights=_weights, counts=_counts)
         )
         for j in range(num_batches):
-            outs[j] = layer(inps[j], **layer_kwargs)[0]  # (bsz, seqlen, hidden_size)
+            outs[j] = _first_tensor(layer(inps[j], **current_layer_kwargs))
         act_weights[i] = sum(_weights)  # (num_routed_experts + 1 if has_shared_expert else 0,)
         act_counts[i] = sum(_counts)    # (num_routed_experts + 1 if has_shared_expert else 0,)
         # remove hook
         handle.remove()
+
+        if model_type == ModelType.QWEN35MOE:
+            bit_cfg = list(map(int, args.wbits.split(",")))
+            quant_loss[i] = _compute_qwen35_mcmoe_losses(
+                moe_block, block_inps, block_outs, bit_cfg, args.blocksize
+            )
+            layers[i] = layer.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            inps, outs = outs, inps
+            continue
 
         # compute expert quantization errors
         bit_cfg = list(map(int, args.wbits.split(",")))  # e.g., [1, 2, 3]
@@ -232,7 +334,12 @@ def compute_layer_grads(model, dataloader, args):
     model.config.use_cache = False
 
     # NOTE: disable aux loss
-    model.config.alpha = 0.0
+    if hasattr(model.config, "alpha"):
+        model.config.alpha = 0.0
+    if hasattr(model.config, "router_aux_loss_coef"):
+        model.config.router_aux_loss_coef = 0.0
+    if hasattr(model, "router_aux_loss_coef"):
+        model.router_aux_loss_coef = 0.0
 
     # register hooks to get activation gradients
     layer_output_grads = defaultdict(list)
@@ -313,36 +420,56 @@ def compute_faster_layer_re(model, dataloader, args):
     # retrieve decoder blocks
     layers = get_blocks(model, model_name)
 
-    # get input and kwargs to the first layer decoding layer
-    inps = []
-    layer_kwargs = {}
+    # Capture the first-layer activations. Qwen3.5 additionally needs the
+    # per-layer masks produced by the model because attention types alternate.
+    if model_type == ModelType.QWEN35MOE:
+        calibration_batches = [
+            enc[start:start + fwd_bsz, 0]
+            for start in range(0, num_samples, fwd_bsz)
+        ]
+        hidden_batches, positional_batches, keyword_batches = (
+            capture_qwen35_decoder_context(
+                model, calibration_batches, model_name, "cuda"
+            )
+        )
+        if any(any(args for args in layer_args) for layer_args in positional_batches):
+            raise RuntimeError("Unexpected positional decoder arguments for Qwen3.5.")
+        inps = torch.cat(hidden_batches, dim=0)
+        layer_kwargs = [items[0] for items in keyword_batches]
+    else:
+        inps = []
+        layer_kwargs = {}
 
-    move_embed(model, model_name, "cuda")
-    layers[0] = layers[0].to("cuda")
-    
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
+        move_embed(model, model_name, "cuda")
+        layers[0] = layers[0].to("cuda")
 
-        def forward(self, inp, **kwargs):
-            inps.append(inp)  # NOTE: inp is (bsz, seqlen, hidden_size)
-            layer_kwargs.update(kwargs)
-            raise ValueError  # early exit to break later inference
+        class Catcher(nn.Module):
+            def __init__(self, module):
+                super().__init__()
+                self.module = module
+                if hasattr(module, "layer_type"):
+                    self.layer_type = module.layer_type
+                if hasattr(module, "attention_type"):
+                    self.attention_type = module.attention_type
 
-    layers[0] = Catcher(layers[0])
-    for i in range(num_samples // fwd_bsz):
-        batch = enc[i * fwd_bsz:(i + 1) * fwd_bsz, 0].to("cuda")  # (bsz, seqlen)
-        try:
-            model(batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module  # restore
-    inps = torch.cat(inps, dim=0)  # (num_samples, seqlen, hidden_size)
-    
+            def forward(self, inp, **kwargs):
+                inps.append(inp)
+                layer_kwargs.update(kwargs)
+                raise ValueError
+
+        layers[0] = Catcher(layers[0])
+        for i in range(num_samples // fwd_bsz):
+            batch = enc[i * fwd_bsz:(i + 1) * fwd_bsz, 0].to("cuda")
+            try:
+                model(batch)
+            except ValueError:
+                pass
+        layers[0] = layers[0].module
+        inps = torch.cat(inps, dim=0)
+        move_embed(model, model_name, "cpu")
+        layers[0] = layers[0].cpu()
+
     # for memory savings
-    move_embed(model, model_name, "cpu")
-    layers[0] = layers[0].cpu()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -352,12 +479,21 @@ def compute_faster_layer_re(model, dataloader, args):
     outs = torch.zeros_like(inps)
     for i in tqdm(range(len(layers)), desc="Computing rec errors"):
         layer = layers[i].to("cuda")
+        current_layer_kwargs = move_tree_to_device(
+            layer_kwargs[i] if isinstance(layer_kwargs, list) else layer_kwargs,
+            torch.device("cuda"),
+        )
 
         # NOTE: we skip computing stats for the first dense layer of deepseekv2
         if model_type == ModelType.DEEPSEEKV2 and i == 0:
             # still need to forward it to get inputs for the next layer
             for j in range(num_samples // fwd_bsz):
-                outs[j * fwd_bsz:(j + 1) * fwd_bsz] = layer(inps[j * fwd_bsz:(j + 1) * fwd_bsz], **layer_kwargs)[0]  # (bsz, seqlen, hidden_size)
+                outs[j * fwd_bsz:(j + 1) * fwd_bsz] = _first_tensor(
+                    layer(
+                        inps[j * fwd_bsz:(j + 1) * fwd_bsz],
+                        **current_layer_kwargs,
+                    )
+                )
             layers[i] = layer.to("cpu")
             gc.collect()
             torch.cuda.empty_cache()
@@ -372,10 +508,35 @@ def compute_faster_layer_re(model, dataloader, args):
         block_inps, block_outs = [], []
         handle = moe_block.register_forward_hook(partial(get_inout_hook, inps=block_inps, outs=block_outs))
         for j in range(num_samples // fwd_bsz):
-            outs[j * fwd_bsz:(j + 1) * fwd_bsz] = layer(inps[j * fwd_bsz:(j + 1) * fwd_bsz], **layer_kwargs)[0]  # (bsz, seqlen, hidden_size)
+            outs[j * fwd_bsz:(j + 1) * fwd_bsz] = _first_tensor(
+                layer(
+                    inps[j * fwd_bsz:(j + 1) * fwd_bsz],
+                    **current_layer_kwargs,
+                )
+            )
         block_inps = torch.cat(block_inps, dim=0)  # (num_samples, seqlen, hidden_size)
         block_outs = torch.cat(block_outs, dim=0)  # (num_samples, seqlen, hidden_size)
         handle.remove()
+
+        if model_type == ModelType.QWEN35MOE:
+            bit_cfg = list(map(int, args.wbits.split(",")))
+            layer_sq_grads = (
+                layer_output_grads[i].squeeze(1).double().pow(2).to("cuda")
+            )
+            quant_loss[i] = _compute_qwen35_layer_re_losses(
+                moe_block,
+                block_inps,
+                block_outs,
+                layer_sq_grads,
+                bit_cfg,
+                args.blocksize,
+                fwd_bsz,
+            )
+            inps, outs = outs, inps
+            layers[i] = layer.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            continue
 
         # compute expert quantization errors
         bit_cfg = list(map(int, args.wbits.split(",")))  # e.g., [1, 2, 3]

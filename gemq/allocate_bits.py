@@ -62,10 +62,14 @@ def parse_bit_candidates(value):
 def compute_total_bits(model_name, bpe, bit_cands):
     """Compute the legacy Layer-RE global budget, including shared experts."""
     m = get_model_info(model_name)
-    bpl = (
-        bpe * (m.num_routed_experts_per_layer + m.num_shared_experts_per_layer)
-        - (max(0, m.num_shared_experts_per_layer - 1)) * max(bit_cands)
-    )
+    if not m.shared_experts_participate_in_allocation:
+        bpl = bpe * m.num_allocatable_experts_per_layer
+    else:
+        # Preserve the historical GEMQ budget convention for existing models.
+        bpl = (
+            bpe * (m.num_routed_experts_per_layer + m.num_shared_experts_per_layer)
+            - (max(0, m.num_shared_experts_per_layer - 1)) * max(bit_cands)
+        )
     return math.floor(bpl * (m.num_layers - m.first_k_dense_layers) + 1e-12)
 
 
