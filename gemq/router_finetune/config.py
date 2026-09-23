@@ -30,6 +30,10 @@ RFT_TRAINERS = (
     "router_compensated_dual_norm_distill",
     "layerwise_teacher",
 )
+QWEN35_RFT_TRAINERS = (
+    "dual_norm_distill",
+    "router_compensated_dual_norm_distill",
+)
 
 
 @dataclass(frozen=True)

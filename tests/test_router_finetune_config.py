@@ -5,6 +5,7 @@ import pytest
 from gemq.router_finetune.config import (
     DistillCEConfig,
     NORM_DISTILL_MODES,
+    QWEN35_RFT_TRAINERS,
     RFT_TRAINERS,
     RouterFinetuneConfig,
 )
@@ -100,6 +101,13 @@ def test_norm_distill_modes_are_two_independent_options():
             "router_compensated": True,
         },
     }
+
+
+def test_qwen35_exposes_only_the_two_dual_norm_trainers():
+    assert QWEN35_RFT_TRAINERS == (
+        "dual_norm_distill",
+        "router_compensated_dual_norm_distill",
+    )
 
 
 def test_distill_ce_does_not_validate_layerwise_loss_arguments():

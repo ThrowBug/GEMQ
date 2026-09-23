@@ -27,6 +27,8 @@ def _args(**overrides):
         "quantizer": "gptq",
         "reproduce_mcmoe": False,
         "attn_wbits": 4,
+        "linear_attn_wbits": 4,
+        "softmax_attn_wbits": 4,
         "gate_wbits": 16,
         "dense_wbits": 4,
         "expert_wbits": 2,
@@ -100,3 +102,17 @@ def test_checkpoint_load_validates_identity_and_completion(tmp_path):
     (checkpoint / SUCCESS_FILENAME).unlink()
     with pytest.raises(RuntimeError, match="incomplete"):
         load_gptq_checkpoint_metadata(checkpoint, identity)
+
+
+def test_checkpoint_identity_tracks_qwen35_attention_bitwidths():
+    input_ids = torch.arange(12).reshape(2, 6)
+    baseline = build_gptq_checkpoint_identity(_args(), input_ids, None)
+    changed_linear = build_gptq_checkpoint_identity(
+        _args(linear_attn_wbits=3), input_ids, None
+    )
+    changed_softmax = build_gptq_checkpoint_identity(
+        _args(softmax_attn_wbits=3), input_ids, None
+    )
+
+    assert baseline != changed_linear
+    assert baseline != changed_softmax

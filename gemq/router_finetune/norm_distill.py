@@ -5,7 +5,12 @@ import time
 import torch
 
 from gemq.router_finetune.losses import compute_causal_output_distill_ce
-from gemq.utils.model_utils import get_blocks, get_router_module
+from gemq.utils.model_utils import (
+    NAME_TO_MODEL,
+    ModelType,
+    get_blocks,
+    get_router_module,
+)
 
 
 class NormScale:
@@ -44,6 +49,32 @@ class NormScale:
         if not torch.isfinite(realized_scale).all() or not (realized_scale > 0).all():
             raise FloatingPointError("The learned norm scale cannot be folded safely.")
         self.norm.weight.copy_(new_norm)
+        return realized_scale
+
+
+class ZeroCenteredNormScale(NormScale):
+    """Fold a channel scale into a zero-centered RMSNorm parameter.
+
+    Qwen3.5 stores ``weight = gamma - 1`` and applies ``gamma = 1 + weight``
+    in the forward pass.  Multiplying the stored parameter directly would lose
+    the learned scale, especially for the zero initialization used by the model.
+    """
+
+    @torch.no_grad()
+    def fold(self):
+        old_weight = self.norm.weight.detach().clone()
+        old_gain = old_weight.float().add(1.0)
+        new_weight = (old_gain * self.delta.exp() - 1.0).to(old_weight.dtype)
+        new_gain = new_weight.float().add(1.0)
+
+        realized_scale = torch.ones_like(self.delta)
+        nonzero = old_gain.ne(0)
+        realized_scale[nonzero] = new_gain[nonzero] / old_gain[nonzero]
+        if not torch.isfinite(realized_scale).all() or not (realized_scale > 0).all():
+            raise FloatingPointError(
+                "The learned zero-centered norm scale cannot be folded safely."
+            )
+        self.norm.weight.copy_(new_weight)
         return realized_scale
 
 
@@ -100,6 +131,97 @@ class RouterCompensatedNorm(NormScale):
         return realized_scale
 
 
+class Qwen35RouterCompensatedNorm(ZeroCenteredNormScale):
+    """Scale a Qwen3.5 MoE input while preserving both gating functions."""
+
+    def __init__(self, layer, model_name):
+        super().__init__(layer.post_attention_layernorm)
+        _, self.router = get_router_module(layer, model_name)
+        try:
+            self.shared_expert_gate = layer.mlp.shared_expert_gate
+        except AttributeError as exc:
+            raise ValueError(
+                "Qwen3.5 router compensation requires layer.mlp.shared_expert_gate."
+            ) from exc
+
+        width = self.norm.weight.numel()
+        for label, gate in (
+            ("router", self.router),
+            ("shared-expert gate", self.shared_expert_gate),
+        ):
+            if gate.weight.shape[1] != width:
+                raise ValueError(
+                    f"Qwen3.5 {label} input width differs from post-attention "
+                    "norm width."
+                )
+            if gate.weight.device != self.norm.weight.device:
+                raise ValueError(
+                    f"Qwen3.5 {label} and post-attention norm must be on the "
+                    "same device."
+                )
+
+        self._gate_hooks = []
+        self._unscaled = None
+        self._pending_consumers = set()
+
+    def install(self):
+        expected_consumers = {"router", "shared_expert_gate"}
+
+        def scale_norm(_module, _inputs, output):
+            if self._unscaled is not None or self._pending_consumers:
+                raise RuntimeError(
+                    "Qwen3.5 norm ran again before both gates consumed its output."
+                )
+            self._unscaled = output
+            self._pending_consumers = set(expected_consumers)
+            return (output.float() * self.delta.exp()).to(output.dtype)
+
+        def restore_gate_input(label):
+            def restore(_module, inputs):
+                if self._unscaled is None or label not in self._pending_consumers:
+                    raise RuntimeError(
+                        f"Qwen3.5 {label} ran without a matching norm output."
+                    )
+                unscaled = self._unscaled
+                if inputs[0].numel() != unscaled.numel():
+                    raise RuntimeError(
+                        f"Qwen3.5 {label} input shape is incompatible with the "
+                        "norm output."
+                    )
+                self._pending_consumers.remove(label)
+                if not self._pending_consumers:
+                    self._unscaled = None
+                return (unscaled.reshape_as(inputs[0]), *inputs[1:])
+
+            return restore
+
+        self._norm_hook = self.norm.register_forward_hook(scale_norm)
+        self._gate_hooks = [
+            self.router.register_forward_pre_hook(restore_gate_input("router")),
+            self.shared_expert_gate.register_forward_pre_hook(
+                restore_gate_input("shared_expert_gate")
+            ),
+        ]
+
+    def remove(self):
+        for hook in self._gate_hooks:
+            hook.remove()
+        self._gate_hooks = []
+        super().remove()
+        self._unscaled = None
+        self._pending_consumers.clear()
+
+    @torch.no_grad()
+    def fold(self):
+        realized_scale = super().fold()
+        inverse_scale = realized_scale.reciprocal().unsqueeze(0)
+        for gate in (self.router, self.shared_expert_gate):
+            gate.weight.copy_(
+                (gate.weight.float() * inverse_scale).to(gate.weight.dtype)
+            )
+        return realized_scale
+
+
 def _print_scale_summary(label, learned_scales, realized_scales):
     learned = torch.cat(
         [scale.detach().float().reshape(-1).cpu() for scale in learned_scales]
@@ -147,17 +269,31 @@ def finetune_norms_distill_ce(
             f"Teacher cache has {input_ids.shape[0]} samples, but --nsamples={args.nsamples}."
         )
 
+    model_type = NAME_TO_MODEL[args.model_name]
+    zero_centered = model_type == ModelType.QWEN35MOE
     controllers = []
     controller_groups = {"input": [], "post": []}
     for layer in get_blocks(model, args.model_name):
         if optimize_input_norm:
-            input_controller = NormScale(layer.input_layernorm)
+            input_controller = (
+                ZeroCenteredNormScale(layer.input_layernorm)
+                if zero_centered
+                else NormScale(layer.input_layernorm)
+            )
             controllers.append(input_controller)
             controller_groups["input"].append(input_controller)
         if router_compensated:
-            post_controller = RouterCompensatedNorm(layer, args.model_name)
+            post_controller = (
+                Qwen35RouterCompensatedNorm(layer, args.model_name)
+                if zero_centered
+                else RouterCompensatedNorm(layer, args.model_name)
+            )
         else:
-            post_controller = NormScale(layer.post_attention_layernorm)
+            post_controller = (
+                ZeroCenteredNormScale(layer.post_attention_layernorm)
+                if zero_centered
+                else NormScale(layer.post_attention_layernorm)
+            )
         controllers.append(post_controller)
         controller_groups["post"].append(post_controller)
     for controller in controllers:

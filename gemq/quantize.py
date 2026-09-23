@@ -27,6 +27,7 @@ from gemq.utils.hf_loading import load_causal_lm_checkpoint
 from gemq.router_finetune.config import (
     DistillCEConfig,
     NORM_DISTILL_MODES,
+    QWEN35_RFT_TRAINERS,
     RFT_TIMINGS,
     RFT_TRAINERS,
     ROUTER_LOSS_TYPES,
@@ -883,10 +884,14 @@ if __name__ == "__main__":
             raise ValueError(
                 "Qwen3.5 support is pseudo-quantization only; disable --real_quant."
             )
-        if args.finetune_routers:
+        if (
+            args.finetune_routers
+            and args.rft_trainer not in QWEN35_RFT_TRAINERS
+        ):
             raise ValueError(
-                "Qwen3.5 router/norm fine-tuning is outside this implementation; "
-                "disable --finetune_routers."
+                "Qwen3.5 fine-tuning supports only: "
+                + ", ".join(QWEN35_RFT_TRAINERS)
+                + f"; got {args.rft_trainer!r}."
             )
         if args.gate_wbits != 16:
             raise ValueError("Qwen3.5 routers must remain full precision (gate_wbits=16).")

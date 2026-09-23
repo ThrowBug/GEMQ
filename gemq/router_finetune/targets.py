@@ -13,6 +13,7 @@ from gemq.utils.model_utils import (
     extract_router_logits,
     get_blocks,
     get_router_module,
+    move_tree_to_device,
 )
 
 
@@ -289,6 +290,14 @@ def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, 
     for layer_idx, layer in enumerate(layers):
         layer = layer.to("cuda")
         layers[layer_idx] = layer
+        current_layer_kwargs = (
+            layer_kwargs[layer_idx]
+            if isinstance(layer_kwargs, list)
+            else layer_kwargs
+        )
+        current_layer_kwargs = move_tree_to_device(
+            current_layer_kwargs, torch.device("cuda")
+        )
         captured = []
         handle = None
         if config.needs_router_targets:
@@ -300,7 +309,9 @@ def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, 
             handle = router.register_forward_hook(capture_router_logits)
 
         for sample_idx in range(inps.shape[0]):
-            output = layer(inps[sample_idx: sample_idx + 1], **layer_kwargs)
+            output = layer(
+                inps[sample_idx: sample_idx + 1], **current_layer_kwargs
+            )
             outs[sample_idx] = _extract_layer_hidden(output)
 
         if handle is not None:
@@ -315,6 +326,7 @@ def collect_teacher_targets(model, dataloader, input_ids, attention_mask, args, 
 
         inps, outs = outs, inps
         layers[layer_idx] = layer.to("cpu")
+        del current_layer_kwargs
         gc.collect()
         torch.cuda.empty_cache()
 

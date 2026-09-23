@@ -26,6 +26,22 @@ groupsize="${GROUPSIZE:-128}"
 blocksize="${BLOCKSIZE:-128}"
 percdamp="${PERCDAMP:-0.01}"
 
+# Qwen3.5 intentionally supports only dual-norm distilled fine-tuning.  The
+# routed router is never optimized; the compensated mode inverse-folds the
+# learned post-attention scale into both MoE gates.
+finetune_routers="${FINETUNE_ROUTERS:-false}"
+rft_trainer="${RFT_TRAINER:-router_compensated_dual_norm_distill}"
+rft_epochs="${RFT_EPOCHS:-1}"
+rft_batch_size="${RFT_BATCH_SIZE:-1}"
+rft_lr="${RFT_LR:-1e-4}"
+rft_wd="${RFT_WD:-0.0}"
+rft_teacher_cache_dir="${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}"
+rft_rebuild_teacher_cache="${RFT_REBUILD_TEACHER_CACHE:-false}"
+
+save_gptq_checkpoint="${SAVE_GPTQ_CHECKPOINT:-false}"
+load_gptq_checkpoint="${LOAD_GPTQ_CHECKPOINT:-false}"
+gptq_checkpoint_root="${GPTQ_CHECKPOINT_ROOT:-results/gptq_checkpoints}"
+
 case "${metric}" in
     expert_cost)
         alloc_bits="${WBITS:-0,2,3}"
@@ -57,7 +73,54 @@ else
     mixed_args=()
 fi
 
-save_path="${SAVE_PATH:-results/fake_quant_models/${model_name}/GEMQ/${quant_tag}}"
+rft_args=()
+rft_tag=""
+if [[ "${finetune_routers}" == "true" ]]; then
+    case "${rft_trainer}" in
+        dual_norm_distill|router_compensated_dual_norm_distill)
+            ;;
+        *)
+            echo "Qwen3.5 supports only dual_norm_distill or router_compensated_dual_norm_distill; got ${rft_trainer}." >&2
+            exit 1
+            ;;
+    esac
+    rft_lr_tag="$(python -c 'import sys; from decimal import Decimal; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "${rft_lr}")"
+    rft_tag="_RFT-${rft_trainer}-lr${rft_lr_tag}"
+    rft_args=(
+        --finetune_routers
+        --rft_trainer "${rft_trainer}"
+        --rft_epochs "${rft_epochs}"
+        --rft_batch_size "${rft_batch_size}"
+        --rft_lr "${rft_lr}"
+        --rft_wd "${rft_wd}"
+        --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
+    )
+    if [[ "${rft_rebuild_teacher_cache}" == "true" ]]; then
+        rft_args+=(--rft_rebuild_teacher_cache)
+    fi
+fi
+
+gptq_checkpoint_path="${GPTQ_CHECKPOINT_PATH:-${gptq_checkpoint_root}/${model_name}/GEMQ/${quant_tag}}"
+checkpoint_args=()
+if [[ "${save_gptq_checkpoint}" == "true" && "${load_gptq_checkpoint}" == "true" ]]; then
+    echo "SAVE_GPTQ_CHECKPOINT and LOAD_GPTQ_CHECKPOINT cannot both be true." >&2
+    exit 1
+elif [[ "${save_gptq_checkpoint}" == "true" ]]; then
+    [[ ! -e "${gptq_checkpoint_path}" ]] || {
+        echo "GPTQ checkpoint already exists and will not be overwritten: ${gptq_checkpoint_path}" >&2
+        echo "Set LOAD_GPTQ_CHECKPOINT=true to reuse it." >&2
+        exit 1
+    }
+    checkpoint_args=(--save_gptq_checkpoint --gptq_checkpoint_path "${gptq_checkpoint_path}")
+elif [[ "${load_gptq_checkpoint}" == "true" ]]; then
+    [[ -f "${gptq_checkpoint_path}/_SUCCESS" ]] || {
+        echo "Complete GPTQ checkpoint not found: ${gptq_checkpoint_path}" >&2
+        exit 1
+    }
+    checkpoint_args=(--load_gptq_checkpoint --gptq_checkpoint_path "${gptq_checkpoint_path}")
+fi
+
+save_path="${SAVE_PATH:-results/fake_quant_models/${model_name}/GEMQ/${quant_tag}${rft_tag}}"
 [[ ! -e "${save_path}" ]] || {
     echo "Output already exists and will not be overwritten: ${save_path}" >&2
     exit 1
@@ -71,8 +134,26 @@ save_path="${SAVE_PATH:-results/fake_quant_models/${model_name}/GEMQ/${quant_tag
     exit 1
 }
 
-# Qwen3.5 support is intentionally fake-quant only. Routers, router gates,
-# linear-attention auxiliary projections and non-target weights stay BF16.
+# Qwen3.5 support is intentionally fake-quant only. Linear-attention auxiliary
+# projections and non-target weights stay BF16.
+echo "=============================================="
+echo ">>> Qwen3.5-35B-A3B fake-quant job"
+echo "----------------------------------------------"
+echo " Allocation:       ${metric} (mixed=${mixed_prec})"
+echo " Attention bits:   linear=${linear_attn_wbits}, softmax=${softmax_attn_wbits}"
+echo " Dense bits:       ${dense_wbits}"
+echo " Fine-tuning:      ${finetune_routers} (trainer=${rft_trainer})"
+if [[ "${finetune_routers}" == "true" ]]; then
+    echo " RFT optimizer:    epochs=${rft_epochs}, batch=${rft_batch_size}, lr=${rft_lr}, wd=${rft_wd}"
+fi
+echo " Save GPTQ ckpt:   ${save_gptq_checkpoint}"
+echo " Load GPTQ ckpt:   ${load_gptq_checkpoint}"
+if [[ "${save_gptq_checkpoint}" == "true" || "${load_gptq_checkpoint}" == "true" ]]; then
+    echo " GPTQ ckpt path:   ${gptq_checkpoint_path}"
+fi
+echo " Save path:        ${save_path}"
+echo "=============================================="
+
 CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.quantize \
     --model "${model}" \
     --model_name "${model_name}" \
@@ -96,6 +177,8 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.quantize \
     --blocksize "${blocksize}" \
     --percdamp "${percdamp}" \
     --mse \
+    "${rft_args[@]}" \
+    "${checkpoint_args[@]}" \
     --save_path "${save_path}" \
     --save_dtype bfloat16
 

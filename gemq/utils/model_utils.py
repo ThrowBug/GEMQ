@@ -734,7 +734,13 @@ def compute_decoder_inputs(model, dataloader, model_name, device="cuda"):
         # Calibration batches have a fixed shape, so masks/positions are equal in
         # shape and semantics. Keep one kwargs dictionary per decoder layer.
         layer_kwargs = [layer_keywords[0] for layer_keywords in keywords]
-        return torch.cat(hidden, dim=0), layer_kwargs
+        # All layer-wise callers keep their rolling input/output activation
+        # buffers on ``device``.  The recorder stores CPU copies to avoid
+        # accumulating them while the model builds contexts, then transfers the
+        # single concatenated tensor once after capture.
+        return torch.cat(hidden, dim=0).to(
+            device=device, non_blocking=True
+        ), layer_kwargs
 
     # get input and kwargs to the first layer decoding layer
     # NOTE: kwargs are shared across all layers
