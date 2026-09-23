@@ -131,7 +131,7 @@ serve_args=(
     --data-parallel-size "${data_parallel_size}"
     --gpu-memory-utilization "${gpu_memory_utilization}"
     --generation-config vllm
-    --disable-log-requests
+    --no-enable-log-requests
 )
 if [[ -n "${MAX_MODEL_LEN:-}" ]]; then serve_args+=(--max-model-len "${MAX_MODEL_LEN}"); fi
 if [[ "${ENABLE_EXPERT_PARALLEL:-false}" == "true" ]]; then serve_args+=(--enable-expert-parallel); fi
