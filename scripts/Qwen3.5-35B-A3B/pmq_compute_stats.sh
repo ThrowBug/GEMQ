@@ -13,6 +13,7 @@ seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
 batch_size="${BATCH_SIZE:-1}"
 candidate_bits="1,2,3"
+expert_batch_size="${PMQ_EXPERT_BATCH_SIZE:-4096}"
 stats_dir="${PMQ_STATS_DIR:-cache/${model_name}/PMQ/C4-N${nsamples}-L${seqlen}-Seed${seed}_B${candidate_bits}}"
 
 [[ -f data/c4-train.00000-of-01024.json ]] || {
@@ -23,6 +24,19 @@ stats_dir="${PMQ_STATS_DIR:-cache/${model_name}/PMQ/C4-N${nsamples}-L${seqlen}-S
     echo "NSAMPLES must be divisible by BATCH_SIZE." >&2
     exit 1
 }
+[[ "${expert_batch_size}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "PMQ_EXPERT_BATCH_SIZE must be a positive integer." >&2
+    exit 1
+}
+
+echo "=============================================="
+echo ">>> PMQ statistics: Qwen3.5-35B-A3B"
+echo " Samples/length:  ${nsamples}/${seqlen}"
+echo " Calibration BS:  ${batch_size}"
+echo " Expert chunk:    ${expert_batch_size} active tokens"
+echo " Candidate bits:  ${candidate_bits}"
+echo " Output:          ${stats_dir}"
+echo "=============================================="
 
 CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_model_stats \
     --mode mcmoe_stats \
@@ -38,4 +52,5 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_model_stats \
     --seed "${seed}" \
     --wbits "${candidate_bits}" \
     --blocksize "${BLOCKSIZE:-128}" \
+    --expert_batch_size "${expert_batch_size}" \
     --mcmoe_stats_dir "${stats_dir}"

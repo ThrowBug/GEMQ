@@ -1,11 +1,18 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 
+from gemq.compute_model_stats import _compute_qwen35_mcmoe_losses
 from gemq.pruning.qwen35 import prune_qwen35_experts
 from gemq.utils.model_utils import LinearModuleType, get_module_type
-from gemq.utils.qwen35 import forward_packed_expert
+from gemq.utils.qwen35 import (
+    clone_packed_expert_weights,
+    copy_packed_expert_weights_,
+    forward_packed_expert,
+    install_rtn_packed_expert_,
+)
 
 
 MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
@@ -27,6 +34,21 @@ class _PackedExperts(nn.Module):
         self.num_experts = num_experts
         self.act_fn = torch.nn.functional.silu
 
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        final = torch.zeros_like(hidden_states)
+        for expert_idx in range(self.num_experts):
+            token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+            if token_idx.numel() == 0:
+                continue
+            output = forward_packed_expert(
+                SimpleNamespace(experts=self),
+                expert_idx,
+                hidden_states[token_idx],
+            )
+            output = output * top_k_weights[token_idx, top_k_pos, None]
+            final.index_add_(0, token_idx, output.to(final.dtype))
+        return final
+
 
 class _Router(nn.Module):
     def __init__(self, num_experts=4, hidden_size=2):
@@ -39,13 +61,31 @@ class _Router(nn.Module):
         self.num_experts = num_experts
         self.top_k = 2
 
+    def forward(self, hidden_states):
+        logits = torch.nn.functional.linear(hidden_states, self.weight)
+        probabilities = logits.softmax(dim=-1, dtype=torch.float)
+        weights, indices = probabilities.topk(self.top_k, dim=-1)
+        weights = (weights / weights.sum(dim=-1, keepdim=True)).to(logits.dtype)
+        return logits, weights, indices
+
 
 class _Moe(nn.Module):
     def __init__(self):
         super().__init__()
         self.experts = _PackedExperts()
         self.gate = _Router()
+        self.shared_expert = nn.Linear(2, 2, bias=False)
+        self.shared_expert_gate = nn.Linear(2, 1, bias=False)
         self.num_experts = 4
+
+    def forward(self, hidden_states):
+        batch_size, sequence_length, hidden_size = hidden_states.shape
+        flat = hidden_states.reshape(-1, hidden_size)
+        _, routing_weights, selected_experts = self.gate(flat)
+        routed = self.experts(flat, selected_experts, routing_weights)
+        shared = self.shared_expert(flat)
+        shared = self.shared_expert_gate(flat).sigmoid() * shared
+        return (routed + shared).reshape(batch_size, sequence_length, hidden_size)
 
 
 class _Layer(nn.Module):
@@ -136,3 +176,45 @@ def test_qwen35_linear_module_policy_is_exact():
         get_module_type("mlp.shared_expert_gate", MODEL_NAME)
         == LinearModuleType.OTHERS
     )
+
+
+def test_active_token_pmq_loss_matches_full_moe_recomputation():
+    torch.manual_seed(7)
+    moe = _Moe()
+    with torch.no_grad():
+        for parameter in moe.parameters():
+            parameter.copy_(torch.randn_like(parameter))
+    block_inputs = [torch.randn(1, 5, 2), torch.randn(1, 3, 2)]
+    baseline = [moe(values).clone() for values in block_inputs]
+    bits = (1, 2, 3)
+
+    expected = {}
+    for expert_idx in range(moe.num_experts):
+        original = clone_packed_expert_weights(moe, expert_idx)
+        expected[expert_idx] = {}
+        try:
+            for bit in bits:
+                install_rtn_packed_expert_(
+                    moe, expert_idx, original, bit, blocksize=2
+                )
+                expected[expert_idx][bit] = sum(
+                    torch.norm(reference.double() - moe(values).double()).item()
+                    for values, reference in zip(block_inputs, baseline)
+                )
+                copy_packed_expert_weights_(moe, expert_idx, original)
+        finally:
+            copy_packed_expert_weights_(moe, expert_idx, original)
+
+    actual = _compute_qwen35_mcmoe_losses(
+        moe,
+        block_inputs,
+        bits,
+        blocksize=2,
+        expert_batch_size=2,
+    )
+
+    for expert_idx in range(moe.num_experts):
+        for bit in bits:
+            assert actual[expert_idx][bit] == pytest.approx(
+                expected[expert_idx][bit], rel=1e-5, abs=1e-6
+            )

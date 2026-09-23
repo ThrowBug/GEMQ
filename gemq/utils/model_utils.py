@@ -947,8 +947,10 @@ def compute_gate_stats_hook_qwen35moe(m, x, y, inps, outs, weights, counts):
     )
     weights.append(actw.to("cpu"))
     counts.append(actc.to("cpu"))
-    inps.append(x[0])
-    outs.append(y[0] if isinstance(y, (tuple, list)) else y)
+    if inps is not None:
+        inps.append(x[0])
+    if outs is not None:
+        outs.append(y[0] if isinstance(y, (tuple, list)) else y)
 
 
 def get_gate_stats_hook_fn(model_name):

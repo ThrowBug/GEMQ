@@ -5,6 +5,7 @@ import pickle
 import json
 import time
 import gc
+import math
 from collections import defaultdict
 from functools import partial
 from tqdm import tqdm
@@ -21,8 +22,10 @@ from gemq.utils.hf_loading import align_deepseek_softmax_scale
 from gemq.utils.qwen35 import (
     clone_packed_expert_weights,
     copy_packed_expert_weights_,
+    forward_packed_expert,
     get_num_routed_experts,
     install_rtn_packed_expert_,
+    qwen35_topk_routes,
 )
 
 logging.set_verbosity_error()
@@ -33,12 +36,65 @@ def _first_tensor(output):
 
 
 @torch.inference_mode()
+def _group_qwen35_active_tokens(moe_block, block_inps):
+    """Group fixed top-k assignments without copying the hidden-state buffer."""
+    num_experts = get_num_routed_experts(moe_block)
+    assignments = [[] for _ in range(num_experts)]
+    for block_input in block_inps:
+        flat_hidden = block_input.reshape(-1, block_input.shape[-1])
+        selected_experts, routing_weights = qwen35_topk_routes(
+            moe_block, flat_hidden
+        )
+        top_k = selected_experts.shape[-1]
+        flat_experts = selected_experts.reshape(-1)
+        flat_weights = routing_weights.reshape(-1)
+        token_indices = torch.arange(
+            flat_hidden.shape[0], device=flat_hidden.device
+        ).repeat_interleave(top_k)
+
+        # Sorting once per calibration batch avoids scanning every routing entry
+        # independently for all 256 experts.
+        order = flat_experts.argsort()
+        counts = torch.bincount(flat_experts, minlength=num_experts).to("cpu")
+        offset = 0
+        for expert_idx, count in enumerate(counts.tolist()):
+            if count:
+                positions = order[offset : offset + count]
+                assignments[expert_idx].append(
+                    (
+                        flat_hidden,
+                        token_indices.index_select(0, positions),
+                        flat_weights.index_select(0, positions),
+                    )
+                )
+            offset += count
+    return assignments
+
+
+@torch.inference_mode()
 def _compute_qwen35_mcmoe_losses(
-    moe_block, block_inps, block_outs, bit_cfg, blocksize
+    moe_block,
+    block_inps,
+    bit_cfg,
+    blocksize,
+    expert_batch_size,
 ):
-    """Source-faithful PMQ perturbations for packed routed experts only."""
+    """Compute PMQ perturbations from only the tokens routed to each expert.
+
+    Quantizing one routed expert leaves the router, all other routed experts,
+    and the shared expert unchanged.  Therefore the full-MoE output difference
+    is exactly the selected expert's weighted output difference on its active
+    tokens; zero-valued positions do not affect the Frobenius norm.
+    """
+    if expert_batch_size <= 0:
+        raise ValueError("expert_batch_size must be positive.")
+    assignments = _group_qwen35_active_tokens(moe_block, block_inps)
     layer_quant_loss = defaultdict(dict)
-    for expert_idx in range(get_num_routed_experts(moe_block)):
+    for expert_idx in tqdm(
+        range(get_num_routed_experts(moe_block)),
+        desc="Qwen3.5 PMQ experts",
+        leave=False,
+    ):
         original = clone_packed_expert_weights(moe_block, expert_idx)
         try:
             for bit in bit_cfg:
@@ -46,11 +102,39 @@ def _compute_qwen35_mcmoe_losses(
                     moe_block, expert_idx, original, bit, blocksize
                 )
                 loss = 0.0
-                for block_input, block_output in zip(block_inps, block_outs):
-                    quant_output = _first_tensor(moe_block(block_input))
-                    loss += torch.norm(
-                        block_output.double() - quant_output.double()
-                    ).item()
+                for flat_hidden, token_indices, routing_weights in assignments[
+                    expert_idx
+                ]:
+                    batch_squared_error = 0.0
+                    for start in range(0, token_indices.numel(), expert_batch_size):
+                        end = min(
+                            start + expert_batch_size, token_indices.numel()
+                        )
+                        active_hidden = flat_hidden.index_select(
+                            0, token_indices[start:end]
+                        )
+                        active_weights = routing_weights[start:end, None]
+                        reference = forward_packed_expert(
+                            moe_block,
+                            expert_idx,
+                            active_hidden,
+                            weights=original,
+                        )
+                        quantized = forward_packed_expert(
+                            moe_block, expert_idx, active_hidden
+                        )
+                        # Match HF's expert implementation: apply the routing
+                        # coefficient first, then cast to the MoE output dtype.
+                        reference = (reference * active_weights).to(
+                            flat_hidden.dtype
+                        )
+                        quantized = (quantized * active_weights).to(
+                            flat_hidden.dtype
+                        )
+                        delta = reference.double() - quantized.double()
+                        batch_squared_error += delta.square().sum().item()
+                    # Released PMQ sums one Frobenius norm per calibration batch.
+                    loss += math.sqrt(batch_squared_error)
                 layer_quant_loss[expert_idx][bit] = loss
                 copy_packed_expert_weights_(moe_block, expert_idx, original)
         finally:
@@ -133,7 +217,9 @@ def get_stats(model, enc, args):
         )
         if any(any(args for args in layer_args) for layer_args in positional_batches):
             raise RuntimeError("Unexpected positional decoder arguments for Qwen3.5.")
-        inps = torch.stack(hidden_batches, dim=0)
+        inps = torch.stack(hidden_batches, dim=0).to(
+            device="cuda", non_blocking=True
+        )
         layer_kwargs = [items[0] for items in keyword_batches]
     else:
         inps = []
@@ -199,7 +285,8 @@ def get_stats(model, enc, args):
         moe_block = get_moe_block(layer, model_name)
 
         # get expert weights & counts and inputs/outputs of the moe block
-        block_inps, block_outs = [], []
+        block_inps = []
+        block_outs = None if model_type == ModelType.QWEN35MOE else []
         _weights, _counts = [], []
         # register hook
         handle = moe_block.register_forward_hook(
@@ -215,7 +302,11 @@ def get_stats(model, enc, args):
         if model_type == ModelType.QWEN35MOE:
             bit_cfg = list(map(int, args.wbits.split(",")))
             quant_loss[i] = _compute_qwen35_mcmoe_losses(
-                moe_block, block_inps, block_outs, bit_cfg, args.blocksize
+                moe_block,
+                block_inps,
+                bit_cfg,
+                args.blocksize,
+                args.expert_batch_size,
             )
             layers[i] = layer.to("cpu")
             gc.collect()
@@ -321,6 +412,12 @@ def compute_mcmoe_stats(model, dataloader, args):
         "seed": args.seed,
         "candidate_bits": list(map(int, args.wbits.split(","))),
         "blocksize": args.blocksize,
+        "expert_batch_size": args.expert_batch_size,
+        "qwen35_quant_loss_implementation": (
+            "active routed tokens with fixed top-k weights"
+            if NAME_TO_MODEL[args.model_name] == ModelType.QWEN35MOE
+            else None
+        ),
     }
     with open(osp.join(args.mcmoe_stats_dir, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -434,7 +531,9 @@ def compute_faster_layer_re(model, dataloader, args):
         )
         if any(any(args for args in layer_args) for layer_args in positional_batches):
             raise RuntimeError("Unexpected positional decoder arguments for Qwen3.5.")
-        inps = torch.cat(hidden_batches, dim=0)
+        inps = torch.cat(hidden_batches, dim=0).to(
+            device="cuda", non_blocking=True
+        )
         layer_kwargs = [items[0] for items in keyword_batches]
     else:
         inps = []
@@ -677,6 +776,13 @@ def parse_args():
         "--blocksize", type=int, default=128,
         help="Blocksize to use for quantization"
     )
+    parser.add_argument(
+        "--expert_batch_size", type=int, default=4096,
+        help=(
+            "Maximum active Qwen3.5 expert tokens per local PMQ forward; "
+            "does not change the statistic"
+        ),
+    )
 
     # misc args
     parser.add_argument(
@@ -699,6 +805,8 @@ if __name__ == "__main__":
     # Parse args
     args = parse_args()
     print(json.dumps(vars(args), indent=4))
+    if args.expert_batch_size <= 0:
+        raise ValueError("--expert_batch_size must be positive.")
 
     # load pre-trained model
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=args.use_fast)
