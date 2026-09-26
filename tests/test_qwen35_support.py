@@ -6,7 +6,11 @@ import torch.nn as nn
 
 from gemq.compute_model_stats import _compute_qwen35_mcmoe_losses
 from gemq.pruning.qwen35 import prune_qwen35_experts
-from gemq.utils.model_utils import LinearModuleType, get_module_type
+from gemq.utils.model_utils import (
+    LinearModuleType,
+    get_module_type,
+    get_router_params,
+)
 from gemq.utils.qwen35 import (
     clone_packed_expert_weights,
     copy_packed_expert_weights_,
@@ -176,6 +180,20 @@ def test_qwen35_linear_module_policy_is_exact():
         get_module_type("mlp.shared_expert_gate", MODEL_NAME)
         == LinearModuleType.OTHERS
     )
+
+
+def test_qwen35_router_params_exclude_shared_expert_gate():
+    model = _Model()
+    router_params = get_router_params(model, MODEL_NAME)
+    expected = [layer.mlp.gate.weight for layer in model.model.layers]
+
+    assert [id(param) for param in router_params] == [
+        id(param) for param in expected
+    ]
+    shared_gate_ids = {
+        id(layer.mlp.shared_expert_gate.weight) for layer in model.model.layers
+    }
+    assert all(id(param) not in shared_gate_ids for param in router_params)
 
 
 def test_active_token_pmq_loss_matches_full_moe_recomputation():

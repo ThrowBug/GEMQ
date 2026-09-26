@@ -271,15 +271,23 @@ def finetune_routers(model, dataloader, args):
 
     # enable gradients for all routers
     router_params = get_router_params(model, args.model_name)  # NOTE: return a list of parameters
+    if not router_params:
+        raise RuntimeError(
+            f"No router parameters found for model {args.model_name!r}."
+        )
+    router_param_ids = {id(param) for param in router_params}
     for p in model.parameters():
         p.requires_grad = False
     for p in router_params:
         p.requires_grad = True
 
-    # sanity check
+    # Classify by parameter identity instead of passing full parameter names such
+    # as ``model.layers.0.mlp.gate.weight`` back through the module-name policy.
+    # Qwen3.5 deliberately treats only ``mlp.gate`` as the routed router and keeps
+    # ``mlp.shared_expert_gate`` frozen during legacy CE fine-tuning.
     org_pmean, org_gmean = 0.0, 0.0
-    for name, param in model.named_parameters():
-        if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+    for param in model.parameters():
+        if id(param) in router_param_ids:
             org_gmean += param.mean().item()
         else:
             org_pmean += param.mean().item()
@@ -310,8 +318,8 @@ def finetune_routers(model, dataloader, args):
         # sanity check
         if epoch == 0:
             pmean, gmean = 0., 0.
-            for name, param in model.named_parameters():
-                if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+            for param in model.parameters():
+                if id(param) in router_param_ids:
                     gmean += param.mean().item()
                 else:
                     pmean += param.mean().item()

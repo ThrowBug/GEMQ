@@ -26,9 +26,9 @@ groupsize="${GROUPSIZE:-128}"
 blocksize="${BLOCKSIZE:-128}"
 percdamp="${PERCDAMP:-0.01}"
 
-# Qwen3.5 intentionally supports only dual-norm distilled fine-tuning.  The
-# routed router is never optimized; the compensated mode inverse-folds the
-# learned post-attention scale into both MoE gates.
+# Qwen3.5 supports the original hard-label CE router baseline and the two
+# dual-norm distilled modes. Legacy CE updates only the routed ``mlp.gate``;
+# the compensated norm mode inverse-folds its scale into both MoE gates.
 finetune_routers="${FINETUNE_ROUTERS:-false}"
 rft_trainer="${RFT_TRAINER:-router_compensated_dual_norm_distill}"
 rft_epochs="${RFT_EPOCHS:-1}"
@@ -77,10 +77,10 @@ rft_args=()
 rft_tag=""
 if [[ "${finetune_routers}" == "true" ]]; then
     case "${rft_trainer}" in
-        dual_norm_distill|router_compensated_dual_norm_distill)
+        legacy_ce|dual_norm_distill|router_compensated_dual_norm_distill)
             ;;
         *)
-            echo "Qwen3.5 supports only dual_norm_distill or router_compensated_dual_norm_distill; got ${rft_trainer}." >&2
+            echo "Qwen3.5 supports only legacy_ce, dual_norm_distill, or router_compensated_dual_norm_distill; got ${rft_trainer}." >&2
             exit 1
             ;;
     esac
@@ -93,10 +93,12 @@ if [[ "${finetune_routers}" == "true" ]]; then
         --rft_batch_size "${rft_batch_size}"
         --rft_lr "${rft_lr}"
         --rft_wd "${rft_wd}"
-        --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
     )
-    if [[ "${rft_rebuild_teacher_cache}" == "true" ]]; then
-        rft_args+=(--rft_rebuild_teacher_cache)
+    if [[ "${rft_trainer}" != "legacy_ce" ]]; then
+        rft_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
+        if [[ "${rft_rebuild_teacher_cache}" == "true" ]]; then
+            rft_args+=(--rft_rebuild_teacher_cache)
+        fi
     fi
 fi
 

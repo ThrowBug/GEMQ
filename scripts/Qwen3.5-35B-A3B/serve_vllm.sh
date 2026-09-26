@@ -50,13 +50,13 @@ rft_trainer="${RFT_TRAINER:-router_compensated_dual_norm_distill}"
 rft_tag=""
 if [[ "${finetune_routers}" == "true" ]]; then
     case "${rft_trainer}" in
-        dual_norm_distill|router_compensated_dual_norm_distill)
+        legacy_ce|dual_norm_distill|router_compensated_dual_norm_distill)
             rft_lr="${RFT_LR:-1e-4}"
             rft_lr_tag="$(python -c 'import sys; from decimal import Decimal; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "${rft_lr}")"
             rft_tag="_RFT-${rft_trainer}-lr${rft_lr_tag}"
             ;;
         *)
-            echo "Qwen3.5 supports only dual_norm_distill or router_compensated_dual_norm_distill; got ${rft_trainer}." >&2
+            echo "Qwen3.5 supports only legacy_ce, dual_norm_distill, or router_compensated_dual_norm_distill; got ${rft_trainer}." >&2
             exit 1
             ;;
     esac

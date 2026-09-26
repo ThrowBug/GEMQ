@@ -103,8 +103,9 @@ def test_norm_distill_modes_are_two_independent_options():
     }
 
 
-def test_qwen35_exposes_only_the_two_dual_norm_trainers():
+def test_qwen35_exposes_legacy_ce_and_the_two_dual_norm_trainers():
     assert QWEN35_RFT_TRAINERS == (
+        "legacy_ce",
         "dual_norm_distill",
         "router_compensated_dual_norm_distill",
     )

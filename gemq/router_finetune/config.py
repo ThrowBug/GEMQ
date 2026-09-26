@@ -31,6 +31,7 @@ RFT_TRAINERS = (
     "layerwise_teacher",
 )
 QWEN35_RFT_TRAINERS = (
+    "legacy_ce",
     "dual_norm_distill",
     "router_compensated_dual_norm_distill",
 )
