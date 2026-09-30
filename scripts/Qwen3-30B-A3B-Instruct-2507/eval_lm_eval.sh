@@ -5,12 +5,12 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 
 if (( $# > 1 )); then
-    echo "Usage: bash ${BASH_SOURCE[0]} MODEL_PATH" >&2
+    echo "Usage: EVAL_MODEL_PATH=/path/to/model bash ${BASH_SOURCE[0]} [MODEL_PATH]" >&2
     exit 1
 fi
-model_path="${1:-${MODEL_PATH:-}}"
+model_path="${1:-${EVAL_MODEL_PATH:-${MODEL_PATH:-}}}"
 if [[ -z "${model_path}" || ! -d "${model_path}" ]]; then
-    echo "Pass an existing saved Qwen3 model directory as MODEL_PATH or the first argument." >&2
+    echo "Pass an existing saved Qwen3 model directory via EVAL_MODEL_PATH, MODEL_PATH, or the first argument." >&2
     exit 1
 fi
 # Resolve before changing directories so a relative path is relative to the caller.
@@ -30,11 +30,6 @@ if (( ${#weight_files[@]} == 0 )); then
     echo "No .safetensors or .bin model weights found under: ${model_path}" >&2
     exit 1
 fi
-if [[ "${model_path}" == *,* ]]; then
-    echo "lm_eval model_args cannot parse a model path containing a comma: ${model_path}" >&2
-    exit 1
-fi
-
 if ! command -v python >/dev/null 2>&1; then
     echo "python not found. Activate the GEMQ evaluation environment first." >&2
     exit 1
@@ -62,7 +57,24 @@ if [[ ! "${eval_batch_size}" =~ ^[1-9][0-9]*$ || ! "${num_fewshot}" =~ ^[0-9]+$ 
     exit 1
 fi
 
-model_args="pretrained=${model_path},dtype=${model_dtype},parallelize=${parallelize},attn_implementation=eager"
+# lm_eval splits --model_args on commas. GEMQ bit-allocation directory names
+# contain commas (for example B0,2,3), so use a temporary comma-free alias.
+model_arg_path="${model_path}"
+alias_dir=""
+cleanup_alias() {
+    if [[ -n "${alias_dir}" ]]; then
+        rm -- "${alias_dir}/model"
+        rmdir -- "${alias_dir}"
+    fi
+}
+if [[ "${model_path}" == *,* ]]; then
+    alias_dir="$(mktemp -d /tmp/gemq-lm-eval.XXXXXXXX)"
+    trap cleanup_alias EXIT
+    ln -s -- "${model_path}" "${alias_dir}/model"
+    model_arg_path="${alias_dir}/model"
+fi
+
+model_args="pretrained=${model_arg_path},dtype=${model_dtype},parallelize=${parallelize},attn_implementation=eager"
 eval_args=(
     --model hf
     --model_args "${model_args}"
@@ -77,6 +89,7 @@ if [[ -n "${output_path}" ]]; then eval_args+=(--output_path "${output_path}"); 
 echo "=============================================="
 echo ">>> Qwen3 PIQA / ARC-Easy / ARC-Challenge / HellaSwag / Winogrande"
 echo " Model path:    ${model_path}"
+if [[ -n "${alias_dir}" ]]; then echo " lm_eval alias: ${model_arg_path}"; fi
 echo " CUDA devices:  ${gpus}"
 echo " Dtype:         ${model_dtype}"
 echo " Batch size:    ${eval_batch_size}"
