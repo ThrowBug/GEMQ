@@ -14,6 +14,7 @@ gpus="${CUDA_VISIBLE_DEVICES:-0}"
 context_mode="${CONTEXT_MODE:-uniform_bit}"
 average_bits="${AVERAGE_BITS:-2}"
 candidate_bits="${CANDIDATE_BITS:-0,1,2,3}"
+normalize_by_activation_count="${NORMALIZE_BY_ACTIVATION_COUNT:-true}"
 blocksize="${BLOCKSIZE:-128}"
 
 dataset="${CALIB_DATASET:-mixed_chat_en}"
@@ -45,6 +46,8 @@ require_nonnegative_int() {
 
 [[ "${context_mode}" == "fp" || "${context_mode}" == "uniform_bit" ]] || \
     die "CONTEXT_MODE must be 'fp' or 'uniform_bit'; got '${context_mode}'."
+[[ "${normalize_by_activation_count}" == "true" || "${normalize_by_activation_count}" == "false" ]] || \
+    die "NORMALIZE_BY_ACTIVATION_COUNT must be 'true' or 'false'; got '${normalize_by_activation_count}'."
 [[ "${model_dtype}" == "float16" || "${model_dtype}" == "bfloat16" ]] || \
     die "MODEL_DTYPE must be 'float16' or 'bfloat16'; got '${model_dtype}'."
 [[ "${attn_impl}" == "eager" || "${attn_impl}" == "sdpa" ]] || \
@@ -98,10 +101,14 @@ if [[ "${context_mode}" == "uniform_bit" ]]; then
     context_tag="uniform${average_bits}bit"
 fi
 default_output="cache/${model_name}/ExpertCosts_${dataset}-N${nsamples}-L${seqlen}-Seed${seed}_${context_tag}_B${candidate_bits}.pt"
+if [[ "${normalize_by_activation_count}" == "false" ]]; then
+    default_output="${default_output%.pt}_NoCountNorm.pt"
+fi
 output_path="${OUTPUT_PATH:-${default_output}}"
 
 echo "Computing Qwen3-MoE expert costs"
 echo "  context=${context_mode}, average_bits=${average_bits}, candidates=${candidate_bits}"
+echo "  normalize_by_activation_count=${normalize_by_activation_count}"
 echo "  calibration=${dataset}, nsamples=${nsamples}, seqlen=${seqlen}"
 echo "  output=${output_path}"
 
@@ -122,4 +129,5 @@ CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.compute_expert_costs \
     --context_mode "${context_mode}" \
     --average_bits "${average_bits}" \
     --blocksize "${blocksize}" \
+    --normalize_by_activation_count "${normalize_by_activation_count}" \
     --output_path "${output_path}"

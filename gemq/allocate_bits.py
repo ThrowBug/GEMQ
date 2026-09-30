@@ -88,8 +88,13 @@ def _auto_save_path(args, source_path, bit_cands, solver):
             f"{constraint_tag}{model_str}.pkl"
         )
     else:
+        cost_tag = (
+            "-NoCountNorm"
+            if solver.artifact_metadata.get("normalize_by_activation_count", True) is False
+            else ""
+        )
         filename = (
-            f"{common}-{_context_tag(solver.artifact_metadata)}"
+            f"{common}-{_context_tag(solver.artifact_metadata)}{cost_tag}"
             f"_E{args.bit_budget:.1f}_B{bc_str}"
         )
         if 0 in bit_cands:

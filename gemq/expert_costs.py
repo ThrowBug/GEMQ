@@ -344,6 +344,7 @@ def _compute_layer_costs(
     blocksize,
     expert_batch_size,
     device,
+    normalize_by_activation_count=True,
 ):
     num_experts = moe_block.num_experts
     num_bits = len(candidate_bits)
@@ -391,7 +392,9 @@ def _compute_layer_costs(
                 device,
                 zero_output=True,
             )
-            costs[expert_idx, bit_to_column[0]] = numerator / count
+            costs[expert_idx, bit_to_column[0]] = (
+                numerator / count if normalize_by_activation_count else numerator
+            )
 
         nonzero_bits = [bit for bit in candidate_bits if bit != 0]
         if context_mode == "uniform_bit":
@@ -415,7 +418,9 @@ def _compute_layer_costs(
                     expert_batch_size,
                     device,
                 )
-                costs[expert_idx, bit_to_column[bit]] = numerator / count
+                costs[expert_idx, bit_to_column[bit]] = (
+                    numerator / count if normalize_by_activation_count else numerator
+                )
 
                 keep_this_bit = (
                     context_mode == "uniform_bit" and bit == average_bits
@@ -444,6 +449,7 @@ def compute_qwen3_expert_costs(
     blocksize=128,
     expert_batch_size=4096,
     device="cuda",
+    normalize_by_activation_count=True,
 ):
     """Compute ``[layer, expert, candidate_bit]`` costs and active counts."""
     if NAME_TO_MODEL.get(model_name) != ModelType.QWEN3MOE:
@@ -532,6 +538,7 @@ def compute_qwen3_expert_costs(
                 blocksize,
                 expert_batch_size,
                 device,
+                normalize_by_activation_count,
             )
             costs[layer_idx] = layer_costs
             counts[layer_idx] = layer_counts

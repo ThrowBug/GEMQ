@@ -7,6 +7,7 @@ cd "${repo_root}"
 
 model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"
 allocation_metric="${ALLOCATION_METRIC:-expert_cost}" # expert_cost | layer_re
+normalize_by_activation_count="${NORMALIZE_BY_ACTIVATION_COUNT:-true}"
 bits_per_expert="${BITS_PER_EXPERT:-2.0}"
 if [[ -n "${WBITS:-}" ]]; then
     wbits="${WBITS}"
@@ -27,6 +28,10 @@ output_path="${ALLOCATION_OUTPUT_PATH:-}"
 stat_args=()
 case "${allocation_metric}" in
     expert_cost)
+        if [[ "${normalize_by_activation_count}" != "true" && "${normalize_by_activation_count}" != "false" ]]; then
+            echo "NORMALIZE_BY_ACTIVATION_COUNT must be 'true' or 'false'." >&2
+            exit 1
+        fi
         extra_constr="${EXTRA_CONSTR:-none}"
         if [[ "${extra_constr}" != "none" ]]; then
             echo "EXTRA_CONSTR is only valid with ALLOCATION_METRIC=layer_re." >&2
@@ -35,6 +40,9 @@ case "${allocation_metric}" in
         expert_cost_bits="${EXPERT_COST_BITS:-0,1,2,3}"
         expert_cost_context_bit="${EXPERT_COST_CONTEXT_BIT:-2}"
         default_expert_cost_path="cache/${model_name}/ExpertCosts_${calib_dataset}-N${nsamples}-L${seqlen}-Seed${seed}_uniform${expert_cost_context_bit}bit_B${expert_cost_bits}.pt"
+        if [[ "${normalize_by_activation_count}" == "false" ]]; then
+            default_expert_cost_path="${default_expert_cost_path%.pt}_NoCountNorm.pt"
+        fi
         expert_cost_path="${EXPERT_COST_PATH:-${default_expert_cost_path}}"
         if [[ ! -f "${expert_cost_path}" ]]; then
             echo "Expert-cost artifact not found: ${expert_cost_path}" >&2

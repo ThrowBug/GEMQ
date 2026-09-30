@@ -39,11 +39,19 @@ def _positive_int(value):
     return integer
 
 
+def _bool_arg(value):
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Compute C[l,i,b] = E_{x in X[l,i]}[g[l,i](x) "
-            "||f[l,i](x)-f_b[l,i](x)||_2] for Qwen3-MoE."
+            "Compute the mean or sum over Top-K-selected tokens of "
+            "g[l,i](x) ||f[l,i](x)-f_b[l,i](x)||_2 for Qwen3-MoE."
         )
     )
     parser.add_argument("--model", required=True)
@@ -88,6 +96,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--average_bits", type=_positive_int, default=2)
     parser.add_argument("--blocksize", type=_positive_int, default=128)
+    parser.add_argument(
+        "--normalize_by_activation_count",
+        type=_bool_arg,
+        default=True,
+        help="Divide each expert's weighted deviation sum by its Top-K activation count.",
+    )
     parser.add_argument("--output_path", required=True)
     return parser.parse_args(argv)
 
@@ -158,6 +172,7 @@ def main(argv=None):
         blocksize=args.blocksize,
         expert_batch_size=args.expert_batch_size,
         device="cuda",
+        normalize_by_activation_count=args.normalize_by_activation_count,
     )
 
     filled_costs, imputed_mask = impute_zero_frequency_costs(costs, counts)
@@ -182,8 +197,10 @@ def main(argv=None):
             "context_mode": args.context_mode,
             "average_bits": args.average_bits,
             "blocksize": args.blocksize,
+            "normalize_by_activation_count": args.normalize_by_activation_count,
             "cost_definition": (
-                "mean over Top-K-selected tokens of "
+                ("mean" if args.normalize_by_activation_count else "sum")
+                + " over Top-K-selected tokens of "
                 "g_i(x) * ||f_i(x) - f_i^b(x)||_2"
             ),
             "counts_definition": "number of tokens whose Top-K contains expert i",

@@ -75,6 +75,48 @@ def test_zero_bit_cost_and_zero_frequency_policy():
     assert torch.isnan(costs[1, 0])
 
 
+def test_expert_cost_without_count_normalization_scales_both_bit_types(monkeypatch):
+    import gemq.expert_costs as expert_costs
+
+    moe_block = _TinyMoe(num_experts=2, hidden_size=2)
+    hidden_states = torch.tensor([[[3.0, 4.0], [0.0, 2.0]]])
+    selected_experts = torch.tensor([[0], [0]], dtype=torch.long)
+    routing_weights = torch.tensor([[0.5], [0.25]])
+
+    # Keep the two candidate numerators fixed to isolate the normalization step.
+    monkeypatch.setattr(expert_costs, "_install_quantized_weights", lambda *args: None)
+    monkeypatch.setattr(
+        expert_costs,
+        "_weighted_deviation_sum",
+        lambda *args, zero_output=False: 3.0 if zero_output else 4.0,
+    )
+    common_args = dict(
+        moe_block=moe_block,
+        moe_input_batches=[hidden_states],
+        selected_expert_batches=[selected_experts],
+        routing_weight_batches=[routing_weights],
+        candidate_bits=[0, 2],
+        context_mode="fp",
+        average_bits=2,
+        blocksize=2,
+        expert_batch_size=1,
+        device=torch.device("cpu"),
+    )
+    normalized, normalized_counts = _compute_layer_costs(**common_args)
+    summed, summed_counts = _compute_layer_costs(
+        **common_args, normalize_by_activation_count=False
+    )
+
+    torch.testing.assert_close(
+        normalized[0], torch.tensor([1.5, 2.0], dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        summed[0], torch.tensor([3.0, 4.0], dtype=torch.float64)
+    )
+    assert normalized_counts.tolist() == summed_counts.tolist() == [2, 0]
+    assert torch.isnan(summed[1]).all()
+
+
 def test_rtn_zero_bit_and_partial_binary_block():
     weights = torch.tensor([[1.0, -2.0, 3.0]])
 

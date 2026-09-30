@@ -28,6 +28,7 @@ calib_path_args=()
 # ===============================
 quantizer="gptq"
 allocation_metric="${ALLOCATION_METRIC:-expert_cost}" # expert_cost | layer_re
+normalize_by_activation_count="${NORMALIZE_BY_ACTIVATION_COUNT:-true}"
 bpe="${BPE:-2.0}"
 if [[ -n "${WBITS:-}" ]]; then
     wbits="${WBITS}"
@@ -55,12 +56,20 @@ if [[ -z "${allocation_tag}" ]]; then
 fi
 bpe_tag="$(printf '%.1f' "${bpe}")"
 if [[ "${allocation_metric}" == "expert_cost" ]]; then
+    if [[ "${normalize_by_activation_count}" != "true" && "${normalize_by_activation_count}" != "false" ]]; then
+        echo "NORMALIZE_BY_ACTIVATION_COUNT must be 'true' or 'false'." >&2
+        exit 1
+    fi
     extra_constr="${EXTRA_CONSTR:-none}"
     if [[ "${extra_constr}" != "none" ]]; then
         echo "EXTRA_CONSTR is only valid with ALLOCATION_METRIC=layer_re." >&2
         exit 1
     fi
-    default_bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-expert_cost-Ctxuniform${expert_cost_context_bit}_E${bpe_tag}_B${wbits}"
+    cost_norm_tag=""
+    if [[ "${normalize_by_activation_count}" == "false" ]]; then
+        cost_norm_tag="-NoCountNorm"
+    fi
+    default_bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-expert_cost-Ctxuniform${expert_cost_context_bit}${cost_norm_tag}_E${bpe_tag}_B${wbits}"
     if [[ ",${wbits}," == *,0,* ]]; then
         max_prune_ratio_tag="$(printf '%g' "${max_prune_ratio}")"
         default_bit_cfg+="_Pmax${max_prune_ratio_tag}_EqPrune"
