@@ -10,7 +10,7 @@ import warnings
 
 
 BITS = (1, 2, 3, 4)
-COLORS = ("#DAFFFE", "#C0FCA4", "#F6FBAC", "#FCBEE0", "#FFB10A")
+COLORS = ("#CDFFFD", "#C0FCA4", "#F6FBAC", "#FCBEE0", "#FFB10A")
 MARKERS = ("o", "s", "^", "D", "v")
 COMPARISON_FIELDS = (
     "model", "dataset", "calib_samples", "eval_samples", "seqlen",
