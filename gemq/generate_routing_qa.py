@@ -53,9 +53,13 @@ def load_evalscope_prompts(dataset, nsamples, seed, evalscope_seed, model, local
         samples = [(subset, sample) for subset in data.keys() for sample in data[subset]]
     if len(samples) < nsamples:
         raise ValueError(f"{dataset} has only {len(samples)} samples, need {nsamples}.")
-    chosen = sorted(random.Random(seed).sample(range(len(samples)), nsamples))
+    rng = random.Random(seed)
+    chosen = sorted(rng.sample(range(len(samples)), nsamples))
+    chosen_set = set(chosen)
+    remaining = [position for position in range(len(samples)) if position not in chosen_set]
+    rng.shuffle(remaining)
     prompts = []
-    for position in chosen:
+    for position in chosen + remaining:
         subset, sample = samples[position]
         messages = [
             {"role": str(message.role), "content": message.content}
@@ -78,6 +82,56 @@ def load_evalscope_prompts(dataset, nsamples, seed, evalscope_seed, model, local
         "few_shot_num": adapter.few_shot_num,
         "evalscope_seed": evalscope_seed,
     }
+
+
+def select_fitting_prompts(prompts, tokenizer, nsamples, max_seq_len):
+    """Keep intact EvalScope prompts, replacing overlong ones deterministically."""
+    selected, skipped = [], []
+    for item in prompts:
+        prompt_ids = tokenizer.apply_chat_template(
+            item["messages"], tokenize=True, add_generation_prompt=True
+        )
+        if len(prompt_ids) >= max_seq_len:
+            skipped.append({"source_position": item["source_position"], "prompt_tokens": len(prompt_ids)})
+            continue
+        selected.append({**item, "prompt_ids": prompt_ids})
+        if len(selected) == nsamples:
+            break
+    if len(selected) < nsamples:
+        raise ValueError(
+            f"Only {len(selected)} complete prompts fit within {max_seq_len - 1} tokens; "
+            f"need {nsamples}. Increase --max_seq_len or reduce --nsamples."
+        )
+    return selected, skipped
+
+
+def existing_record_count(output_dir, metadata, prompts):
+    """Validate a prior partial run before appending; never replace its records."""
+    metadata_path = output_dir / "metadata.json"
+    records_path = output_dir / "records.jsonl"
+    if not metadata_path.is_file() or not records_path.is_file():
+        raise FileExistsError(f"{output_dir} exists but is not a resumable generation directory")
+    prior = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for key in (
+        "format_version", "dataset", "model", "nsamples", "max_seq_len",
+        "max_new_tokens", "seed", "dtype", "attn_impl", "local_dataset", "evalscope",
+    ):
+        if prior.get(key) != metadata.get(key):
+            raise ValueError(f"Cannot resume: metadata field {key} differs in {output_dir}")
+    count = 0
+    with records_path.open(encoding="utf-8") as source:
+        for index, line in enumerate(source):
+            record = json.loads(line)
+            if index >= len(prompts):
+                raise ValueError(f"Too many records in {records_path}")
+            if (
+                record.get("id") != index
+                or record.get("source_position") != prompts[index]["source_position"]
+                or record.get("prompt_ids") != prompts[index]["prompt_ids"]
+            ):
+                raise ValueError(f"Record {index} differs from the deterministic prompt selection")
+            count += 1
+    return count
 
 
 def parse_args(argv=None):
@@ -105,8 +159,6 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.output_dir.exists():
-        raise FileExistsError(f"Refusing to overwrite {args.output_dir}")
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -118,15 +170,7 @@ def main(argv=None):
         args.model, args.local_dataset, args.dataset_hub
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=getattr(torch, args.dtype),
-        device_map="auto",
-        attn_implementation=args.attn_impl,
-        trust_remote_code=True,
-    ).eval()
-    input_device = model.get_input_embeddings().weight.device
-    args.output_dir.mkdir(parents=True)
+    prompts, skipped = select_fitting_prompts(prompts, tokenizer, args.nsamples, args.max_seq_len)
     metadata = {
         "format_version": 1,
         "dataset": args.dataset,
@@ -142,17 +186,42 @@ def main(argv=None):
         "evalscope": evalscope_info,
         "local_dataset": str(Path(args.local_dataset).resolve()) if args.local_dataset else None,
     }
-    (args.output_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
     records_path = args.output_dir / "records.jsonl"
-    with records_path.open("x", encoding="utf-8") as output:
-        for index, item in enumerate(prompts):
-            prompt_ids = tokenizer.apply_chat_template(
-                item["messages"], tokenize=True, add_generation_prompt=True
-            )
-            if len(prompt_ids) >= args.max_seq_len:
-                raise ValueError(f"Prompt {index} has {len(prompt_ids)} tokens (limit {args.max_seq_len}).")
+    if args.output_dir.exists():
+        start = existing_record_count(args.output_dir, metadata, prompts)
+        print(f"Resuming {records_path} at record {start}/{args.nsamples}", flush=True)
+    else:
+        args.output_dir.mkdir(parents=True)
+        (args.output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        records_path.touch(exist_ok=False)
+        start = 0
+    selection_path = args.output_dir / "selection.json"
+    selection = {
+        "policy": "skip intact prompts that leave no answer token; fill from seeded remaining samples",
+        "source_positions": [item["source_position"] for item in prompts],
+        "skipped": skipped,
+    }
+    if not selection_path.exists():
+        selection_path.write_text(json.dumps(selection, indent=2), encoding="utf-8")
+    elif json.loads(selection_path.read_text(encoding="utf-8")) != selection:
+        raise ValueError(f"Cannot resume: prompt selection differs in {selection_path}")
+    if start == args.nsamples:
+        print(f"Already complete: {records_path}")
+        return
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        torch_dtype=getattr(torch, args.dtype),
+        device_map="auto",
+        attn_implementation=args.attn_impl,
+        trust_remote_code=True,
+    ).eval()
+    input_device = model.get_input_embeddings().weight.device
+    with records_path.open("a", encoding="utf-8") as output:
+        for index in range(start, len(prompts)):
+            item = prompts[index]
+            prompt_ids = item["prompt_ids"]
             allowance = min(args.max_new_tokens, args.max_seq_len - len(prompt_ids))
             prompt = torch.tensor([prompt_ids], dtype=torch.long, device=input_device)
             with torch.inference_mode():
