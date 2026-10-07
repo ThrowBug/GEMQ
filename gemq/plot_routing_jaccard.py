@@ -6,10 +6,12 @@ import json
 import math
 from pathlib import Path
 
+from gemq.plot_style import configure_arial
+
 
 METRICS = (
-    ("activation_count", "Activation count", "o", "-"),
-    ("mean_probability_when_active", "Mean routing score", "s", "--"),
+    ("activation_count", "Activation Count", "o", "-"),
+    ("mean_probability_when_active", "Mean Routing Score", "s", "--"),
 )
 DOMAINS = (
     ("math_500", "MATH-500", "#0072B2"),
@@ -106,6 +108,7 @@ def draw_figure(rows, output_png, output_pdf, top_n):
     except ImportError as exc:
         raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
 
+    configure_arial()
     fig, ax = plt.subplots(figsize=(8.2, 4.1), constrained_layout=True)
     for dataset, label, color in DOMAINS:
         for metric, metric_label, marker, linestyle in METRICS:
@@ -119,10 +122,10 @@ def draw_figure(rows, output_png, output_pdf, top_n):
                     [point["jaccard"] for point in points],
                     color=color, linestyle=linestyle, marker=marker,
                     markersize=3.7, linewidth=1.45,
-                    label=f"{label} vs C4 · {metric_label}",
+                    label=f"{label} vs. C4 · {metric_label}",
                 )
-    ax.set_xlabel("MoE layer (0-based)")
-    ax.set_ylabel(f"Top-{top_n} expert Jaccard")
+    ax.set_xlabel("MoE Layer Index")
+    ax.set_ylabel(f"Top-{top_n} Expert Jaccard Similarity")
     ax.set_ylim(0, 1)
     ax.grid(axis="y", color="0.88", linewidth=0.7)
     ax.spines["top"].set_visible(False)

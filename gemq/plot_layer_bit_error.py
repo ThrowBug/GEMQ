@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import warnings
 
+from gemq.plot_style import configure_arial
+
 
 BITS = (1, 2, 3, 4)
 COLORS = ("#67E4E0", "#7ADF4B", "#E6F421", "#FCBEE0", "#FFB10A")
@@ -131,6 +133,7 @@ def main(argv=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    configure_arial()
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
     for index, item in enumerate(series):
         color = args.color if index == 0 else COLORS[index % len(COLORS)]
@@ -142,8 +145,8 @@ def main(argv=None):
         )
     ax.set_xticks(BITS)
     ax.set_xlim(0.8, 4.2)
-    ax.set_xlabel("Bit-width")
-    ax.set_ylabel("Relative MoE output MSE")
+    ax.set_xlabel("Bit Width")
+    ax.set_ylabel("Relative MoE Output MSE")
     ax.set_yscale(args.yscale)
     if args.yscale == "linear":
         ax.set_ylim(bottom=0)

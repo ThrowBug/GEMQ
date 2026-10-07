@@ -11,6 +11,7 @@ from gemq.compare_quant_routing_jaccard import (
     read_metadata,
 )
 from gemq.plot_routing_jaccard import read_routing_csv
+from gemq.plot_style import configure_arial
 
 
 DATASET_LABELS = {
@@ -101,6 +102,7 @@ def draw_figure(rows, labels, top_n, output_png, output_pdf):
     except ImportError as exc:
         raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
 
+    configure_arial()
     fig, axes = plt.subplots(1, 3, figsize=(11.6, 3.65), sharey=True)
     legend_handles = []
     for ax, dataset in zip(axes, DATASETS):
@@ -120,13 +122,13 @@ def draw_figure(rows, labels, top_n, output_png, output_pdf):
             if dataset == DATASETS[0]:
                 legend_handles.append(line)
         ax.set_title(DATASET_LABELS[dataset], fontsize=11)
-        ax.set_xlabel("MoE layer (0-based)")
+        ax.set_xlabel("MoE Layer Index")
         ax.set_ylim(0, 1)
         ax.set_yticks((0, 0.25, 0.5, 0.75, 1.0))
         ax.grid(axis="y", color="0.88", linewidth=0.7)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-    axes[0].set_ylabel(f"Top-{top_n} mean-score Jaccard")
+    axes[0].set_ylabel(f"Top-{top_n} Mean-Score Jaccard Similarity")
     fig.legend(legend_handles, labels, loc="upper center", ncol=3, frameon=False,
                bbox_to_anchor=(0.5, 1.0))
     fig.tight_layout(rect=(0, 0, 1, 0.88))

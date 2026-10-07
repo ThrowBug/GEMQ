@@ -133,8 +133,9 @@ class PlotInputTest(unittest.TestCase):
             with patch.dict("sys.modules", {"matplotlib": matplotlib,
                                            "matplotlib.pyplot": pyplot}):
                 argv = [item for path in paths for item in ("--input", str(path))]
-                with redirect_stdout(StringIO()):
+                with patch("gemq.plot_layer_bit_error.configure_arial") as configure, redirect_stdout(StringIO()):
                     plot_main(argv + ["--output", str(Path(directory) / "comparison.png")])
+            configure.assert_called_once_with()
             self.assertEqual(axes.plot.call_count, 3)
             self.assertEqual(axes.legend.call_count, 1)
             self.assertEqual(figure.savefig.call_count, 2)
@@ -155,8 +156,9 @@ class PlotInputTest(unittest.TestCase):
             pyplot.close = Mock()
             with patch.dict("sys.modules", {"matplotlib": matplotlib,
                                            "matplotlib.pyplot": pyplot}):
-                with redirect_stdout(StringIO()):
+                with patch("gemq.plot_layer_bit_error.configure_arial") as configure, redirect_stdout(StringIO()):
                     plot_main(["--input", str(path)])
+            configure.assert_called_once_with()
             self.assertEqual(axes.plot.call_count, 1)
             axes.legend.assert_not_called()
             self.assertEqual(figure.savefig.call_count, 2)
