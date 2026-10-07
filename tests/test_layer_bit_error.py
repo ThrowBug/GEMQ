@@ -1,12 +1,32 @@
 import csv
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+import json
 import tempfile
+import types
 import unittest
+import warnings
 from pathlib import Path
+from unittest.mock import Mock, patch
 
-from gemq.plot_layer_bit_error import read_summary
+from gemq.plot_layer_bit_error import (
+    main as plot_main,
+    parse_args as parse_plot_args,
+    read_series,
+    read_summary,
+    warn_if_incomparable,
+)
 
 
 class PlotInputTest(unittest.TestCase):
+    @staticmethod
+    def write_summary(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "bit_width,relative_mse\n1,0.5\n2,0.1\n3,0.03\n4,0.01\n",
+            encoding="utf-8",
+        )
+
     def test_read_four_bits_in_bit_order(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "summary.csv"
@@ -23,6 +43,114 @@ class PlotInputTest(unittest.TestCase):
             path.write_text("bit_width,relative_mse\n1,0.5\n2,0.1\n3,0.03\n", encoding="utf-8")
             with self.assertRaises(ValueError):
                 read_summary(path)
+
+    def test_single_input_keeps_original_default_output(self):
+        args = parse_plot_args(["--input", "measurements/summary.csv"])
+        self.assertEqual(args.input, [Path("measurements/summary.csv")])
+        self.assertEqual(args.output, Path("measurements/bit_width_relative_mse.png"))
+
+    def test_multiple_inputs_require_separate_output(self):
+        inputs = ["--input", "L5/summary.csv", "--input", "L24/summary.csv"]
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_plot_args(inputs)
+        args = parse_plot_args(inputs + ["--output", "comparison.png"])
+        self.assertEqual(len(args.input), 2)
+        self.assertEqual(args.output, Path("comparison.png"))
+
+    def test_existing_metadata_supplies_layer_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for layer in (5, 24, 42):
+                path = Path(directory) / f"L{layer}-C4" / "summary.csv"
+                self.write_summary(path)
+                path.with_name("metadata.json").write_text(
+                    json.dumps({"layer": layer, "dataset": "c4", "seed": 0}),
+                    encoding="utf-8",
+                )
+                paths.append(path)
+            series = [read_series(path, index) for index, path in enumerate(paths)]
+            self.assertEqual([item["label"] for item in series], ["L5", "L24", "L42"])
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                warn_if_incomparable(series)
+            self.assertEqual(recorded, [])
+
+    def test_missing_metadata_falls_back_and_warns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "L5-C4" / "summary.csv"
+            second = Path(directory) / "older-result" / "summary.csv"
+            self.write_summary(first)
+            self.write_summary(second)
+            first.with_name("metadata.json").write_text(
+                json.dumps({"layer": 5, "dataset": "c4"}), encoding="utf-8"
+            )
+            series = [read_series(first, 0), read_series(second, 1)]
+            self.assertEqual([item["label"] for item in series], ["L5", "Series 2"])
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                warn_if_incomparable(series)
+            self.assertTrue(any("lacks metadata" in str(w.message) for w in recorded))
+
+    def test_mismatched_settings_warn_without_rejecting_old_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for layer, seed in ((5, 0), (24, 1)):
+                path = Path(directory) / f"L{layer}" / "summary.csv"
+                self.write_summary(path)
+                path.with_name("metadata.json").write_text(
+                    json.dumps({"layer": layer, "dataset": "c4", "seed": seed}),
+                    encoding="utf-8",
+                )
+                paths.append(path)
+            series = [read_series(path, index) for index, path in enumerate(paths)]
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter("always")
+                warn_if_incomparable(series)
+            self.assertTrue(any("seed" in str(w.message) for w in recorded))
+
+    def test_three_inputs_draw_three_curves_without_torch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = []
+            for layer in (5, 24, 42):
+                path = Path(directory) / f"L{layer}" / "summary.csv"
+                self.write_summary(path)
+                path.with_name("metadata.json").write_text(
+                    json.dumps({"layer": layer, "seed": 0}), encoding="utf-8"
+                )
+                paths.append(path)
+            figure, axes = Mock(), Mock()
+            matplotlib = types.ModuleType("matplotlib")
+            pyplot = types.ModuleType("matplotlib.pyplot")
+            matplotlib.use = Mock()
+            pyplot.subplots = Mock(return_value=(figure, axes))
+            pyplot.close = Mock()
+            with patch.dict("sys.modules", {"matplotlib": matplotlib,
+                                           "matplotlib.pyplot": pyplot}):
+                argv = [item for path in paths for item in ("--input", str(path))]
+                with redirect_stdout(StringIO()):
+                    plot_main(argv + ["--output", str(Path(directory) / "comparison.png")])
+            self.assertEqual(axes.plot.call_count, 3)
+            self.assertEqual(axes.legend.call_count, 1)
+            self.assertEqual(figure.savefig.call_count, 2)
+
+    def test_single_input_still_draws_one_curve_without_legend(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.csv"
+            self.write_summary(path)
+            figure, axes = Mock(), Mock()
+            matplotlib = types.ModuleType("matplotlib")
+            pyplot = types.ModuleType("matplotlib.pyplot")
+            matplotlib.use = Mock()
+            pyplot.subplots = Mock(return_value=(figure, axes))
+            pyplot.close = Mock()
+            with patch.dict("sys.modules", {"matplotlib": matplotlib,
+                                           "matplotlib.pyplot": pyplot}):
+                with redirect_stdout(StringIO()):
+                    plot_main(["--input", str(path)])
+            self.assertEqual(axes.plot.call_count, 1)
+            axes.legend.assert_not_called()
+            self.assertEqual(figure.savefig.call_count, 2)
 
 
 class MeasurementMathTest(unittest.TestCase):
