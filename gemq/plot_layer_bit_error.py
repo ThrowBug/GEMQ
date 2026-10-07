@@ -10,7 +10,7 @@ import warnings
 
 
 BITS = (1, 2, 3, 4)
-COLORS = ("#9BF9F6", "#75D500", "#EDF854", "#FCBEE0", "#FFB10A")
+COLORS = ("#A6F2EF", "#75D500", "#F2F98B", "#FCBEE0", "#FFB10A")
 MARKERS = ("o", "s", "^", "D", "v")
 COMPARISON_FIELDS = (
     "model", "dataset", "calib_samples", "eval_samples", "seqlen",
@@ -50,10 +50,10 @@ def read_series(path, index):
 
     layer = metadata.get("layer") if metadata is not None else None
     if isinstance(layer, int) and not isinstance(layer, bool) and layer >= 0:
-        label = f"L{layer}"
+        label = f"Layer {layer}"
     else:
         match = re.match(r"^L(\d+)(?:-|$)", path.parent.name)
-        label = f"L{match.group(1)}" if match else f"Series {index + 1}"
+        label = f"Layer {match.group(1)}" if match else f"Series {index + 1}"
     return {"path": path, "label": label, "values": read_summary(path),
             "metadata": metadata}
 
@@ -97,8 +97,8 @@ def parse_args(argv=None):
     parser.add_argument("--yscale", choices=("linear", "log"), default="linear")
     parser.add_argument("--color", default="#0072B2")
     parser.add_argument("--marker", default="o")
-    parser.add_argument("--fig_width", type=float, default=3.6)
-    parser.add_argument("--fig_height", type=float, default=2.8)
+    parser.add_argument("--fig_width", type=float, default=4.6)
+    parser.add_argument("--fig_height", type=float, default=3.2)
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--title", default="")
     args = parser.parse_args(argv)
@@ -150,6 +150,8 @@ def main(argv=None):
     if args.title:
         ax.set_title(args.title)
     ax.grid(axis="y", alpha=0.25)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     if len(series) > 1:
         ax.legend(frameon=False, fontsize=8)
     fig.tight_layout()

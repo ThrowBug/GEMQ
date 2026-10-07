@@ -48,6 +48,7 @@ class PlotInputTest(unittest.TestCase):
         args = parse_plot_args(["--input", "measurements/summary.csv"])
         self.assertEqual(args.input, [Path("measurements/summary.csv")])
         self.assertEqual(args.output, Path("measurements/bit_width_relative_mse.png"))
+        self.assertEqual((args.fig_width, args.fig_height), (4.6, 3.2))
 
     def test_multiple_inputs_require_separate_output(self):
         inputs = ["--input", "L5/summary.csv", "--input", "L24/summary.csv"]
@@ -70,7 +71,10 @@ class PlotInputTest(unittest.TestCase):
                 )
                 paths.append(path)
             series = [read_series(path, index) for index, path in enumerate(paths)]
-            self.assertEqual([item["label"] for item in series], ["L5", "L24", "L42"])
+            self.assertEqual(
+                [item["label"] for item in series],
+                ["Layer 5", "Layer 24", "Layer 42"],
+            )
             with warnings.catch_warnings(record=True) as recorded:
                 warnings.simplefilter("always")
                 warn_if_incomparable(series)
@@ -86,7 +90,7 @@ class PlotInputTest(unittest.TestCase):
                 json.dumps({"layer": 5, "dataset": "c4"}), encoding="utf-8"
             )
             series = [read_series(first, 0), read_series(second, 1)]
-            self.assertEqual([item["label"] for item in series], ["L5", "Series 2"])
+            self.assertEqual([item["label"] for item in series], ["Layer 5", "Series 2"])
             with warnings.catch_warnings(record=True) as recorded:
                 warnings.simplefilter("always")
                 warn_if_incomparable(series)
@@ -120,6 +124,7 @@ class PlotInputTest(unittest.TestCase):
                 )
                 paths.append(path)
             figure, axes = Mock(), Mock()
+            axes.spines = {"top": Mock(), "right": Mock()}
             matplotlib = types.ModuleType("matplotlib")
             pyplot = types.ModuleType("matplotlib.pyplot")
             matplotlib.use = Mock()
@@ -133,12 +138,16 @@ class PlotInputTest(unittest.TestCase):
             self.assertEqual(axes.plot.call_count, 3)
             self.assertEqual(axes.legend.call_count, 1)
             self.assertEqual(figure.savefig.call_count, 2)
+            pyplot.subplots.assert_called_once_with(figsize=(4.6, 3.2))
+            axes.spines["top"].set_visible.assert_called_once_with(False)
+            axes.spines["right"].set_visible.assert_called_once_with(False)
 
     def test_single_input_still_draws_one_curve_without_legend(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "summary.csv"
             self.write_summary(path)
             figure, axes = Mock(), Mock()
+            axes.spines = {"top": Mock(), "right": Mock()}
             matplotlib = types.ModuleType("matplotlib")
             pyplot = types.ModuleType("matplotlib.pyplot")
             matplotlib.use = Mock()
@@ -151,6 +160,8 @@ class PlotInputTest(unittest.TestCase):
             self.assertEqual(axes.plot.call_count, 1)
             axes.legend.assert_not_called()
             self.assertEqual(figure.savefig.call_count, 2)
+            axes.spines["top"].set_visible.assert_called_once_with(False)
+            axes.spines["right"].set_visible.assert_called_once_with(False)
 
 
 class MeasurementMathTest(unittest.TestCase):
