@@ -1,0 +1,73 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "Qwen3 expert-routing Jaccard: from traces to figure",
+  "description": "Follow how full-precision Qwen3 routing is measured on C4, MATH-500, and GPQA-Diamond, then compared as layer-wise top-expert Jaccard curves.",
+  "steps": [
+    {
+      "file": "gemq/generate_routing_qa.py",
+      "line": 13,
+      "title": "Reuse evaluation prompts",
+      "description": "MATH-500 and GPQA-Diamond samples are loaded through their EvalScope adapters with zero-shot formatting. A seeded sample order is recorded, so the later routing statistics refer to actual task-style prompts rather than an invented template."
+    },
+    {
+      "file": "gemq/generate_routing_qa.py",
+      "line": 87,
+      "title": "Replace overlong prompts",
+      "description": "Each chat-formatted prompt must fit under max_seq_len and leave room for an answer token. Overlong prompts are skipped and replaced from the deterministic remaining pool; prompt 82 does not truncate or block the run."
+    },
+    {
+      "file": "gemq/generate_routing_qa.py",
+      "line": 213,
+      "title": "Generate and save QA traces",
+      "description": "The original full-precision model generates answers greedily. Each records.jsonl entry saves separate prompt_ids and answer_ids, allowing the profiling pass to replay the same token context and split prompt versus answer routing."
+    },
+    {
+      "file": "gemq/profile_expert_routing.py",
+      "line": 44,
+      "title": "Construct profiling sequences",
+      "description": "C4 yields 128 fixed 2048-token calibration blocks by default. QA instead replays 128 independent prompt-plus-answer records of variable length, checks generation metadata, and never repacks them into C4-style blocks."
+    },
+    {
+      "file": "gemq/profile_expert_routing.py",
+      "line": 165,
+      "title": "Capture router logits",
+      "description": "The profiler loads the full-precision checkpoint and hooks selected MoE gates during a complete model forward. --layers chooses which gates to record; it does not skip the other transformer layers or accelerate the whole forward proportionally."
+    },
+    {
+      "file": "gemq/profile_expert_routing.py",
+      "line": 22,
+      "title": "Apply Qwen3 top-k routing",
+      "description": "Per token, router logits become softmax probabilities, the top-k expert IDs are selected, and their selected probabilities are renormalized to sum to one. For Qwen3 k is eight; these are the probabilities used by the statistic, not the original unnormalized top-k mass."
+    },
+    {
+      "file": "gemq/profile_expert_routing.py",
+      "line": 32,
+      "title": "Accumulate three expert statistics",
+      "description": "For each selected expert and scope, add one activation and its renormalized probability. The CSV later exposes count C, probability sum S, and mean S/C when C is nonzero; inactive experts have no mean."
+    },
+    {
+      "file": "gemq/profile_expert_routing.py",
+      "line": 105,
+      "title": "Persist statistics by layer and scope",
+      "description": "The profiler writes per_sample.npz and routing_stats.csv. C4 has a combined scope; QA has combined, prompt, and answer scopes, so the plot can choose which QA tokens to compare against C4."
+    },
+    {
+      "file": "gemq/plot_routing_jaccard.py",
+      "line": 62,
+      "title": "Rank top-N experts independently",
+      "description": "For each common layer and domain, rank active experts separately by activation_count or mean_probability_when_active and take top_n, default 32. Ties use smaller expert ID. The stored probability sum is deliberately not a ranking metric in this figure."
+    },
+    {
+      "file": "gemq/plot_routing_jaccard.py",
+      "line": 78,
+      "title": "Compare each domain with C4",
+      "description": "For each metric, build a C4 top-N set and a target-domain top-N set, then compute intersection divided by union. MATH-500 versus C4 and GPQA-Diamond versus C4 are separate comparisons; there is no direct MATH-versus-GPQA curve."
+    },
+    {
+      "file": "gemq/plot_routing_jaccard.py",
+      "line": 101,
+      "title": "Draw and export the figure",
+      "description": "The x-axis is zero-based MoE layer and the y-axis is Jaccard from zero to one. Domain controls color and ranking metric controls marker and line style; the script writes PNG, PDF, comparison CSV, and metadata JSON without overwriting existing files."
+    }
+  ]
+}

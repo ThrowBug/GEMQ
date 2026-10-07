@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from gemq.profile_expert_routing import load_sequences, parse_layers
+from gemq.profile_expert_routing import load_sequences, parse_args, parse_layers
 
 
 class LayerSelectionTest(unittest.TestCase):
@@ -16,6 +16,23 @@ class LayerSelectionTest(unittest.TestCase):
         for spec in ("", "0,0", "4", "-1"):
             with self.subTest(spec=spec), self.assertRaises(ValueError):
                 parse_layers(spec, 4)
+
+    def test_quantized_model_uses_its_directory_name_without_changing_original_defaults(self):
+        original = parse_args(["--dataset", "c4"])
+        self.assertEqual(
+            original.output_dir,
+            Path("cache/routing_analysis/stats/c4/N128-L2048-Seed0"),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            quantized = Path(temp) / "fake-quant-model"
+            quantized.mkdir()
+            args = parse_args([
+                "--dataset", "c4", "--quantized_model_path", str(quantized),
+            ])
+            self.assertEqual(
+                args.output_dir,
+                Path("cache/routing_analysis/stats/fake-quant-model/c4/N128-L2048-Seed0"),
+            )
 
 
 class RoutingStatisticsTest(unittest.TestCase):
@@ -51,7 +68,7 @@ class RecordValidationTest(unittest.TestCase):
             }) + "\n", encoding="utf-8")
             args = SimpleNamespace(
                 dataset="math_500", model="checkpoint", nsamples=1, seqlen=8,
-                records=records,
+                records=records, quantized_model_path=directory / "fake-quant-model",
             )
             self.assertEqual(list(load_sequences(args, None)), [(0, [1, 2, 3, 4], 2)])
             args.dataset = "gpqa_diamond"

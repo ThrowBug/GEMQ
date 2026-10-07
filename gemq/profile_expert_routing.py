@@ -1,4 +1,4 @@
-"""Measure full-checkpoint Qwen3-MoE expert routing on C4 or saved QA traces."""
+"""Measure Qwen3-MoE expert routing on C4 or saved QA traces."""
 
 import argparse
 import csv
@@ -83,7 +83,9 @@ def load_sequences(args, tokenizer):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=("c4", "math_500", "gpqa_diamond"), required=True)
-    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--model", default=MODEL, help="Original model used for the tokenizer and QA records")
+    parser.add_argument("--quantized_model_path", type=Path,
+                        help="Saved, unpruned fake-quant model directory to profile instead of --model")
     parser.add_argument("--records", type=Path, help="records.jsonl from generate_routing_qa")
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--seqlen", type=int, default=2048)
@@ -97,8 +99,15 @@ def parse_args(argv=None):
         parser.error("nsamples and seqlen must be positive")
     if args.dataset != "c4" and args.records is None:
         parser.error("--records is required for math_500 and gpqa_diamond")
+    if args.quantized_model_path is not None and not args.quantized_model_path.is_dir():
+        parser.error("--quantized_model_path must be an existing model directory")
+    if args.quantized_model_path is not None and args.quantized_model_path.name in ("", ".", ".."):
+        parser.error("--quantized_model_path must name a model directory, not its parent")
     if args.output_dir is None:
-        args.output_dir = Path("cache/routing_analysis/stats") / args.dataset / f"N{args.nsamples}-L{args.seqlen}-Seed{args.seed}"
+        stats_root = Path("cache/routing_analysis/stats")
+        if args.quantized_model_path is not None:
+            stats_root /= args.quantized_model_path.name
+        args.output_dir = stats_root / args.dataset / f"N{args.nsamples}-L{args.seqlen}-Seed{args.seed}"
     return args
 
 
@@ -134,10 +143,10 @@ def main(argv=None):
     from transformers import AutoModel, AutoTokenizer
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Full-checkpoint routing collection requires CUDA.")
+        raise RuntimeError("Expert routing collection requires CUDA.")
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True, trust_remote_code=True)
     model = AutoModel.from_pretrained(
-        args.model,
+        str(args.quantized_model_path) if args.quantized_model_path is not None else args.model,
         torch_dtype=getattr(torch, args.dtype),
         device_map="auto",
         attn_implementation=args.attn_impl,
@@ -232,6 +241,9 @@ def main(argv=None):
         "mass_definition": "topk(softmax(router_logits)) / sum(topk(softmax(router_logits)))",
         "c4_source": "gemq.utils.data_utils.get_calib_loader" if args.dataset == "c4" else None,
     }
+    if args.quantized_model_path is not None:
+        metadata["quantized_model_path"] = str(args.quantized_model_path.resolve())
+        metadata["quantized_model_name"] = args.quantized_model_path.name
     (args.output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
     )
