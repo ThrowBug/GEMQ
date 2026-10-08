@@ -1,10 +1,12 @@
 import csv
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from gemq.plot_routing_jaccard import compare_domains, main, read_routing_csv, top_experts
+from gemq.plot_routing_jaccard import compare_domains, draw_figure, main, read_routing_csv, top_experts
 
 
 def write_stats(path, dataset, counts, means):
@@ -21,6 +23,27 @@ def write_stats(path, dataset, counts, means):
 
 
 class JaccardPlotDataTest(unittest.TestCase):
+    def test_figure_doubles_text_sizes(self):
+        figure, axes = Mock(), Mock()
+        axes.spines = {"top": Mock(), "right": Mock()}
+        matplotlib = types.ModuleType("matplotlib")
+        pyplot = types.ModuleType("matplotlib.pyplot")
+        matplotlib.use = Mock()
+        pyplot.subplots = Mock(return_value=(figure, axes))
+        pyplot.close = Mock()
+        rows = [{
+            "comparison": "math_500_vs_c4", "metric": "activation_count",
+            "layer": 5, "jaccard": 0.5,
+        }]
+        with patch.dict(sys.modules, {"matplotlib": matplotlib, "matplotlib.pyplot": pyplot}):
+            with patch("gemq.plot_routing_jaccard.configure_arial"):
+                draw_figure(rows, "plot.png", "plot.pdf", 32)
+        axes.set_xlabel.assert_called_once_with("MoE Layer Index", fontsize=20)
+        axes.set_ylabel.assert_called_once_with("Top-32 Expert Jaccard Similarity", fontsize=20)
+        axes.tick_params.assert_called_once_with(axis="both", labelsize=20)
+        axes.legend.assert_called_once_with(frameon=False, ncol=1, fontsize=16, loc="best")
+        self.assertEqual(figure.savefig.call_count, 2)
+
     def test_count_and_mean_use_different_top_sets(self):
         with tempfile.TemporaryDirectory() as temp:
             c4_path, math_path = Path(temp) / "c4.csv", Path(temp) / "math.csv"

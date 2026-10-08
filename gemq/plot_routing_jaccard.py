@@ -17,6 +17,9 @@ DOMAINS = (
     ("math_500", "MATH-500", "#0072B2"),
     ("gpqa_diamond", "GPQA-Diamond", "#D55E00"),
 )
+AXIS_LABEL_FONTSIZE = 20
+TICK_FONTSIZE = 20
+LEGEND_FONTSIZE = 16
 
 
 def read_routing_csv(path, expected_dataset, scope):
@@ -124,13 +127,14 @@ def draw_figure(rows, output_png, output_pdf, top_n):
                     markersize=3.7, linewidth=1.45,
                     label=f"{label} vs. C4 · {metric_label}",
                 )
-    ax.set_xlabel("MoE Layer Index")
-    ax.set_ylabel(f"Top-{top_n} Expert Jaccard Similarity")
+    ax.set_xlabel("MoE Layer Index", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.set_ylabel(f"Top-{top_n} Expert Jaccard Similarity", fontsize=AXIS_LABEL_FONTSIZE)
+    ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
     ax.set_ylim(0, 1)
     ax.grid(axis="y", color="0.88", linewidth=0.7)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, ncol=2, fontsize=8, loc="best")
+    ax.legend(frameon=False, ncol=1, fontsize=LEGEND_FONTSIZE, loc="best")
     fig.savefig(output_png, dpi=300)
     fig.savefig(output_pdf)
     plt.close(fig)
