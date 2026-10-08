@@ -6,7 +6,7 @@ import json
 import math
 from pathlib import Path
 
-from gemq.plot_style import configure_arial
+from gemq.plot_style import configure_plot_font
 
 
 METRICS = (
@@ -17,9 +17,8 @@ DOMAINS = (
     ("math_500", "MATH-500", "#0072B2"),
     ("gpqa_diamond", "GPQA-Diamond", "#D55E00"),
 )
-AXIS_LABEL_FONTSIZE = 16
-TICK_FONTSIZE = 16
-LEGEND_FONTSIZE = 13
+DEFAULT_FONT_SIZE = 16.0
+LEGEND_FONT_SCALE = 13 / 16
 
 
 def read_routing_csv(path, expected_dataset, scope):
@@ -103,7 +102,7 @@ def compare_domains(c4, target, target_name, top_n):
     return rows
 
 
-def draw_figure(rows, output_png, output_pdf, top_n):
+def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -111,7 +110,7 @@ def draw_figure(rows, output_png, output_pdf, top_n):
     except ImportError as exc:
         raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
 
-    configure_arial()
+    configure_plot_font(font_size)
     fig, ax = plt.subplots(figsize=(8.2, 4.1), constrained_layout=True)
     for dataset, label, color in DOMAINS:
         for metric, metric_label, marker, linestyle in METRICS:
@@ -127,14 +126,14 @@ def draw_figure(rows, output_png, output_pdf, top_n):
                     markersize=3.7, linewidth=1.45,
                     label=f"{label} vs. C4 · {metric_label}",
                 )
-    ax.set_xlabel("MoE Layer Index", fontsize=AXIS_LABEL_FONTSIZE)
-    ax.set_ylabel(f"Top-{top_n} Expert Jaccard Similarity", fontsize=AXIS_LABEL_FONTSIZE)
-    ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
+    ax.set_xlabel("MoE Layer Index", fontsize=font_size)
+    ax.set_ylabel(f"Top-{top_n} Expert Jaccard Similarity", fontsize=font_size)
+    ax.tick_params(axis="both", labelsize=font_size)
     ax.set_ylim(0, 1)
     ax.grid(axis="y", color="0.88", linewidth=0.7)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, ncol=1, fontsize=LEGEND_FONTSIZE, loc="best")
+    ax.legend(frameon=False, ncol=1, fontsize=font_size * LEGEND_FONT_SCALE, loc="best")
     fig.savefig(output_png, dpi=300)
     fig.savefig(output_pdf)
     plt.close(fig)
@@ -149,11 +148,13 @@ def parse_args(argv=None):
     parser.add_argument("--gpqa_csv", type=Path, default=stats_root / "gpqa_diamond" / run_name / "routing_stats.csv")
     parser.add_argument("--qa_scope", choices=("combined", "prompt", "answer"), default="combined")
     parser.add_argument("--top_n", type=int, default=32, help="Number of top-ranked experts per layer (default: 32)")
+    parser.add_argument("--font_size", type=float, default=DEFAULT_FONT_SIZE,
+                        help="Base font size in points (default: 16)")
     parser.add_argument("--output_prefix", type=Path,
                         help="Output path without extension; creates .png, .pdf, .csv and .json in cache/")
     args = parser.parse_args(argv)
-    if args.top_n <= 0:
-        parser.error("--top_n must be positive")
+    if args.top_n <= 0 or args.font_size <= 0:
+        parser.error("--top_n and --font_size must be positive")
     if args.output_prefix is None:
         args.output_prefix = Path("cache/routing_analysis/figures") / f"jaccard_layers_top{args.top_n}_{args.qa_scope}"
     return args
@@ -183,7 +184,7 @@ def main(argv=None):
         if path.exists():
             raise FileExistsError(f"Refusing to overwrite {path}; choose another --output_prefix")
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    draw_figure(rows, outputs[".png"], outputs[".pdf"], args.top_n)
+    draw_figure(rows, outputs[".png"], outputs[".pdf"], args.top_n, args.font_size)
     with outputs[".csv"].open("x", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=(
             "comparison", "layer", "metric", "top_n", "intersection", "union", "jaccard",

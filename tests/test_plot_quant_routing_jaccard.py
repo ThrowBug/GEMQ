@@ -27,13 +27,14 @@ class ThreeModelRoutingPlotTest(unittest.TestCase):
                 "--quantized_model_paths", *(str(model) for model in models),
                 "--labels", "Model A", "Model B", "Model C",
                 "--stats_root", str(stats), "--top_n", "2",
-                "--qa_scope", "answer", "--output_prefix", str(prefix),
+                "--qa_scope", "answer", "--font_size", "12", "--output_prefix", str(prefix),
             ]
 
-            def fake_draw(rows, labels, top_n, png, pdf):
+            def fake_draw(rows, labels, top_n, png, pdf, font_size):
                 self.assertEqual(len(rows), 9)
                 self.assertEqual(labels, ["Model A", "Model B", "Model C"])
                 self.assertEqual(top_n, 2)
+                self.assertEqual(font_size, 12.0)
                 png.touch()
                 pdf.touch()
 

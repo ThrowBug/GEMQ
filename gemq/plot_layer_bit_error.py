@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import warnings
 
-from gemq.plot_style import configure_arial
+from gemq.plot_style import configure_plot_font
 
 
 BITS = (1, 2, 3, 4)
@@ -103,9 +103,11 @@ def parse_args(argv=None):
     parser.add_argument("--fig_height", type=float, default=3.2)
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--title", default="")
+    parser.add_argument("--font_size", type=float, default=10.0,
+                        help="Base font size in points (default: 10)")
     args = parser.parse_args(argv)
-    if args.fig_width <= 0 or args.fig_height <= 0 or args.dpi <= 0:
-        parser.error("figure dimensions and DPI must be positive")
+    if args.fig_width <= 0 or args.fig_height <= 0 or args.dpi <= 0 or args.font_size <= 0:
+        parser.error("figure dimensions, DPI and --font_size must be positive")
     if len({path.resolve() for path in args.input}) != len(args.input):
         parser.error("--input paths must be distinct")
     if args.output is None:
@@ -133,7 +135,7 @@ def main(argv=None):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    configure_arial()
+    configure_plot_font(args.font_size)
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
     for index, item in enumerate(series):
         color = args.color if index == 0 else COLORS[index % len(COLORS)]
@@ -145,18 +147,19 @@ def main(argv=None):
         )
     ax.set_xticks(BITS)
     ax.set_xlim(0.8, 4.2)
-    ax.set_xlabel("Bit Width")
-    ax.set_ylabel("Relative MoE Output MSE")
+    ax.set_xlabel("Bit Width", fontsize=args.font_size)
+    ax.set_ylabel("Relative MoE Output MSE", fontsize=args.font_size)
+    ax.tick_params(axis="both", labelsize=args.font_size)
     ax.set_yscale(args.yscale)
     if args.yscale == "linear":
         ax.set_ylim(bottom=0)
     if args.title:
-        ax.set_title(args.title)
+        ax.set_title(args.title, fontsize=args.font_size * 1.2)
     ax.grid(axis="y", alpha=0.25)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     if len(series) > 1:
-        ax.legend(frameon=False, fontsize=8)
+        ax.legend(frameon=False, fontsize=args.font_size * 0.8)
     fig.tight_layout()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=args.dpi)

@@ -36,8 +36,9 @@ class JaccardPlotDataTest(unittest.TestCase):
             "layer": 5, "jaccard": 0.5,
         }]
         with patch.dict(sys.modules, {"matplotlib": matplotlib, "matplotlib.pyplot": pyplot}):
-            with patch("gemq.plot_routing_jaccard.configure_arial"):
+            with patch("gemq.plot_routing_jaccard.configure_plot_font") as configure:
                 draw_figure(rows, "plot.png", "plot.pdf", 32)
+        configure.assert_called_once_with(16.0)
         axes.set_xlabel.assert_called_once_with("MoE Layer Index", fontsize=16)
         axes.set_ylabel.assert_called_once_with("Top-32 Expert Jaccard Similarity", fontsize=16)
         axes.tick_params.assert_called_once_with(axis="both", labelsize=16)
@@ -74,7 +75,8 @@ class JaccardPlotDataTest(unittest.TestCase):
             write_stats(math_path, "math_500", [12, 5, 11, 4], [0.2, 0.1, 0.95, 0.85])
             prefix = directory / "plot"
 
-            def fake_draw(_rows, png, pdf, _top_n):
+            def fake_draw(_rows, png, pdf, _top_n, font_size):
+                self.assertEqual(font_size, 14.0)
                 png.touch()
                 pdf.touch()
 
@@ -82,7 +84,7 @@ class JaccardPlotDataTest(unittest.TestCase):
                 main([
                     "--c4_csv", str(c4_path), "--math_csv", str(math_path),
                     "--gpqa_csv", str(directory / "missing.csv"),
-                    "--top_n", "2", "--output_prefix", str(prefix),
+                    "--top_n", "2", "--font_size", "14", "--output_prefix", str(prefix),
                 ])
             self.assertTrue((directory / "plot.png").is_file())
             self.assertTrue((directory / "plot.pdf").is_file())

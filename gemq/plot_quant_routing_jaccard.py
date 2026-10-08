@@ -11,7 +11,7 @@ from gemq.compare_quant_routing_jaccard import (
     read_metadata,
 )
 from gemq.plot_routing_jaccard import read_routing_csv
-from gemq.plot_style import configure_arial
+from gemq.plot_style import configure_plot_font
 
 
 DATASET_LABELS = {
@@ -21,6 +21,7 @@ DATASET_LABELS = {
 }
 MODEL_COLORS = ("#0072B2", "#D55E00", "#009E73")
 MODEL_MARKERS = ("o", "s", "^")
+DEFAULT_FONT_SIZE = 10.0
 CSV_COLUMNS = (
     "model_label", "quantized_model_name", "quantized_model_path", "dataset",
     "scope", "layer", "metric", "top_n", "intersection", "union", "jaccard",
@@ -40,11 +41,13 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--qa_scope", choices=("combined", "prompt", "answer"), default="combined")
     parser.add_argument("--top_n", type=int, default=32)
+    parser.add_argument("--font_size", type=float, default=DEFAULT_FONT_SIZE,
+                        help="Base font size in points (default: 10)")
     parser.add_argument("--output_prefix", required=True, type=Path,
                         help="Output path without extension; creates .csv, .png and .pdf")
     args = parser.parse_args(argv)
-    if args.nsamples <= 0 or args.seqlen <= 0 or args.top_n <= 0:
-        parser.error("--nsamples, --seqlen and --top_n must be positive")
+    if args.nsamples <= 0 or args.seqlen <= 0 or args.top_n <= 0 or args.font_size <= 0:
+        parser.error("--nsamples, --seqlen, --top_n and --font_size must be positive")
     for path in args.quantized_model_paths:
         if not path.is_dir() or path.name in ("", ".", ".."):
             parser.error(f"--quantized_model_paths must contain named model directories: {path}")
@@ -94,7 +97,7 @@ def collect_rows(args):
     return rows
 
 
-def draw_figure(rows, labels, top_n, output_png, output_pdf):
+def draw_figure(rows, labels, top_n, output_png, output_pdf, font_size=DEFAULT_FONT_SIZE):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -102,7 +105,7 @@ def draw_figure(rows, labels, top_n, output_png, output_pdf):
     except ImportError as exc:
         raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
 
-    configure_arial()
+    configure_plot_font(font_size)
     fig, axes = plt.subplots(1, 3, figsize=(11.6, 3.65), sharey=True)
     legend_handles = []
     for ax, dataset in zip(axes, DATASETS):
@@ -121,16 +124,17 @@ def draw_figure(rows, labels, top_n, output_png, output_pdf):
             )
             if dataset == DATASETS[0]:
                 legend_handles.append(line)
-        ax.set_title(DATASET_LABELS[dataset], fontsize=11)
-        ax.set_xlabel("MoE Layer Index")
+        ax.set_title(DATASET_LABELS[dataset], fontsize=font_size * 1.1)
+        ax.set_xlabel("MoE Layer Index", fontsize=font_size)
         ax.set_ylim(0, 1)
         ax.set_yticks((0, 0.25, 0.5, 0.75, 1.0))
+        ax.tick_params(axis="both", labelsize=font_size)
         ax.grid(axis="y", color="0.88", linewidth=0.7)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
-    axes[0].set_ylabel(f"Top-{top_n} Mean-Score Jaccard Similarity")
+    axes[0].set_ylabel(f"Top-{top_n} Mean-Score Jaccard Similarity", fontsize=font_size)
     fig.legend(legend_handles, labels, loc="upper center", ncol=3, frameon=False,
-               bbox_to_anchor=(0.5, 1.0))
+               bbox_to_anchor=(0.5, 1.0), fontsize=font_size)
     fig.tight_layout(rect=(0, 0, 1, 0.88))
     fig.savefig(output_png, dpi=300)
     fig.savefig(output_pdf)
@@ -146,7 +150,7 @@ def main(argv=None):
             raise FileExistsError(f"Refusing to overwrite {path}; choose another --output_prefix")
     rows = collect_rows(args)
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    draw_figure(rows, args.labels, args.top_n, outputs[".png"], outputs[".pdf"])
+    draw_figure(rows, args.labels, args.top_n, outputs[".png"], outputs[".pdf"], args.font_size)
     with outputs[".csv"].open("x", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
         writer.writeheader()

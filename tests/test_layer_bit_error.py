@@ -133,11 +133,13 @@ class PlotInputTest(unittest.TestCase):
             with patch.dict("sys.modules", {"matplotlib": matplotlib,
                                            "matplotlib.pyplot": pyplot}):
                 argv = [item for path in paths for item in ("--input", str(path))]
-                with patch("gemq.plot_layer_bit_error.configure_arial") as configure, redirect_stdout(StringIO()):
-                    plot_main(argv + ["--output", str(Path(directory) / "comparison.png")])
-            configure.assert_called_once_with()
+                with patch("gemq.plot_layer_bit_error.configure_plot_font") as configure, redirect_stdout(StringIO()):
+                    plot_main(argv + ["--font_size", "14", "--output", str(Path(directory) / "comparison.png")])
+            configure.assert_called_once_with(14.0)
             self.assertEqual(axes.plot.call_count, 3)
             self.assertEqual(axes.legend.call_count, 1)
+            axes.set_xlabel.assert_called_once_with("Bit Width", fontsize=14.0)
+            axes.tick_params.assert_called_once_with(axis="both", labelsize=14.0)
             self.assertEqual(figure.savefig.call_count, 2)
             pyplot.subplots.assert_called_once_with(figsize=(4.6, 3.2))
             axes.spines["top"].set_visible.assert_called_once_with(False)
@@ -156,9 +158,9 @@ class PlotInputTest(unittest.TestCase):
             pyplot.close = Mock()
             with patch.dict("sys.modules", {"matplotlib": matplotlib,
                                            "matplotlib.pyplot": pyplot}):
-                with patch("gemq.plot_layer_bit_error.configure_arial") as configure, redirect_stdout(StringIO()):
+                with patch("gemq.plot_layer_bit_error.configure_plot_font") as configure, redirect_stdout(StringIO()):
                     plot_main(["--input", str(path)])
-            configure.assert_called_once_with()
+            configure.assert_called_once_with(10.0)
             self.assertEqual(axes.plot.call_count, 1)
             axes.legend.assert_not_called()
             self.assertEqual(figure.savefig.call_count, 2)
