@@ -1,0 +1,101 @@
+"""Plot cumulative decoder-output relative MSE versus layer for 1/2/3 bits."""
+
+import argparse
+import csv
+import math
+from pathlib import Path
+
+from gemq.plot_style import configure_plot_font
+
+
+BITS = (1, 2, 3)
+COLORS = {1: "#D55E00", 2: "#0072B2", 3: "#009E73"}
+MARKERS = {1: "o", 2: "s", 3: "^"}
+
+
+def read_measurements(path):
+    values = {}
+    with Path(path).open(newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream)
+        required = {"layer", "bit_width", "relative_mse"}
+        if reader.fieldnames is None or not required.issubset(reader.fieldnames):
+            raise ValueError(f"{path}: missing columns {sorted(required - set(reader.fieldnames or []))}")
+        for row in reader:
+            layer = int(row["layer"])
+            bit = int(row["bit_width"])
+            value = float(row["relative_mse"])
+            if layer < 0 or bit not in BITS or not math.isfinite(value) or value < 0:
+                raise ValueError(f"{path}: invalid layer, bit width or relative MSE: {row}")
+            if (layer, bit) in values:
+                raise ValueError(f"{path}: duplicate layer {layer}, {bit}-bit result")
+            values[layer, bit] = value
+    layers = sorted({layer for layer, _ in values})
+    if not layers or layers != list(range(layers[-1] + 1)):
+        raise ValueError(f"{path}: expected consecutive layer indices starting at zero")
+    missing = [(layer, bit) for layer in layers for bit in BITS if (layer, bit) not in values]
+    if missing:
+        raise ValueError(f"{path}: missing layer/bit results: {missing[:12]}")
+    return layers, {bit: [values[layer, bit] for layer in layers] for bit in BITS}
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", required=True, type=Path,
+                        help="cumulative_relative_mse.csv from the measurement script")
+    parser.add_argument("--output", type=Path,
+                        help="PNG output; a PDF is saved alongside it")
+    parser.add_argument("--fig_width", type=float, default=6.0)
+    parser.add_argument("--fig_height", type=float, default=3.8)
+    parser.add_argument("--dpi", type=int, default=300)
+    parser.add_argument("--font_size", type=float, default=10.0)
+    args = parser.parse_args(argv)
+    if args.fig_width <= 0 or args.fig_height <= 0 or args.dpi <= 0 or args.font_size <= 0:
+        parser.error("figure dimensions, DPI and --font_size must be positive")
+    if args.output is None:
+        args.output = args.input.with_suffix(".png")
+    if args.output.suffix.lower() != ".png":
+        parser.error("--output must end in .png")
+    return args
+
+
+def draw_figure(layers, curves, args):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
+
+    configure_plot_font(args.font_size)
+    fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
+    for bit in BITS:
+        ax.plot(
+            layers, curves[bit], color=COLORS[bit], marker=MARKERS[bit],
+            linewidth=1.8, markersize=4.5, label=f"{bit} Bit" if bit == 1 else f"{bit} Bits",
+        )
+    ax.set_xlabel("Decoder Layer Index", fontsize=args.font_size)
+    ax.set_ylabel("Cumulative Relative MSE", fontsize=args.font_size)
+    ax.set_xlim(layers[0], layers[-1])
+    ax.set_ylim(bottom=0)
+    ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+    ax.tick_params(axis="both", labelsize=args.font_size)
+    ax.grid(axis="y", alpha=0.25)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False, fontsize=args.font_size * 0.9)
+    fig.tight_layout()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(args.output, dpi=args.dpi)
+    fig.savefig(args.output.with_suffix(".pdf"))
+    plt.close(fig)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    layers, curves = read_measurements(args.input)
+    draw_figure(layers, curves, args)
+    print(f"Saved {args.output} and {args.output.with_suffix('.pdf')}")
+
+
+if __name__ == "__main__":
+    main()
