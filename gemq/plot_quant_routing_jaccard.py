@@ -145,13 +145,10 @@ def main(argv=None):
     args = parse_args(argv)
     outputs = {suffix: args.output_prefix.parent / f"{args.output_prefix.name}{suffix}"
                for suffix in (".csv", ".png", ".pdf")}
-    for path in outputs.values():
-        if path.exists():
-            raise FileExistsError(f"Refusing to overwrite {path}; choose another --output_prefix")
     rows = collect_rows(args)
     args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
     draw_figure(rows, args.labels, args.top_n, outputs[".png"], outputs[".pdf"], args.font_size)
-    with outputs[".csv"].open("x", newline="", encoding="utf-8") as output:
+    with outputs[".csv"].open("w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)

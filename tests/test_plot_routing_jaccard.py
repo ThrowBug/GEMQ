@@ -80,18 +80,26 @@ class JaccardPlotDataTest(unittest.TestCase):
                 png.touch()
                 pdf.touch()
 
+            argv = [
+                "--c4_csv", str(c4_path), "--math_csv", str(math_path),
+                "--gpqa_csv", str(directory / "missing.csv"),
+                "--top_n", "2", "--font_size", "14", "--output_prefix", str(prefix),
+            ]
             with patch("gemq.plot_routing_jaccard.draw_figure", side_effect=fake_draw):
-                main([
-                    "--c4_csv", str(c4_path), "--math_csv", str(math_path),
-                    "--gpqa_csv", str(directory / "missing.csv"),
-                    "--top_n", "2", "--font_size", "14", "--output_prefix", str(prefix),
-                ])
+                main(argv)
             self.assertTrue((directory / "plot.png").is_file())
             self.assertTrue((directory / "plot.pdf").is_file())
             with (directory / "plot.csv").open(newline="", encoding="utf-8") as source:
                 rows = list(csv.DictReader(source))
             self.assertEqual(len(rows), 2)
             self.assertEqual({row["comparison"] for row in rows}, {"math_500_vs_c4"})
+            (directory / "plot.csv").write_text("obsolete", encoding="utf-8")
+            (directory / "plot.json").write_text("obsolete", encoding="utf-8")
+            with patch("gemq.plot_routing_jaccard.draw_figure", side_effect=fake_draw):
+                main(argv)
+            with (directory / "plot.csv").open(newline="", encoding="utf-8") as source:
+                self.assertEqual(len(list(csv.DictReader(source))), 2)
+            self.assertIn('"top_n": 2', (directory / "plot.json").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

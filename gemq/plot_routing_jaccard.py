@@ -180,12 +180,9 @@ def main(argv=None):
 
     prefix = args.output_prefix
     outputs = {suffix: prefix.parent / f"{prefix.name}{suffix}" for suffix in (".png", ".pdf", ".csv", ".json")}
-    for path in outputs.values():
-        if path.exists():
-            raise FileExistsError(f"Refusing to overwrite {path}; choose another --output_prefix")
     prefix.parent.mkdir(parents=True, exist_ok=True)
     draw_figure(rows, outputs[".png"], outputs[".pdf"], args.top_n, args.font_size)
-    with outputs[".csv"].open("x", newline="", encoding="utf-8") as output:
+    with outputs[".csv"].open("w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, fieldnames=(
             "comparison", "layer", "metric", "top_n", "intersection", "union", "jaccard",
         ))

@@ -51,8 +51,11 @@ class ThreeModelRoutingPlotTest(unittest.TestCase):
             self.assertTrue(all(abs(float(row["jaccard"]) - 1 / 3) < 1e-12 for row in rows))
             self.assertEqual({row["scope"] for row in rows if row["dataset"] == "c4"}, {"combined"})
             self.assertEqual({row["scope"] for row in rows if row["dataset"] != "c4"}, {"answer"})
-            with self.assertRaises(FileExistsError):
+            prefix.with_suffix(".csv").write_text("obsolete", encoding="utf-8")
+            with patch("gemq.plot_quant_routing_jaccard.draw_figure", side_effect=fake_draw):
                 main(argv)
+            with prefix.with_suffix(".csv").open(newline="", encoding="utf-8") as source:
+                self.assertEqual(len(list(csv.DictReader(source))), 9)
 
     def test_directory_names_are_default_labels(self):
         with tempfile.TemporaryDirectory() as temp:
