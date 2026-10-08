@@ -17,9 +17,9 @@ DOMAINS = (
     ("math_500", "MATH-500", "#0072B2"),
     ("gpqa_diamond", "GPQA-Diamond", "#D55E00"),
 )
-AXIS_LABEL_FONTSIZE = 20
-TICK_FONTSIZE = 20
-LEGEND_FONTSIZE = 16
+AXIS_LABEL_FONTSIZE = 16
+TICK_FONTSIZE = 16
+LEGEND_FONTSIZE = 13
 
 
 def read_routing_csv(path, expected_dataset, scope):
