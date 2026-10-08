@@ -11,13 +11,11 @@ from tests.test_compare_quant_routing_jaccard import write_stats
 
 
 class ThreeModelRoutingPlotTest(unittest.TestCase):
-    def test_three_models_and_datasets_export_csv_png_pdf(self):
+    def test_three_models_without_model_dirs_export_csv_png_pdf(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stats = root / "stats"
             models = [root / name for name in ("quant-a", "quant-b", "quant-c")]
-            for model in models:
-                model.mkdir()
             for dataset in DATASETS:
                 write_stats(stats / dataset / "N128-L2048-Seed0", dataset)
                 for model in models:
@@ -60,8 +58,6 @@ class ThreeModelRoutingPlotTest(unittest.TestCase):
     def test_directory_names_are_default_labels(self):
         with tempfile.TemporaryDirectory() as temp:
             models = [Path(temp) / name for name in ("first", "second", "third")]
-            for model in models:
-                model.mkdir()
             args = parse_args([
                 "--quantized_model_paths", *(str(model) for model in models),
                 "--output_prefix", str(Path(temp) / "comparison"),
@@ -72,8 +68,6 @@ class ThreeModelRoutingPlotTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             models = [root / name for name in ("first", "second", "third")]
-            for model in models:
-                model.mkdir()
             prefix = root / "plot"
             with self.assertRaises(FileNotFoundError):
                 main([

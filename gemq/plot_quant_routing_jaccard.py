@@ -49,8 +49,8 @@ def parse_args(argv=None):
     if args.nsamples <= 0 or args.seqlen <= 0 or args.top_n <= 0 or args.font_size <= 0:
         parser.error("--nsamples, --seqlen, --top_n and --font_size must be positive")
     for path in args.quantized_model_paths:
-        if not path.is_dir() or path.name in ("", ".", ".."):
-            parser.error(f"--quantized_model_paths must contain named model directories: {path}")
+        if path.name in ("", ".", ".."):
+            parser.error(f"--quantized_model_paths must contain named model paths: {path}")
     model_names = [path.name for path in args.quantized_model_paths]
     if len(set(model_names)) != 3:
         parser.error("The three model directory names must be distinct because they identify stats subdirectories")
