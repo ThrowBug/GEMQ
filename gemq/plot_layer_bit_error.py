@@ -12,7 +12,7 @@ from gemq.plot_style import configure_arial
 
 
 BITS = (1, 2, 3, 4)
-COLORS = ("#67E4E0", "#7ADF4B", "#E6F421", "#FCBEE0", "#FFB10A")
+COLORS = ("#008AE09F", "#74BE51C7", "#E2EC56E2", "#FCBEE0", "#FFB10A")
 MARKERS = ("o", "s", "^", "D", "v")
 COMPARISON_FIELDS = (
     "model", "dataset", "calib_samples", "eval_samples", "seqlen",
@@ -97,7 +97,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--output", type=Path, help="PNG output; PDF is saved alongside it")
     parser.add_argument("--yscale", choices=("linear", "log"), default="linear")
-    parser.add_argument("--color", default="#67E4E0")
+    parser.add_argument("--color", default="#008AE09F")
     parser.add_argument("--marker", default="o")
     parser.add_argument("--fig_width", type=float, default=4.6)
     parser.add_argument("--fig_height", type=float, default=3.2)
