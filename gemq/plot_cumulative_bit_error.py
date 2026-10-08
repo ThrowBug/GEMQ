@@ -1,4 +1,4 @@
-"""Plot cumulative decoder-output relative MSE versus layer for 1/2/3 bits."""
+"""Plot cumulative decoder-output relative MSE versus layer for 1/2/3/4 bits."""
 
 import argparse
 import csv
@@ -8,9 +8,9 @@ from pathlib import Path
 from gemq.plot_style import configure_plot_font
 
 
-BITS = (1, 2, 3)
-COLORS = {1: "#D55E00", 2: "#0072B2", 3: "#009E73"}
-MARKERS = {1: "o", 2: "s", 3: "^"}
+BITS = (1, 2, 3, 4)
+COLORS = {1: "#D55E00", 2: "#0072B2", 3: "#009E73", 4: "#CC79A7"}
+MARKERS = {1: "o", 2: "s", 3: "^", 4: "D"}
 
 
 def read_measurements(path):
@@ -47,7 +47,8 @@ def parse_args(argv=None):
     parser.add_argument("--fig_width", type=float, default=6.0)
     parser.add_argument("--fig_height", type=float, default=3.8)
     parser.add_argument("--dpi", type=int, default=300)
-    parser.add_argument("--font_size", type=float, default=10.0)
+    parser.add_argument("--font_size", type=float, default=10.0,
+                        help="Base font size in points (default: 10)")
     args = parser.parse_args(argv)
     if args.fig_width <= 0 or args.fig_height <= 0 or args.dpi <= 0 or args.font_size <= 0:
         parser.error("figure dimensions, DPI and --font_size must be positive")

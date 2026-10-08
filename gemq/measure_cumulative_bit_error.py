@@ -1,7 +1,7 @@
-"""Measure cumulative decoder-output error for uniform 1/2/3-bit routed experts.
+"""Measure cumulative decoder-output error for uniform 1/2/3/4-bit routed experts.
 
 GPTQ Hessians are collected on the same full-precision C4 calibration path for
-all three bit widths. Evaluation is different: each bit-width path receives its
+all four bit widths. Evaluation is different: each bit-width path receives its
 own preceding layer output, so its error and routing changes can propagate.
 Attention, dense MLPs, routers, and other non-routed-expert weights stay FP.
 """
@@ -36,7 +36,7 @@ from gemq.utils.hf_loading import load_causal_lm_checkpoint
 from gemq.utils.model_utils import get_blocks, get_moe_block
 
 
-BITS = (1, 2, 3)
+BITS = (1, 2, 3, 4)
 CSV_COLUMNS = (
     "layer", "bit_width", "tokens", "squared_error_sum",
     "reference_squared_sum", "relative_mse",

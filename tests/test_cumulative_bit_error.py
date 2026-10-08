@@ -17,13 +17,13 @@ def write_measurements(path, *, missing=None):
         writer = csv.writer(stream)
         writer.writerow(("layer", "bit_width", "relative_mse"))
         for layer in range(2):
-            for bit in (1, 2, 3):
+            for bit in (1, 2, 3, 4):
                 if (layer, bit) != missing:
                     writer.writerow((layer, bit, (layer + 1) / bit))
 
 
 class CumulativePlotTest(unittest.TestCase):
-    def test_reads_three_complete_bit_curves(self):
+    def test_reads_four_complete_bit_curves(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cumulative_relative_mse.csv"
             write_measurements(path)
@@ -31,6 +31,7 @@ class CumulativePlotTest(unittest.TestCase):
             self.assertEqual(layers, [0, 1])
             self.assertEqual(curves[1], [1.0, 2.0])
             self.assertEqual(curves[3], [1 / 3, 2 / 3])
+            self.assertEqual(curves[4], [0.25, 0.5])
 
     def test_rejects_missing_layer_bit_pair(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -39,7 +40,7 @@ class CumulativePlotTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing layer/bit"):
                 read_measurements(path)
 
-    def test_draws_three_curves_and_both_formats(self):
+    def test_draws_four_curves_and_both_formats(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "cumulative_relative_mse.csv"
             write_measurements(path)
@@ -58,7 +59,7 @@ class CumulativePlotTest(unittest.TestCase):
                         plot_main(["--input", str(path), "--output", str(output),
                                    "--font_size", "12"])
             configure.assert_called_once_with(12.0)
-            self.assertEqual(axes.plot.call_count, 3)
+            self.assertEqual(axes.plot.call_count, 4)
             self.assertEqual(figure.savefig.call_count, 2)
             axes.set_xlabel.assert_called_once_with("Decoder Layer Index", fontsize=12.0)
             axes.spines["top"].set_visible.assert_called_once_with(False)
@@ -98,7 +99,7 @@ class CumulativeMeasurementTest(unittest.TestCase):
             return [item * 2 + layer.quant_error for item in hidden]
 
         def install(entries, bit, _args):
-            entries[0].quant_error = {1: 1.0, 2: 0.5, 3: 0.25}[bit]
+            entries[0].quant_error = {1: 1.0, 2: 0.5, 3: 0.25, 4: 0.125}[bit]
 
         def restore(entries):
             entries[0].quant_error = 0.0
@@ -123,6 +124,7 @@ class CumulativeMeasurementTest(unittest.TestCase):
         self.assertEqual(routed, [0, 1])
         one_bit = [row for row in rows if row["bit_width"] == 1]
         self.assertEqual([row["relative_mse"] for row in one_bit], [0.25, 9 / 16])
+        self.assertEqual({row["bit_width"] for row in rows}, {1, 2, 3, 4})
 
 
 if __name__ == "__main__":
