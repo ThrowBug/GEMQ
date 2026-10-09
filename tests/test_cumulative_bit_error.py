@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from gemq.plot_cumulative_bit_error import main as plot_main, read_measurements
+from gemq.plot_cumulative_bit_error import (
+    main as plot_main, parse_args as parse_plot_args, read_measurements,
+)
 
 
 def write_measurements(path, *, missing=None):
@@ -32,6 +34,20 @@ class CumulativePlotTest(unittest.TestCase):
             self.assertEqual(curves[1], [1.0, 2.0])
             self.assertEqual(curves[3], [1 / 3, 2 / 3])
             self.assertEqual(curves[4], [0.25, 0.5])
+            first_layer, first_curves = read_measurements(path, max_layers=1)
+            self.assertEqual(first_layer, [0])
+            self.assertEqual(first_curves[4], [0.25])
+            with self.assertRaisesRegex(ValueError, "--max_layers"):
+                read_measurements(path, max_layers=3)
+
+    def test_plot_limit_has_distinct_default_output(self):
+        args = parse_plot_args([
+            "--input", "cache/run/cumulative_relative_mse.csv", "--max_layers", "12",
+        ])
+        self.assertEqual(args.output, Path("cache/run/cumulative_relative_mse_first12.png"))
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parse_plot_args(["--input", "cache/run/cumulative_relative_mse.csv",
+                             "--max_layers", "0"])
 
     def test_rejects_missing_layer_bit_pair(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -120,14 +136,36 @@ class CumulativeMeasurementTest(unittest.TestCase):
              patch.object(measurement, "restore_fp_weights", side_effect=restore):
             with redirect_stdout(StringIO()):
                 rows, routed, unactivated = measurement.measure_layers(
-                    None, [None, None], types.SimpleNamespace(calib_samples=1),
+                    None, [None, None], types.SimpleNamespace(calib_samples=1, max_layers=None),
                     torch.device("cpu"),
                 )
+                first_rows, first_routed, _ = measurement.measure_layers(
+                    None, [None, None], types.SimpleNamespace(calib_samples=1, max_layers=1),
+                    torch.device("cpu"),
+                )
+                with self.assertRaisesRegex(ValueError, "exceeds 2"):
+                    measurement.measure_layers(
+                        None, [None, None], types.SimpleNamespace(calib_samples=1, max_layers=3),
+                        torch.device("cpu"),
+                    )
         self.assertEqual(routed, [0, 1])
         self.assertEqual(unactivated, {})
         one_bit = [row for row in rows if row["bit_width"] == 1]
         self.assertEqual([row["relative_mse"] for row in one_bit], [0.25, 9 / 16])
         self.assertEqual({row["bit_width"] for row in rows}, {1, 2, 3, 4})
+        self.assertEqual(first_routed, [0])
+        self.assertEqual(len(first_rows), 4)
+        self.assertEqual({row["layer"] for row in first_rows}, {0})
+
+    def test_measurement_limit_has_distinct_default_output(self):
+        from gemq.measure_cumulative_bit_error import parse_args
+
+        limited = parse_args(["--max_layers", "12"])
+        full = parse_args([])
+        self.assertEqual(limited.output_dir.name, "C4-Cal128-Eval8-Len2048-Seed0-First12")
+        self.assertEqual(full.output_dir.name, "C4-Cal128-Eval8-Len2048-Seed0")
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            parse_args(["--max_layers", "0"])
 
     def test_unactivated_expert_uses_weight_only_fallback(self):
         import torch

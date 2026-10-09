@@ -19,6 +19,9 @@ args=(
 if [[ -n "${OUTPUT_DIR:-}" ]]; then
     args+=(--output_dir "${OUTPUT_DIR}")
 fi
+if [[ -n "${MAX_LAYERS:-}" ]]; then
+    args+=(--max_layers "${MAX_LAYERS}")
+fi
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
     python -m gemq.measure_cumulative_bit_error "${args[@]}"

@@ -54,6 +54,8 @@ def parse_args(argv=None):
     parser.add_argument("--blocksize", type=int, default=128)
     parser.add_argument("--percdamp", type=float, default=0.01)
     parser.add_argument("--attn_impl", choices=("eager", "sdpa"), default="eager")
+    parser.add_argument("--max_layers", type=int,
+                        help="Measure only the first N decoder layers (indices 0 through N-1)")
     parser.add_argument("--output_dir", type=Path)
     args = parser.parse_args(argv)
     for key in ("calib_samples", "eval_samples", "seqlen", "groupsize", "blocksize"):
@@ -61,11 +63,16 @@ def parse_args(argv=None):
             parser.error(f"--{key} must be positive")
     if args.seed < 0 or not math.isfinite(args.percdamp) or args.percdamp < 0:
         parser.error("--seed and --percdamp must be non-negative and finite")
+    if args.max_layers is not None and args.max_layers <= 0:
+        parser.error("--max_layers must be positive")
     if args.output_dir is None:
-        args.output_dir = Path("cache/cumulative_bit_error/Qwen3-30B-A3B-Instruct-2507") / (
+        run_name = (
             f"C4-Cal{args.calib_samples}-Eval{args.eval_samples}"
             f"-Len{args.seqlen}-Seed{args.seed}"
         )
+        if args.max_layers is not None:
+            run_name += f"-First{args.max_layers}"
+        args.output_dir = Path("cache/cumulative_bit_error/Qwen3-30B-A3B-Instruct-2507") / run_name
     return args
 
 
@@ -106,6 +113,9 @@ def error_row(layer_index, bit, reference, candidate):
 @torch.inference_mode()
 def measure_layers(model, batches, args, device):
     layers = get_blocks(model, MODEL_NAME)
+    if args.max_layers is not None and args.max_layers > len(layers):
+        raise ValueError(f"--max_layers={args.max_layers} exceeds {len(layers)} decoder layers")
+    layer_count = args.max_layers if args.max_layers is not None else len(layers)
     hidden, positional, keyword = _capture_decoder_inputs(
         model, batches, MODEL_NAME, device
     )
@@ -123,7 +133,8 @@ def measure_layers(model, batches, args, device):
     routed_layers = []
     unactivated_experts = {}
 
-    for index, layer in enumerate(layers):
+    for index in range(layer_count):
+        layer = layers[index]
         started = time.monotonic()
         layer.to(device)
         entries = None
@@ -231,6 +242,7 @@ def main(argv=None):
         "calibration_input_ids_sha256": calib_hash,
         "evaluation_input_ids_sha256": eval_hash,
         "bits": list(BITS), "routed_layers": routed_layers,
+        "max_layers": args.max_layers, "measured_layers": len(rows) // len(BITS),
         "unactivated_experts_by_layer": unactivated_experts,
         "unactivated_expert_fallback": "identity Hessian (weight-only per-group rounding with MSE clipping)",
         "attn_impl": args.attn_impl,

@@ -13,7 +13,7 @@ COLORS = {1: "#D55E00", 2: "#0072B2", 3: "#009E73", 4: "#CC79A7"}
 MARKERS = {1: "o", 2: "s", 3: "^", 4: "D"}
 
 
-def read_measurements(path):
+def read_measurements(path, max_layers=None):
     values = {}
     with Path(path).open(newline="", encoding="utf-8-sig") as stream:
         reader = csv.DictReader(stream)
@@ -35,6 +35,10 @@ def read_measurements(path):
     missing = [(layer, bit) for layer in layers for bit in BITS if (layer, bit) not in values]
     if missing:
         raise ValueError(f"{path}: missing layer/bit results: {missing[:12]}")
+    if max_layers is not None:
+        if max_layers <= 0 or max_layers > len(layers):
+            raise ValueError(f"--max_layers must be between 1 and {len(layers)} for {path}")
+        layers = layers[:max_layers]
     return layers, {bit: [values[layer, bit] for layer in layers] for bit in BITS}
 
 
@@ -49,11 +53,16 @@ def parse_args(argv=None):
     parser.add_argument("--dpi", type=int, default=300)
     parser.add_argument("--font_size", type=float, default=10.0,
                         help="Base font size in points (default: 10)")
+    parser.add_argument("--max_layers", type=int,
+                        help="Plot only the first N decoder layers (indices 0 through N-1)")
     args = parser.parse_args(argv)
     if args.fig_width <= 0 or args.fig_height <= 0 or args.dpi <= 0 or args.font_size <= 0:
         parser.error("figure dimensions, DPI and --font_size must be positive")
+    if args.max_layers is not None and args.max_layers <= 0:
+        parser.error("--max_layers must be positive")
     if args.output is None:
-        args.output = args.input.with_suffix(".png")
+        suffix = f"_first{args.max_layers}" if args.max_layers is not None else ""
+        args.output = args.input.with_name(f"{args.input.stem}{suffix}.png")
     if args.output.suffix.lower() != ".png":
         parser.error("--output must end in .png")
     return args
@@ -76,7 +85,10 @@ def draw_figure(layers, curves, args):
         )
     ax.set_xlabel("Decoder Layer Index", fontsize=args.font_size)
     ax.set_ylabel("Cumulative Relative MSE", fontsize=args.font_size)
-    ax.set_xlim(layers[0], layers[-1])
+    if len(layers) == 1:
+        ax.set_xlim(layers[0] - 0.5, layers[0] + 0.5)
+    else:
+        ax.set_xlim(layers[0], layers[-1])
     ax.set_ylim(bottom=0)
     ax.ticklabel_format(axis="y", style="plain", useOffset=False)
     ax.tick_params(axis="both", labelsize=args.font_size)
@@ -93,7 +105,7 @@ def draw_figure(layers, curves, args):
 
 def main(argv=None):
     args = parse_args(argv)
-    layers, curves = read_measurements(args.input)
+    layers, curves = read_measurements(args.input, args.max_layers)
     draw_figure(layers, curves, args)
     print(f"Saved {args.output} and {args.output.with_suffix('.pdf')}")
 
