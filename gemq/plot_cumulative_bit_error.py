@@ -87,7 +87,7 @@ def draw_figure(layers, curves, args):
             linewidth=1.8, markersize=4.5, label=f"Layer 0: {bit} Bit" if bit == 1 else f"Layer 0: {bit} Bits",
         )
     ax.set_xlabel("Decoder Layer Index", fontsize=args.font_size)
-    ax.set_ylabel("Cumulative Relative MSE", fontsize=args.font_size)
+    ax.set_ylabel("Relative Hidden-State MSE", fontsize=args.font_size)
     if len(layers) == 1:
         ax.set_xlim(layers[0] - 0.5, layers[0] + 0.5)
     else:
@@ -98,8 +98,10 @@ def draw_figure(layers, curves, args):
     ax.grid(axis="y", alpha=0.25)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, fontsize=args.font_size * 0.9)
-    fig.tight_layout()
+    fig.legend(frameon=False, fontsize=args.font_size * 0.9,
+               loc="upper center", bbox_to_anchor=(0.5, 0.99), ncol=2)
+    legend_space_inches = 2 * (args.font_size * 0.9 * 1.4) / 72 + 0.12
+    fig.tight_layout(rect=(0, 0, 1, max(0.5, 1 - legend_space_inches / args.fig_height)))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=args.dpi)
     fig.savefig(args.output.with_suffix(".pdf"))

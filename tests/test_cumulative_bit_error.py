@@ -79,6 +79,15 @@ class CumulativePlotTest(unittest.TestCase):
             self.assertEqual(axes.plot.call_args_list[0].kwargs["label"], "Layer 0: 1 Bit")
             self.assertEqual(figure.savefig.call_count, 2)
             axes.set_xlabel.assert_called_once_with("Decoder Layer Index", fontsize=12.0)
+            axes.set_ylabel.assert_called_once_with("Relative Hidden-State MSE", fontsize=12.0)
+            axes.legend.assert_not_called()
+            figure.legend.assert_called_once_with(
+                frameon=False, fontsize=10.8, loc="upper center",
+                bbox_to_anchor=(0.5, 0.99), ncol=2,
+            )
+            layout_top = figure.tight_layout.call_args.kwargs["rect"][3]
+            self.assertGreater(layout_top, 0.8)
+            self.assertLess(layout_top, 0.9)
             axes.spines["top"].set_visible.assert_called_once_with(False)
             axes.spines["right"].set_visible.assert_called_once_with(False)
 
