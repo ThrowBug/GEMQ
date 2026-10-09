@@ -44,7 +44,7 @@ class JaccardPlotDataTest(unittest.TestCase):
         axes.tick_params.assert_called_once_with(axis="both", labelsize=16)
         axes.set_ylim.assert_called_once_with(0, 0.7)
         axes.legend.assert_called_once_with(frameon=False, ncol=1, fontsize=13, loc="upper right")
-        pyplot.subplots.assert_called_once_with(figsize=(8.2, 8.2), constrained_layout=True)
+        pyplot.subplots.assert_called_once_with(figsize=(8.2, 4.1), constrained_layout=True)
         self.assertEqual(figure.savefig.call_count, 2)
 
     def test_count_and_mean_use_different_top_sets(self):

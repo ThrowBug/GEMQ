@@ -111,7 +111,7 @@ def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE
         raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
 
     configure_plot_font(font_size)
-    fig, ax = plt.subplots(figsize=(8.2, 8.2), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(8.2, 4.1), constrained_layout=True)
     for dataset, label, color in DOMAINS:
         for metric, metric_label, marker, linestyle in METRICS:
             points = sorted(
