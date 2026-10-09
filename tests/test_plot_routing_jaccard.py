@@ -42,7 +42,9 @@ class JaccardPlotDataTest(unittest.TestCase):
         axes.set_xlabel.assert_called_once_with("MoE Layer Index", fontsize=16)
         axes.set_ylabel.assert_called_once_with("Jaccard Similarity", fontsize=16)
         axes.tick_params.assert_called_once_with(axis="both", labelsize=16)
-        axes.legend.assert_called_once_with(frameon=False, ncol=1, fontsize=13, loc="best")
+        axes.set_ylim.assert_called_once_with(0, 0.7)
+        axes.legend.assert_called_once_with(frameon=False, ncol=1, fontsize=13, loc="upper right")
+        pyplot.subplots.assert_called_once_with(figsize=(8.2, 8.2), constrained_layout=True)
         self.assertEqual(figure.savefig.call_count, 2)
 
     def test_count_and_mean_use_different_top_sets(self):

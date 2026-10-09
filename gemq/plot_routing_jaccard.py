@@ -111,7 +111,7 @@ def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE
         raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
 
     configure_plot_font(font_size)
-    fig, ax = plt.subplots(figsize=(8.2, 4.1), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(8.2, 8.2), constrained_layout=True)
     for dataset, label, color in DOMAINS:
         for metric, metric_label, marker, linestyle in METRICS:
             points = sorted(
@@ -129,11 +129,11 @@ def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE
     ax.set_xlabel("MoE Layer Index", fontsize=font_size)
     ax.set_ylabel("Jaccard Similarity", fontsize=font_size)
     ax.tick_params(axis="both", labelsize=font_size)
-    ax.set_ylim(0, 1)
+    ax.set_ylim(0, 0.7)
     ax.grid(axis="y", color="0.88", linewidth=0.7)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, ncol=1, fontsize=font_size * LEGEND_FONT_SCALE, loc="best")
+    ax.legend(frameon=False, ncol=1, fontsize=font_size * LEGEND_FONT_SCALE, loc="upper right")
     fig.savefig(output_png, dpi=300)
     fig.savefig(output_pdf)
     plt.close(fig)
