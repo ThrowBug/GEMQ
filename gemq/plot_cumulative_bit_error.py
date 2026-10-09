@@ -1,4 +1,4 @@
-"""Plot cumulative decoder-output relative MSE versus layer for 1/2/3/4 bits."""
+"""Plot propagation of four layer-0 expert bit widths through 2-bit layers."""
 
 import argparse
 import csv
@@ -8,7 +8,7 @@ from pathlib import Path
 from gemq.plot_style import configure_plot_font
 
 
-BITS = (1, 2, 3, 4)
+INITIAL_BITS = (1, 2, 3, 4)
 COLORS = {1: "#D55E00", 2: "#0072B2", 3: "#009E73", 4: "#CC79A7"}
 MARKERS = {1: "o", 2: "s", 3: "^", 4: "D"}
 
@@ -17,14 +17,17 @@ def read_measurements(path, max_layers=None):
     values = {}
     with Path(path).open(newline="", encoding="utf-8-sig") as stream:
         reader = csv.DictReader(stream)
-        required = {"layer", "bit_width", "relative_mse"}
+        required = {"layer", "initial_bit_width", "current_bit_width", "relative_mse"}
         if reader.fieldnames is None or not required.issubset(reader.fieldnames):
             raise ValueError(f"{path}: missing columns {sorted(required - set(reader.fieldnames or []))}")
         for row in reader:
             layer = int(row["layer"])
-            bit = int(row["bit_width"])
+            bit = int(row["initial_bit_width"])
+            current_bit = int(row["current_bit_width"])
             value = float(row["relative_mse"])
-            if layer < 0 or bit not in BITS or not math.isfinite(value) or value < 0:
+            valid_current = (bit,) if layer == 0 else (2, 16)
+            if (layer < 0 or bit not in INITIAL_BITS or current_bit not in valid_current
+                    or not math.isfinite(value) or value < 0):
                 raise ValueError(f"{path}: invalid layer, bit width or relative MSE: {row}")
             if (layer, bit) in values:
                 raise ValueError(f"{path}: duplicate layer {layer}, {bit}-bit result")
@@ -32,20 +35,20 @@ def read_measurements(path, max_layers=None):
     layers = sorted({layer for layer, _ in values})
     if not layers or layers != list(range(layers[-1] + 1)):
         raise ValueError(f"{path}: expected consecutive layer indices starting at zero")
-    missing = [(layer, bit) for layer in layers for bit in BITS if (layer, bit) not in values]
+    missing = [(layer, bit) for layer in layers for bit in INITIAL_BITS if (layer, bit) not in values]
     if missing:
         raise ValueError(f"{path}: missing layer/bit results: {missing[:12]}")
     if max_layers is not None:
         if max_layers <= 0 or max_layers > len(layers):
             raise ValueError(f"--max_layers must be between 1 and {len(layers)} for {path}")
         layers = layers[:max_layers]
-    return layers, {bit: [values[layer, bit] for layer in layers] for bit in BITS}
+    return layers, {bit: [values[layer, bit] for layer in layers] for bit in INITIAL_BITS}
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", required=True, type=Path,
-                        help="cumulative_relative_mse.csv from the measurement script")
+                        help="layer0_bit_propagation.csv from the measurement script")
     parser.add_argument("--output", type=Path,
                         help="PNG output; a PDF is saved alongside it")
     parser.add_argument("--fig_width", type=float, default=6.0)
@@ -78,10 +81,10 @@ def draw_figure(layers, curves, args):
 
     configure_plot_font(args.font_size)
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
-    for bit in BITS:
+    for bit in INITIAL_BITS:
         ax.plot(
             layers, curves[bit], color=COLORS[bit], marker=MARKERS[bit],
-            linewidth=1.8, markersize=4.5, label=f"{bit} Bit" if bit == 1 else f"{bit} Bits",
+            linewidth=1.8, markersize=4.5, label=f"Layer 0: {bit} Bit" if bit == 1 else f"Layer 0: {bit} Bits",
         )
     ax.set_xlabel("Decoder Layer Index", fontsize=args.font_size)
     ax.set_ylabel("Cumulative Relative MSE", fontsize=args.font_size)

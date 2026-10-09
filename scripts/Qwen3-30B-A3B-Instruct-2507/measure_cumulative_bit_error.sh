@@ -8,7 +8,7 @@ cd "${repo_root}"
 args=(
     --model "${MODEL:-Qwen/Qwen3-30B-A3B-Instruct-2507}"
     --calib_samples "${CALIB_SAMPLES:-128}"
-    --eval_samples "${EVAL_SAMPLES:-8}"
+    --eval_samples "${EVAL_SAMPLES:-16}"
     --seqlen "${SEQLEN:-2048}"
     --seed "${SEED:-0}"
     --groupsize "${GROUPSIZE:-128}"
@@ -27,4 +27,4 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
     python -m gemq.measure_cumulative_bit_error "${args[@]}"
 
 # Plot separately without repeating GPTQ:
-# python -m gemq.plot_cumulative_bit_error --input cache/cumulative_bit_error/.../cumulative_relative_mse.csv
+# python -m gemq.plot_cumulative_bit_error --input cache/cumulative_bit_error/.../layer0_bit_propagation.csv

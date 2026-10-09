@@ -1,8 +1,8 @@
-"""Measure cumulative decoder-output error for uniform 1/2/3/4-bit routed experts.
+"""Measure how the layer-0 expert bit width propagates through 2-bit layers.
 
-GPTQ Hessians are collected on the same full-precision C4 calibration path for
-all four bit widths. Evaluation is different: each bit-width path receives its
-own preceding layer output, so its error and routing changes can propagate.
+Layer 0 branches into 1/2/3/4-bit routed-expert paths. Later routed layers all
+use the same 2-bit weights, but each path receives its own preceding hidden
+states. GPTQ Hessians come from the same full-precision C4 calibration path.
 Attention, dense MLPs, routers, and other non-routed-expert weights stay FP.
 """
 
@@ -36,9 +36,10 @@ from gemq.utils.hf_loading import load_causal_lm_checkpoint
 from gemq.utils.model_utils import get_blocks, get_moe_block
 
 
-BITS = (1, 2, 3, 4)
+INITIAL_BITS = (1, 2, 3, 4)
+CONTINUATION_BIT = 2
 CSV_COLUMNS = (
-    "layer", "bit_width", "tokens", "squared_error_sum",
+    "layer", "initial_bit_width", "current_bit_width", "tokens", "squared_error_sum",
     "reference_squared_sum", "relative_mse",
 )
 
@@ -47,7 +48,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--calib_samples", type=int, default=128)
-    parser.add_argument("--eval_samples", type=int, default=8)
+    parser.add_argument("--eval_samples", type=int, default=16)
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--groupsize", type=int, default=128)
@@ -72,6 +73,7 @@ def parse_args(argv=None):
         )
         if args.max_layers is not None:
             run_name += f"-First{args.max_layers}"
+        run_name += "-L0B1-2-3-4-RestB2"
         args.output_dir = Path("cache/cumulative_bit_error/Qwen3-30B-A3B-Instruct-2507") / run_name
     return args
 
@@ -85,7 +87,7 @@ def validate_routed_moe(moe, layer_index):
     return True
 
 
-def error_row(layer_index, bit, reference, candidate):
+def error_row(layer_index, initial_bit, current_bit, reference, candidate):
     if len(reference) != len(candidate):
         raise ValueError("FP and quantized evaluation paths have different batch counts")
     error_total = 0.0
@@ -99,10 +101,13 @@ def error_row(layer_index, bit, reference, candidate):
         reference_total += reference_energy
         tokens += int(fp_hidden.shape[0] * fp_hidden.shape[1])
     if not math.isfinite(error_total) or not math.isfinite(reference_total) or reference_total <= 0:
-        raise ValueError(f"Layer {layer_index}, {bit}-bit: non-finite or zero error denominator")
+        raise ValueError(
+            f"Layer {layer_index}, initial {initial_bit}-bit: non-finite or zero error denominator"
+        )
     return {
         "layer": layer_index,
-        "bit_width": bit,
+        "initial_bit_width": initial_bit,
+        "current_bit_width": current_bit,
         "tokens": tokens,
         "squared_error_sum": error_total,
         "reference_squared_sum": reference_total,
@@ -128,7 +133,7 @@ def measure_layers(model, batches, args, device):
     calib_keyword = keyword[:args.calib_samples]
     eval_keyword = keyword[args.calib_samples:]
     del hidden, positional, keyword
-    bit_eval = {bit: list(fp_eval) for bit in BITS}
+    bit_eval = {bit: list(fp_eval) for bit in INITIAL_BITS}
     rows = []
     routed_layers = []
     unactivated_experts = {}
@@ -141,6 +146,8 @@ def measure_layers(model, batches, args, device):
         try:
             moe = get_moe_block(layer, MODEL_NAME)
             routed = validate_routed_moe(moe, index)
+            if index == 0 and not routed:
+                raise ValueError("Layer 0 must contain routed experts for this experiment")
             if routed:
                 captured = _capture_qwen3_moe_inputs(
                     layer, moe, fp_calib, calib_positional, calib_keyword,
@@ -165,26 +172,46 @@ def measure_layers(model, batches, args, device):
             next_fp_eval = _forward_layer_batches(
                 layer, fp_eval, eval_positional, eval_keyword, device
             )
-            for bit in BITS:
-                if routed:
+            if index == 0:
+                for initial_bit in INITIAL_BITS:
                     try:
-                        install_bit_weights(entries, bit, args)
+                        install_bit_weights(entries, initial_bit, args)
                         next_bit_eval = _forward_layer_batches(
-                            layer, bit_eval[bit], eval_positional, eval_keyword, device
+                            layer, bit_eval[initial_bit], eval_positional, eval_keyword, device
                         )
                     finally:
                         restore_fp_weights(entries)
-                else:
-                    next_bit_eval = _forward_layer_batches(
-                        layer, bit_eval[bit], eval_positional, eval_keyword, device
+                    row = error_row(
+                        index, initial_bit, initial_bit, next_fp_eval, next_bit_eval
                     )
-                row = error_row(index, bit, next_fp_eval, next_bit_eval)
-                rows.append(row)
-                bit_eval[bit] = next_bit_eval
-                print(
-                    f"[layer {index} | {bit}-bit] cumulative relative MSE="
-                    f"{row['relative_mse']:.8g}", flush=True,
-                )
+                    rows.append(row)
+                    bit_eval[initial_bit] = next_bit_eval
+                    print(
+                        f"[layer {index} | initial {initial_bit}-bit] relative MSE="
+                        f"{row['relative_mse']:.8g}", flush=True,
+                    )
+            else:
+                try:
+                    if routed:
+                        install_bit_weights(entries, CONTINUATION_BIT, args)
+                    for initial_bit in INITIAL_BITS:
+                        next_bit_eval = _forward_layer_batches(
+                            layer, bit_eval[initial_bit], eval_positional, eval_keyword, device
+                        )
+                        row = error_row(
+                            index, initial_bit, CONTINUATION_BIT if routed else 16,
+                            next_fp_eval, next_bit_eval,
+                        )
+                        rows.append(row)
+                        bit_eval[initial_bit] = next_bit_eval
+                        print(
+                            f"[layer {index} | initial {initial_bit}-bit, "
+                            f"current {CONTINUATION_BIT if routed else 16}-bit] "
+                            f"cumulative relative MSE={row['relative_mse']:.8g}", flush=True,
+                        )
+                finally:
+                    if routed:
+                        restore_fp_weights(entries)
             fp_calib, fp_eval = next_fp_calib, next_fp_eval
             print(f"[layer {index}] elapsed={time.monotonic() - started:.1f}s", flush=True)
         finally:
@@ -235,25 +262,26 @@ def main(argv=None):
     rows, routed_layers, unactivated_experts = measure_layers(model, batches, args, device)
     metadata = {
         "format_version": 1,
-        "experiment": "cumulative_uniform_routed_expert_gptq_decoder_output_error",
+        "experiment": "layer0_bit_propagation_through_2bit_routed_experts",
         "model": args.model, "model_name": MODEL_NAME,
         "dataset": "c4", "calib_samples": args.calib_samples,
         "eval_samples": args.eval_samples, "seqlen": args.seqlen, "seed": args.seed,
         "calibration_input_ids_sha256": calib_hash,
         "evaluation_input_ids_sha256": eval_hash,
-        "bits": list(BITS), "routed_layers": routed_layers,
-        "max_layers": args.max_layers, "measured_layers": len(rows) // len(BITS),
+        "initial_bits": list(INITIAL_BITS), "continuation_bit": CONTINUATION_BIT,
+        "routed_layers": routed_layers,
+        "max_layers": args.max_layers, "measured_layers": len(rows) // len(INITIAL_BITS),
         "unactivated_experts_by_layer": unactivated_experts,
         "unactivated_expert_fallback": "identity Hessian (weight-only per-group rounding with MSE clipping)",
         "attn_impl": args.attn_impl,
         "gptq": {"groupsize": args.groupsize, "blocksize": args.blocksize,
                  "percdamp": args.percdamp, "mse": True},
-        "metric": "sum(||decoder_l_b - decoder_l_FP||_2^2) / sum(||decoder_l_FP||_2^2)",
-        "context": "FP calibration Hessians; each bit-width evaluation path propagates its own hidden states; only routed expert weights are quantized",
+        "metric": "sum(||decoder_l_initial_b - decoder_l_FP||_2^2) / sum(||decoder_l_FP||_2^2)",
+        "context": "FP calibration Hessians; layer 0 uses separate initial bits, later routed layers share 2-bit weights while each path propagates its own hidden states; only routed expert weights are quantized",
         "total_seconds": time.monotonic() - started,
     }
     args.output_dir.mkdir(parents=True)
-    with (args.output_dir / "cumulative_relative_mse.csv").open(
+    with (args.output_dir / "layer0_bit_propagation.csv").open(
         "w", newline="", encoding="utf-8"
     ) as stream:
         writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS)

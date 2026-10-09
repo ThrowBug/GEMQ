@@ -17,17 +17,17 @@ def write_measurements(path, *, missing=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
-        writer.writerow(("layer", "bit_width", "relative_mse"))
+        writer.writerow(("layer", "initial_bit_width", "current_bit_width", "relative_mse"))
         for layer in range(2):
             for bit in (1, 2, 3, 4):
                 if (layer, bit) != missing:
-                    writer.writerow((layer, bit, (layer + 1) / bit))
+                    writer.writerow((layer, bit, bit if layer == 0 else 2, (layer + 1) / bit))
 
 
 class CumulativePlotTest(unittest.TestCase):
     def test_reads_four_complete_bit_curves(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cumulative_relative_mse.csv"
+            path = Path(temp) / "layer0_bit_propagation.csv"
             write_measurements(path)
             layers, curves = read_measurements(path)
             self.assertEqual(layers, [0, 1])
@@ -42,23 +42,23 @@ class CumulativePlotTest(unittest.TestCase):
 
     def test_plot_limit_has_distinct_default_output(self):
         args = parse_plot_args([
-            "--input", "cache/run/cumulative_relative_mse.csv", "--max_layers", "12",
+            "--input", "cache/run/layer0_bit_propagation.csv", "--max_layers", "12",
         ])
-        self.assertEqual(args.output, Path("cache/run/cumulative_relative_mse_first12.png"))
+        self.assertEqual(args.output, Path("cache/run/layer0_bit_propagation_first12.png"))
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
-            parse_plot_args(["--input", "cache/run/cumulative_relative_mse.csv",
+            parse_plot_args(["--input", "cache/run/layer0_bit_propagation.csv",
                              "--max_layers", "0"])
 
     def test_rejects_missing_layer_bit_pair(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cumulative_relative_mse.csv"
+            path = Path(temp) / "layer0_bit_propagation.csv"
             write_measurements(path, missing=(1, 2))
             with self.assertRaisesRegex(ValueError, "missing layer/bit"):
                 read_measurements(path)
 
     def test_draws_four_curves_and_both_formats(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cumulative_relative_mse.csv"
+            path = Path(temp) / "layer0_bit_propagation.csv"
             write_measurements(path)
             output = Path(temp) / "figure.png"
             figure, axes = Mock(), Mock()
@@ -76,6 +76,7 @@ class CumulativePlotTest(unittest.TestCase):
                                    "--font_size", "12"])
             configure.assert_called_once_with(12.0)
             self.assertEqual(axes.plot.call_count, 4)
+            self.assertEqual(axes.plot.call_args_list[0].kwargs["label"], "Layer 0: 1 Bit")
             self.assertEqual(figure.savefig.call_count, 2)
             axes.set_xlabel.assert_called_once_with("Decoder Layer Index", fontsize=12.0)
             axes.spines["top"].set_visible.assert_called_once_with(False)
@@ -84,7 +85,7 @@ class CumulativePlotTest(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "matplotlib is not installed")
     def test_actual_plot_renders(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "cumulative_relative_mse.csv"
+            path = Path(temp) / "layer0_bit_propagation.csv"
             write_measurements(path)
             with redirect_stderr(StringIO()), redirect_stdout(StringIO()):
                 plot_main(["--input", str(path)])
@@ -114,7 +115,10 @@ class CumulativeMeasurementTest(unittest.TestCase):
         def forward(layer, hidden, _positional, _keyword, _device):
             return [item * 2 + layer.quant_error for item in hidden]
 
+        installed_bits = []
+
         def install(entries, bit, _args):
+            installed_bits.append(bit)
             entries[0][2].quant_error = {1: 1.0, 2: 0.5, 3: 0.25, 4: 0.125}[bit]
 
         def restore(entries):
@@ -139,10 +143,13 @@ class CumulativeMeasurementTest(unittest.TestCase):
                     None, [None, None], types.SimpleNamespace(calib_samples=1, max_layers=None),
                     torch.device("cpu"),
                 )
+                full_run_bits = installed_bits.copy()
+                installed_bits.clear()
                 first_rows, first_routed, _ = measurement.measure_layers(
                     None, [None, None], types.SimpleNamespace(calib_samples=1, max_layers=1),
                     torch.device("cpu"),
                 )
+                first_run_bits = installed_bits.copy()
                 with self.assertRaisesRegex(ValueError, "exceeds 2"):
                     measurement.measure_layers(
                         None, [None, None], types.SimpleNamespace(calib_samples=1, max_layers=3),
@@ -150,9 +157,12 @@ class CumulativeMeasurementTest(unittest.TestCase):
                     )
         self.assertEqual(routed, [0, 1])
         self.assertEqual(unactivated, {})
-        one_bit = [row for row in rows if row["bit_width"] == 1]
-        self.assertEqual([row["relative_mse"] for row in one_bit], [0.25, 9 / 16])
-        self.assertEqual({row["bit_width"] for row in rows}, {1, 2, 3, 4})
+        self.assertEqual(full_run_bits, [1, 2, 3, 4, 2])
+        self.assertEqual(first_run_bits, [1, 2, 3, 4])
+        one_bit = [row for row in rows if row["initial_bit_width"] == 1]
+        self.assertEqual([row["relative_mse"] for row in one_bit], [0.25, 6.25 / 16])
+        self.assertEqual([row["current_bit_width"] for row in one_bit], [1, 2])
+        self.assertEqual({row["initial_bit_width"] for row in rows}, {1, 2, 3, 4})
         self.assertEqual(first_routed, [0])
         self.assertEqual(len(first_rows), 4)
         self.assertEqual({row["layer"] for row in first_rows}, {0})
@@ -162,8 +172,11 @@ class CumulativeMeasurementTest(unittest.TestCase):
 
         limited = parse_args(["--max_layers", "12"])
         full = parse_args([])
-        self.assertEqual(limited.output_dir.name, "C4-Cal128-Eval8-Len2048-Seed0-First12")
-        self.assertEqual(full.output_dir.name, "C4-Cal128-Eval8-Len2048-Seed0")
+        self.assertEqual(limited.eval_samples, 16)
+        self.assertEqual(limited.output_dir.name,
+                         "C4-Cal128-Eval16-Len2048-Seed0-First12-L0B1-2-3-4-RestB2")
+        self.assertEqual(full.output_dir.name,
+                         "C4-Cal128-Eval16-Len2048-Seed0-L0B1-2-3-4-RestB2")
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
             parse_args(["--max_layers", "0"])
 
