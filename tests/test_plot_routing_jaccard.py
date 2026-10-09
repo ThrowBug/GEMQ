@@ -40,7 +40,7 @@ class JaccardPlotDataTest(unittest.TestCase):
                 draw_figure(rows, "plot.png", "plot.pdf", 32)
         configure.assert_called_once_with(16.0)
         axes.set_xlabel.assert_called_once_with("MoE Layer Index", fontsize=16)
-        axes.set_ylabel.assert_called_once_with("Top-32 Expert Jaccard Similarity", fontsize=16)
+        axes.set_ylabel.assert_called_once_with("Jaccard Similarity", fontsize=16)
         axes.tick_params.assert_called_once_with(axis="both", labelsize=16)
         axes.legend.assert_called_once_with(frameon=False, ncol=1, fontsize=13, loc="best")
         self.assertEqual(figure.savefig.call_count, 2)

@@ -127,7 +127,7 @@ def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE
                     label=f"{label} vs. C4 · {metric_label}",
                 )
     ax.set_xlabel("MoE Layer Index", fontsize=font_size)
-    ax.set_ylabel(f"Top-{top_n} Expert Jaccard Similarity", fontsize=font_size)
+    ax.set_ylabel("Jaccard Similarity", fontsize=font_size)
     ax.tick_params(axis="both", labelsize=font_size)
     ax.set_ylim(0, 1)
     ax.grid(axis="y", color="0.88", linewidth=0.7)
