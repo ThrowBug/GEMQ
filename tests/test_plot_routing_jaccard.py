@@ -28,14 +28,18 @@ class JaccardPlotDataTest(unittest.TestCase):
         axes.spines = {"top": Mock(), "right": Mock()}
         matplotlib = types.ModuleType("matplotlib")
         pyplot = types.ModuleType("matplotlib.pyplot")
+        transforms = types.ModuleType("matplotlib.transforms")
         matplotlib.use = Mock()
+        matplotlib.transforms = transforms
+        transforms.offset_copy = Mock(return_value="legend-anchor")
         pyplot.subplots = Mock(return_value=(figure, axes))
         pyplot.close = Mock()
         rows = [{
             "comparison": "math_500_vs_c4", "metric": "activation_count",
             "layer": 5, "jaccard": 0.5,
         }]
-        with patch.dict(sys.modules, {"matplotlib": matplotlib, "matplotlib.pyplot": pyplot}):
+        with patch.dict(sys.modules, {"matplotlib": matplotlib, "matplotlib.pyplot": pyplot,
+                                      "matplotlib.transforms": transforms}):
             with patch("gemq.plot_routing_jaccard.configure_plot_font") as configure:
                 draw_figure(rows, "plot.png", "plot.pdf", 32)
         configure.assert_called_once_with(16.0)
@@ -43,7 +47,13 @@ class JaccardPlotDataTest(unittest.TestCase):
         axes.set_ylabel.assert_called_once_with("Jaccard Similarity", fontsize=16)
         axes.tick_params.assert_called_once_with(axis="both", labelsize=16)
         axes.set_ylim.assert_called_once_with(0, 0.7)
-        axes.legend.assert_called_once_with(frameon=False, ncol=1, fontsize=13, loc="upper right")
+        transforms.offset_copy.assert_called_once_with(
+            axes.transAxes, fig=figure, y=31.2, units="points"
+        )
+        axes.legend.assert_called_once_with(
+            frameon=False, ncol=1, fontsize=13, loc="upper right",
+            bbox_to_anchor=(1, 1), bbox_transform="legend-anchor",
+        )
         pyplot.subplots.assert_called_once_with(figsize=(8.2, 4.1), constrained_layout=True)
         self.assertEqual(figure.savefig.call_count, 2)
 

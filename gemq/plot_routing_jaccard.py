@@ -107,6 +107,7 @@ def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib import transforms
     except ImportError as exc:
         raise RuntimeError("Plotting requires matplotlib; install with: pip install -e '.[plot]'") from exc
 
@@ -133,7 +134,12 @@ def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE
     ax.grid(axis="y", color="0.88", linewidth=0.7)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
-    ax.legend(frameon=False, ncol=1, fontsize=font_size * LEGEND_FONT_SCALE, loc="upper right")
+    legend_font_size = font_size * LEGEND_FONT_SCALE
+    legend_anchor = transforms.offset_copy(
+        ax.transAxes, fig=fig, y=2 * legend_font_size * 1.2, units="points"
+    )
+    ax.legend(frameon=False, ncol=1, fontsize=legend_font_size,
+              loc="upper right", bbox_to_anchor=(1, 1), bbox_transform=legend_anchor)
     fig.savefig(output_png, dpi=300)
     fig.savefig(output_pdf)
     plt.close(fig)
