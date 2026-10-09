@@ -136,7 +136,7 @@ def draw_figure(rows, output_png, output_pdf, top_n, font_size=DEFAULT_FONT_SIZE
     ax.spines["right"].set_visible(False)
     legend_font_size = font_size * LEGEND_FONT_SCALE
     legend_anchor = transforms.offset_copy(
-        ax.transAxes, fig=fig, y=2 * legend_font_size * 1.2, units="points"
+        ax.transAxes, fig=fig, y=2.5 * legend_font_size * 1.2, units="points"
     )
     ax.legend(frameon=False, ncol=1, fontsize=legend_font_size,
               loc="upper right", bbox_to_anchor=(1, 1), bbox_transform=legend_anchor)

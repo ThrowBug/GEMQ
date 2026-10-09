@@ -48,7 +48,7 @@ class JaccardPlotDataTest(unittest.TestCase):
         axes.tick_params.assert_called_once_with(axis="both", labelsize=16)
         axes.set_ylim.assert_called_once_with(0, 0.7)
         transforms.offset_copy.assert_called_once_with(
-            axes.transAxes, fig=figure, y=31.2, units="points"
+            axes.transAxes, fig=figure, y=39.0, units="points"
         )
         axes.legend.assert_called_once_with(
             frameon=False, ncol=1, fontsize=13, loc="upper right",
