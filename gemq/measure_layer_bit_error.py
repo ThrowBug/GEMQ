@@ -100,8 +100,8 @@ def capture_moe_inputs(model, batches, layer_idx, device):
 
 
 @torch.inference_mode()
-def collect_fp_hessians(moe, calibration_inputs, args, device):
-    """Collect each expert linear's GPTQ Hessian on unchanged FP activations."""
+def collect_fp_hessians(moe, calibration_inputs, args, device, allow_unactivated=False):
+    """Collect FP Hessians; optionally use an identity Hessian for unseen experts."""
     entries = []
     handles = []
     for expert_id in range(len(moe.experts)):
@@ -137,7 +137,20 @@ def collect_fp_hessians(moe, calibration_inputs, args, device):
     missing = [(expert_id, name) for expert_id, name, _, master in entries
                if master.nsamples == 0]
     if missing:
-        raise RuntimeError(f"Calibration never activated these expert linears: {missing[:12]}")
+        if not allow_unactivated:
+            raise RuntimeError(f"Calibration never activated these expert linears: {missing[:12]}")
+        for _, _, _, master in entries:
+            if master.nsamples == 0:
+                # A diagonal Hessian removes GPTQ's cross-column error feedback.
+                # This gives weight-only, per-group rounding with the same MSE
+                # clipping search, rather than zeroing an unobserved expert.
+                master.H.diagonal().fill_(1)
+        expert_ids = sorted({expert_id for expert_id, _ in missing})
+        print(
+            f"[GPTQ Hessian] {len(expert_ids)} unactivated experts "
+            f"({len(missing)} linears); using identity-H weight-only fallback: "
+            f"{expert_ids}", flush=True,
+        )
     return entries
 
 

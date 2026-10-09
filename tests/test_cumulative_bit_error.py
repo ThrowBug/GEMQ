@@ -99,10 +99,10 @@ class CumulativeMeasurementTest(unittest.TestCase):
             return [item * 2 + layer.quant_error for item in hidden]
 
         def install(entries, bit, _args):
-            entries[0].quant_error = {1: 1.0, 2: 0.5, 3: 0.25, 4: 0.125}[bit]
+            entries[0][2].quant_error = {1: 1.0, 2: 0.5, 3: 0.25, 4: 0.125}[bit]
 
         def restore(entries):
-            entries[0].quant_error = 0.0
+            entries[0][2].quant_error = 0.0
 
         with patch.object(measurement, "get_blocks", return_value=layers), \
              patch.object(measurement, "_capture_decoder_inputs",
@@ -112,19 +112,68 @@ class CumulativeMeasurementTest(unittest.TestCase):
              patch.object(measurement, "_capture_qwen3_moe_inputs",
                           return_value=([initial[0]], [], [], [])), \
              patch.object(measurement, "collect_fp_hessians",
-                          side_effect=lambda layer, *_: [layer]), \
+                          side_effect=lambda layer, *_, **__: [
+                              (0, "gate_proj", layer, types.SimpleNamespace(nsamples=1))
+                          ]), \
              patch.object(measurement, "_forward_layer_batches", side_effect=forward), \
              patch.object(measurement, "install_bit_weights", side_effect=install), \
              patch.object(measurement, "restore_fp_weights", side_effect=restore):
             with redirect_stdout(StringIO()):
-                rows, routed = measurement.measure_layers(
+                rows, routed, unactivated = measurement.measure_layers(
                     None, [None, None], types.SimpleNamespace(calib_samples=1),
                     torch.device("cpu"),
                 )
         self.assertEqual(routed, [0, 1])
+        self.assertEqual(unactivated, {})
         one_bit = [row for row in rows if row["bit_width"] == 1]
         self.assertEqual([row["relative_mse"] for row in one_bit], [0.25, 9 / 16])
         self.assertEqual({row["bit_width"] for row in rows}, {1, 2, 3, 4})
+
+    def test_unactivated_expert_uses_weight_only_fallback(self):
+        import torch
+        from torch import nn
+        from gemq.measure_layer_bit_error import (
+            collect_fp_hessians, install_bit_weights, restore_fp_weights,
+        )
+
+        class Expert(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gate_proj = nn.Linear(4, 4, bias=False)
+                self.up_proj = nn.Linear(4, 4, bias=False)
+                self.down_proj = nn.Linear(4, 4, bias=False)
+
+            def forward(self, hidden):
+                return self.gate_proj(hidden) + self.up_proj(hidden) + self.down_proj(hidden)
+
+        class MoE(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = nn.ModuleList([Expert(), Expert()])
+
+            def forward(self, hidden):
+                return self.experts[0](hidden)
+
+        moe = MoE()
+        args = types.SimpleNamespace(groupsize=2, blocksize=2, percdamp=0.01)
+        calibration = [torch.ones(1, 2, 4)]
+        with self.assertRaisesRegex(RuntimeError, "never activated"):
+            collect_fp_hessians(moe, calibration, args, torch.device("cpu"))
+        with redirect_stdout(StringIO()):
+            entries = collect_fp_hessians(
+                moe, calibration, args, torch.device("cpu"), allow_unactivated=True
+            )
+        unseen = [entry for entry in entries if entry[0] == 1]
+        self.assertEqual(len(unseen), 3)
+        for _, _, _, master in unseen:
+            self.assertEqual(master.nsamples, 0)
+            self.assertTrue(torch.equal(master.H, torch.eye(4)))
+        original = moe.experts[1].gate_proj.weight.detach().clone()
+        with redirect_stdout(StringIO()):
+            install_bit_weights(entries, 1, args)
+        self.assertTrue(torch.count_nonzero(moe.experts[1].gate_proj.weight) > 0)
+        restore_fp_weights(entries)
+        self.assertTrue(torch.equal(moe.experts[1].gate_proj.weight, original))
 
 
 if __name__ == "__main__":

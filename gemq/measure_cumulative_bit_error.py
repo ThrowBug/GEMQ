@@ -121,6 +121,7 @@ def measure_layers(model, batches, args, device):
     bit_eval = {bit: list(fp_eval) for bit in BITS}
     rows = []
     routed_layers = []
+    unactivated_experts = {}
 
     for index, layer in enumerate(layers):
         started = time.monotonic()
@@ -136,8 +137,15 @@ def measure_layers(model, batches, args, device):
                 )
                 moe_inputs = captured[0]
                 del captured
-                entries = collect_fp_hessians(moe, moe_inputs, args, device)
+                entries = collect_fp_hessians(
+                    moe, moe_inputs, args, device, allow_unactivated=True
+                )
                 del moe_inputs
+                missing = sorted({expert_id for expert_id, _, _, master in entries
+                                  if master.nsamples == 0})
+                if missing:
+                    unactivated_experts[index] = missing
+                    print(f"[layer {index}] unactivated expert IDs: {missing}", flush=True)
                 routed_layers.append(index)
 
             next_fp_calib = _forward_layer_batches(
@@ -178,7 +186,7 @@ def measure_layers(model, batches, args, device):
 
     if not routed_layers:
         raise ValueError("The model has no routed-expert decoder layers")
-    return rows, routed_layers
+    return rows, routed_layers, unactivated_experts
 
 
 @torch.inference_mode()
@@ -213,7 +221,7 @@ def main(argv=None):
     if calib_blocks & eval_blocks:
         raise RuntimeError("Calibration and evaluation C4 blocks overlap")
 
-    rows, routed_layers = measure_layers(model, batches, args, device)
+    rows, routed_layers, unactivated_experts = measure_layers(model, batches, args, device)
     metadata = {
         "format_version": 1,
         "experiment": "cumulative_uniform_routed_expert_gptq_decoder_output_error",
@@ -223,6 +231,8 @@ def main(argv=None):
         "calibration_input_ids_sha256": calib_hash,
         "evaluation_input_ids_sha256": eval_hash,
         "bits": list(BITS), "routed_layers": routed_layers,
+        "unactivated_experts_by_layer": unactivated_experts,
+        "unactivated_expert_fallback": "identity Hessian (weight-only per-group rounding with MSE clipping)",
         "attn_impl": args.attn_impl,
         "gptq": {"groupsize": args.groupsize, "blocksize": args.blocksize,
                  "percdamp": args.percdamp, "mse": True},
