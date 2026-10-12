@@ -139,6 +139,88 @@ class DialogExamplesTest(unittest.TestCase):
         }}]}}, {})
         self.assertIn("weather", text)
 
+    def test_bfcl_simple_tools_are_opt_in_and_complete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tools = [{"type": "function", "function": {
+                "name": "weather", "description": "Get current weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            }}]
+            runs = {}
+            for label, correct in (("ours", True), ("fp", True), ("base", False)):
+                run = write_run(root, label, "bfcl_v3", [(0, "Weather in Paris?", correct,
+                                                           "weather(city='Paris')")], "simple")
+                for kind in ("predictions", "reviews"):
+                    path = run / kind / label / "bfcl_v3" / "simple.jsonl"
+                    row = json.loads(path.read_text(encoding="utf-8"))
+                    row["metadata"] = {"is_fc_model": True, "tools": tools,
+                                       "functions": [tools[0]["function"]]}
+                    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                runs[label] = run
+            args = ["--dataset", "bfcl_v3", "--run", f"ours={runs['ours']}",
+                    "--run", f"fp={runs['fp']}", "--run", f"base={runs['base']}",
+                    "--ours", "ours", "--reference", "fp"]
+            default_output = root / "default"
+            main([*args, "--output_dir", str(default_output)])
+            default_markdown = (default_output / "candidates.md").read_text(encoding="utf-8")
+            self.assertNotIn("Available Tool Definitions", default_markdown)
+            default_sample = json.loads((default_output / "all_samples.jsonl").read_text(
+                encoding="utf-8"))
+            self.assertNotIn("tool_definitions", default_sample)
+
+            output = root / "with_tools"
+            main([*args, "--include_bfcl_tools", "--output_dir", str(output)])
+            markdown = (output / "candidates.md").read_text(encoding="utf-8")
+            self.assertIn("Available Tool Definitions (EvalScope tools):", markdown)
+            self.assertIn("Get current weather", markdown)
+            self.assertLess(markdown.index("Available Tool Definitions"), markdown.index("Prompt:"))
+            sample = json.loads((output / "all_samples.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(sample["tool_definition_source"], "tools")
+            self.assertEqual(sample["tool_definitions"], tools)
+
+            path = runs["base"] / "predictions" / "base" / "bfcl_v3" / "simple.jsonl"
+            row = json.loads(path.read_text(encoding="utf-8"))
+            row["metadata"]["tools"][0]["function"]["name"] = "different"
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tool definitions differ across runs"):
+                main([*args, "--include_bfcl_tools", "--output_dir", str(root / "mismatch")])
+
+    def test_bfcl_text_mode_uses_functions_and_other_datasets_reject_flag(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runs = {}
+            functions = [{"name": "weather", "description": "Get weather"}]
+            for label, correct in (("ours", True), ("fp", True), ("base", False)):
+                run = write_run(root, label, "bfcl_v3", [(0, "Weather?", correct, "weather()")],
+                                "simple")
+                path = run / "predictions" / label / "bfcl_v3" / "simple.jsonl"
+                row = json.loads(path.read_text(encoding="utf-8"))
+                row["metadata"] = {"is_fc_model": False, "functions": functions,
+                                   "tools": [{"type": "function", "function": functions[0]}]}
+                path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                runs[label] = run
+            output = root / "text_mode"
+            main(["--dataset", "bfcl_v3", "--run", f"ours={runs['ours']}",
+                  "--run", f"fp={runs['fp']}", "--run", f"base={runs['base']}",
+                  "--ours", "ours", "--reference", "fp", "--include_bfcl_tools",
+                  "--output_dir", str(output)])
+            sample = json.loads((output / "all_samples.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(sample["tool_definition_source"], "functions")
+            self.assertEqual(sample["tool_definitions"], functions)
+            path = runs["base"] / "predictions" / "base" / "bfcl_v3" / "simple.jsonl"
+            row = json.loads(path.read_text(encoding="utf-8"))
+            row.pop("metadata")
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tool definitions or is_fc_model missing"):
+                main(["--dataset", "bfcl_v3", "--run", f"ours={runs['ours']}",
+                      "--run", f"fp={runs['fp']}", "--run", f"base={runs['base']}",
+                      "--ours", "ours", "--reference", "fp", "--include_bfcl_tools",
+                      "--output_dir", str(root / "missing")])
+            with self.assertRaises(SystemExit):
+                main(["--dataset", "math_500", "--run", f"ours={runs['ours']}",
+                      "--run", f"fp={runs['fp']}", "--run", f"base={runs['base']}",
+                      "--ours", "ours", "--reference", "fp", "--include_bfcl_tools"])
+
     def test_duplicate_sample_id_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

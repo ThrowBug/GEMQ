@@ -319,6 +319,43 @@ def full_text(value):
     return value if isinstance(value, str) else canonical(value)
 
 
+def bfcl_tool_definitions(model):
+    """Read the tool schema used by a BFCL run from its EvalScope sample metadata."""
+    for row in (model["prediction"], model["review"]):
+        metadata = row.get("sample_metadata") or row.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            continue
+        is_fc_model = metadata.get("is_fc_model")
+        if not isinstance(is_fc_model, bool):
+            continue
+        field = "tools" if is_fc_model else "functions"
+        definitions = metadata.get(field)
+        if isinstance(definitions, str):
+            try:
+                definitions = json.loads(definitions)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid BFCL {field} JSON in EvalScope metadata") from exc
+        if isinstance(definitions, (list, dict)) and definitions:
+            return field, definitions
+    raise ValueError("BFCL tool definitions or is_fc_model missing from EvalScope metadata")
+
+
+def add_bfcl_tool_definitions(samples, labels):
+    """Opt-in BFCL simple rendering; never show a schema that differs across runs."""
+    for sample in samples:
+        if sample["subset"] != "simple":
+            raise ValueError("--include_bfcl_tools currently supports only the BFCL simple subset")
+        definitions_by_model = {
+            label: bfcl_tool_definitions(sample["models"][label]) for label in labels
+        }
+        first = definitions_by_model[next(iter(labels))]
+        if any(canonical(value) != canonical(first) for value in definitions_by_model.values()):
+            raise ValueError(
+                f"BFCL tool definitions differ across runs for {sample['subset']} / {sample['sample_id']}"
+            )
+        sample["tool_definition_source"], sample["tool_definitions"] = first
+
+
 def markdown_text_block(value):
     text = full_text(value)
     longest_tildes = max((len(match.group()) for match in re.finditer(r"~+", text)), default=0)
@@ -354,8 +391,13 @@ def write_outputs(output_dir, dataset, samples, report, labels, preview_limit, o
              "Automatically filtered from EvalScope reviews; inspect original JSONL before publication.", ""]
     for sample in candidates[:preview_limit]:
         lines += [f"## {sample['subset']} / {sample['sample_id']}", "",
-                  f"Failed baselines: {', '.join(sample['failed_baselines'])}", "",
-                  "Prompt:", "", *markdown_text_block(sample["prompt"]), "",
+                  f"Failed baselines: {', '.join(sample['failed_baselines'])}", ""]
+        if "tool_definitions" in sample:
+            field = sample["tool_definition_source"]
+            lines += [f"Available Tool Definitions (EvalScope {field}):", "",
+                      *markdown_text_block(json.dumps(sample["tool_definitions"],
+                                                      ensure_ascii=False, indent=2)), ""]
+        lines += ["Prompt:", "", *markdown_text_block(sample["prompt"]), "",
                   "Reference target:", "", *markdown_text_block(sample["target"]), ""]
         for label in labels:
             model = sample["models"][label]
@@ -380,6 +422,8 @@ def parse_args(argv=None):
                         help="Maximum number of candidates in candidates.md (0-50; default: 50)")
     parser.add_argument("--preview_chars", type=int, default=None,
                         help="Deprecated; accepted but ignored because candidates.md is untruncated")
+    parser.add_argument("--include_bfcl_tools", action="store_true",
+                        help="Show BFCL simple tool definitions in candidates.md and all_samples.jsonl")
     parser.add_argument("--overwrite", action="store_true", help="Replace this tool's existing output files")
     args = parser.parse_args(argv)
     runs = {}
@@ -400,6 +444,8 @@ def parse_args(argv=None):
         parser.error("At least one baseline --run is required")
     if not 0 <= args.preview_limit <= 50:
         parser.error("--preview_limit must be between 0 and 50")
+    if args.include_bfcl_tools and args.dataset != "bfcl_v3":
+        parser.error("--include_bfcl_tools requires --dataset bfcl_v3")
     for label, path in runs.items():
         if not path.is_dir():
             parser.error(f"Run directory for {label} does not exist: {path}")
@@ -412,6 +458,8 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     samples, report = collect(args.dataset, args.runs, args.ours, args.reference)
+    if args.include_bfcl_tools:
+        add_bfcl_tool_definitions(samples, args.runs)
     write_outputs(args.output_dir, args.dataset, samples, report, args.runs,
                   args.preview_limit, args.overwrite)
     print(f"Saved {len(samples)} aligned samples and {report['counts']['candidate']} candidates "
