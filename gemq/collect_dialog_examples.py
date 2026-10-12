@@ -123,8 +123,32 @@ def score_evidence(review):
     return {}
 
 
+def user_message_text(messages):
+    """Read the rendered question from the last user turn in an EvalScope cache."""
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list) and content:
+            parts = []
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    break
+                value = part.get("text")
+                if not isinstance(value, str):
+                    break
+                parts.append(value)
+            else:
+                text = "\n".join(parts)
+                if text.strip():
+                    return text
+    return None
+
+
 def prompt_and_identity(prediction, review):
-    """Prefer the rendered prompt; fall back to substantive sample metadata."""
+    """Require an actual question/prompt, never answer-only metadata."""
     context = {}
     for row in (review, prediction):
         metadata = row.get("sample_metadata") or row.get("metadata") or {}
@@ -132,6 +156,11 @@ def prompt_and_identity(prediction, review):
             for field in ("functions", "tools", "choices", "options"):
                 if field in metadata and field not in context:
                     context[field] = metadata[field]
+    for row in (review, prediction):
+        text = user_message_text(row.get("messages"))
+        if text:
+            identity = canonical({"prompt": text, "context": context})
+            return text, "messages.user", hashlib.sha256(identity.encode("utf-8")).hexdigest()
     for row in (review, prediction):
         value = row.get("input")
         if value:
@@ -148,10 +177,6 @@ def prompt_and_identity(prediction, review):
                 text = value if isinstance(value, str) else canonical(value)
                 identity = canonical({"prompt": text, "context": context})
                 return text, "metadata." + field, hashlib.sha256(identity.encode("utf-8")).hexdigest()
-        substantive = {k: v for k, v in meta.items() if k not in ("id", "key", "index")}
-        if substantive:
-            text = canonical(substantive)
-            return text, "metadata", hashlib.sha256(text.encode("utf-8")).hexdigest()
     return "", "missing", None
 
 
@@ -221,6 +246,12 @@ def load_run(label, run_dir, dataset):
 
 
 def collect(dataset, runs, ours, reference=None):
+    if reference is None:
+        raise ValueError("--reference must name the full-precision run")
+    if ours == reference:
+        raise ValueError("--ours and --reference must name different runs")
+    if not any(label not in (ours, reference) for label in runs):
+        raise ValueError("At least one baseline run is required")
     loaded = {}
     report = {"dataset": dataset, "metric": METRICS[dataset], "runs": {}}
     for label, path in runs.items():
@@ -262,8 +293,8 @@ def collect(dataset, runs, ours, reference=None):
             counts[problem] += 1
         failed_baselines = [label for label in baselines if per_model[label]["correct"] is False]
         candidate = (not problems and per_model[ours]["correct"] is True
-                     and bool(failed_baselines)
-                     and (reference is None or per_model[reference]["correct"] is True))
+                     and per_model[reference]["correct"] is True
+                     and all(per_model[label]["correct"] is False for label in baselines))
         if candidate:
             counts["candidate"] += 1
         anchor = per_model[ours]
@@ -332,7 +363,8 @@ def parse_args(argv=None):
     parser.add_argument("--run", action="append", required=True, metavar="LABEL=RUN_DIR",
                         help="Repeat for each model; RUN_DIR is the actual EvalScope timestamp directory")
     parser.add_argument("--ours", required=True, help="Label of the method being showcased")
-    parser.add_argument("--reference", help="Optional FP label; candidates must also pass for this model")
+    parser.add_argument("--reference", required=True,
+                        help="FP run label; candidates must pass here and in --ours")
     parser.add_argument("--output_dir", type=Path, help="Default: cache/dialog_examples/DATASET")
     parser.add_argument("--preview_limit", type=int, default=30)
     parser.add_argument("--preview_chars", type=int, default=2500)
@@ -350,6 +382,8 @@ def parse_args(argv=None):
         runs[label] = Path(path)
     if args.ours not in runs or (args.reference and args.reference not in runs):
         parser.error("--ours and --reference must name labels supplied by --run")
+    if args.ours == args.reference:
+        parser.error("--ours and --reference must name different runs")
     if not any(label not in (args.ours, args.reference) for label in runs):
         parser.error("At least one baseline --run is required")
     if args.preview_limit < 0 or args.preview_chars <= 0:
