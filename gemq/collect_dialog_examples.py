@@ -8,6 +8,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 from pathlib import Path
 
 
@@ -314,8 +315,18 @@ def preview_text(value, limit):
     return text if len(text) <= limit else text[:limit] + "\n[preview truncated; see all_samples.jsonl]"
 
 
-def write_outputs(output_dir, dataset, samples, report, labels, preview_limit, preview_chars,
-                  overwrite=False):
+def full_text(value):
+    return value if isinstance(value, str) else canonical(value)
+
+
+def markdown_text_block(value):
+    text = full_text(value)
+    longest_tildes = max((len(match.group()) for match in re.finditer(r"~+", text)), default=0)
+    fence = "~" * max(4, longest_tildes + 1)
+    return [f"{fence}text", text, fence]
+
+
+def write_outputs(output_dir, dataset, samples, report, labels, preview_limit, overwrite=False):
     output_names = ("all_samples.jsonl", "candidates.csv", "candidates.md", "alignment_report.json")
     existing = [output_dir / name for name in output_names if (output_dir / name).exists()]
     if existing and not overwrite:
@@ -344,13 +355,12 @@ def write_outputs(output_dir, dataset, samples, report, labels, preview_limit, p
     for sample in candidates[:preview_limit]:
         lines += [f"## {sample['subset']} / {sample['sample_id']}", "",
                   f"Failed baselines: {', '.join(sample['failed_baselines'])}", "",
-                  "Prompt:", "", "~~~~text", preview_text(sample["prompt"], preview_chars), "~~~~", "",
-                  "Reference target:", "", "~~~~text",
-                  preview_text(sample["target"], preview_chars), "~~~~", ""]
+                  "Prompt:", "", *markdown_text_block(sample["prompt"]), "",
+                  "Reference target:", "", *markdown_text_block(sample["target"]), ""]
         for label in labels:
             model = sample["models"][label]
-            lines += [f"### {label} (correct={model['correct']})", "", "~~~~text",
-                      preview_text(model["response"], preview_chars), "~~~~", ""]
+            lines += [f"### {label} (correct={model['correct']})", "",
+                      *markdown_text_block(model["response"]), ""]
     (output_dir / "candidates.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (output_dir / "alignment_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -366,8 +376,10 @@ def parse_args(argv=None):
     parser.add_argument("--reference", required=True,
                         help="FP run label; candidates must pass here and in --ours")
     parser.add_argument("--output_dir", type=Path, help="Default: cache/dialog_examples/DATASET")
-    parser.add_argument("--preview_limit", type=int, default=30)
-    parser.add_argument("--preview_chars", type=int, default=2500)
+    parser.add_argument("--preview_limit", type=int, default=50,
+                        help="Maximum number of candidates in candidates.md (0-50; default: 50)")
+    parser.add_argument("--preview_chars", type=int, default=None,
+                        help="Deprecated; accepted but ignored because candidates.md is untruncated")
     parser.add_argument("--overwrite", action="store_true", help="Replace this tool's existing output files")
     args = parser.parse_args(argv)
     runs = {}
@@ -386,8 +398,8 @@ def parse_args(argv=None):
         parser.error("--ours and --reference must name different runs")
     if not any(label not in (args.ours, args.reference) for label in runs):
         parser.error("At least one baseline --run is required")
-    if args.preview_limit < 0 or args.preview_chars <= 0:
-        parser.error("--preview_limit must be nonnegative and --preview_chars positive")
+    if not 0 <= args.preview_limit <= 50:
+        parser.error("--preview_limit must be between 0 and 50")
     for label, path in runs.items():
         if not path.is_dir():
             parser.error(f"Run directory for {label} does not exist: {path}")
@@ -401,7 +413,7 @@ def main(argv=None):
     args = parse_args(argv)
     samples, report = collect(args.dataset, args.runs, args.ours, args.reference)
     write_outputs(args.output_dir, args.dataset, samples, report, args.runs,
-                  args.preview_limit, args.preview_chars, args.overwrite)
+                  args.preview_limit, args.overwrite)
     print(f"Saved {len(samples)} aligned samples and {report['counts']['candidate']} candidates "
           f"to {args.output_dir}")
     print(f"Check {args.output_dir / 'alignment_report.json'} before using the candidates.")

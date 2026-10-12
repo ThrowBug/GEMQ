@@ -84,6 +84,41 @@ class DialogExamplesTest(unittest.TestCase):
             self.assertEqual(report["counts"]["prompt_mismatch"], 1)
             self.assertEqual(report["counts"]["unknown_score"], 1)
 
+    def test_markdown_has_up_to_50_complete_candidates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            long_prompt = "Question " + "p" * 2600 + " PROMPT_END"
+            long_target = "t" * 2600 + " TARGET_END"
+            long_response = "Answer " + "r" * 2600 + "\n~~~~\nRESPONSE_END"
+            rows = [(0, long_prompt, True, long_response)]
+            rows += [(index, f"Question {index}", True, "correct") for index in range(1, 51)]
+            ours = write_run(root, "ours", "math_500", rows)
+            fp = write_run(root, "fp", "math_500", rows)
+            base = write_run(root, "base", "math_500", [
+                (index, prompt, False, "wrong") for index, prompt, _, _ in rows])
+            for run in (ours, fp, base):
+                path = run / "reviews" / run.name / "math_500" / "default.jsonl"
+                reviews = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+                reviews[0]["target"] = long_target
+                path.write_text("\n".join(json.dumps(row) for row in reviews) + "\n",
+                                encoding="utf-8")
+
+            output = root / "out"
+            main(["--dataset", "math_500", "--run", f"ours={ours}",
+                  "--run", f"fp={fp}", "--run", f"base={base}",
+                  "--ours", "ours", "--reference", "fp", "--output_dir", str(output),
+                  "--preview_chars", "10"])
+            markdown = (output / "candidates.md").read_text(encoding="utf-8")
+            self.assertEqual(markdown.count("\n## default / "), 50)
+            self.assertIn("PROMPT_END", markdown)
+            self.assertIn("TARGET_END", markdown)
+            self.assertIn("RESPONSE_END", markdown)
+            self.assertIn("~~~~~text\n" + long_response + "\n~~~~~", markdown)
+            self.assertNotIn("[preview truncated", markdown)
+            self.assertNotIn("## default / 50", markdown)
+            with (output / "candidates.csv").open(encoding="utf-8-sig", newline="") as source:
+                self.assertEqual(len(list(csv.DictReader(source))), 51)
+
     def test_ifeval_uses_prompt_level_strict_and_nested_score(self):
         review = {"sample_score": {"score": {"value": {
             "prompt_level_strict": 0.0, "inst_level_strict": 1.0,
