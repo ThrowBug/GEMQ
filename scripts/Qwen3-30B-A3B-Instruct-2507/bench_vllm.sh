@@ -9,15 +9,14 @@ model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_variant="${MODEL_VARIANT:-FQ}"
 model_variant="${model_variant^^}"
 
-bpe="${BPE:-2.5}"
+bpe="${BPE:-2.0}"
 attn_wbits="${ATTN_WBITS:-4}"
 dense_wbits="${DENSE_WBITS:-4}"
-calib_dataset="${CALIB_DATASET:-mixed_chat_en}"
-calib_seed="${CALIB_SEED:-0}"
+calib_dataset="${CALIB_DATASET:-c4}"
+calib_seed="${CALIB_SEED:-${SEED:-0}}"
 allocation_tag="${ALLOCATION_TAG:-}"
 if [[ -z "${allocation_tag}" ]]; then
     case "${calib_dataset}" in
-        mixed_chat_en) allocation_tag="MixedChatEn-Seed${calib_seed}" ;;
         c4) allocation_tag="C4-Seed${calib_seed}" ;;
         math) allocation_tag="MATH-Seed${calib_seed}" ;;
         math+c4) allocation_tag="MATH+C4-Seed${calib_seed}" ;;
@@ -25,29 +24,53 @@ if [[ -z "${allocation_tag}" ]]; then
     esac
 fi
 
-finetune_routers="${FINETUNE_ROUTERS:-true}"
-rft_trainer="${RFT_TRAINER:-layerwise_teacher}"
+finetune="${FINETUNE:-true}"
+rft_trainer="${RFT_TRAINER:-roco}"
 rft_lr="${RFT_LR:-1e-4}"
 rft_lr_tag="$(python -c 'import sys; from decimal import Decimal; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "${rft_lr}")"
 rft_tag=""
-if [[ "${finetune_routers}" == "true" ]]; then
+if [[ "${finetune}" == "true" ]]; then
     case "${rft_trainer}" in
-        legacy_ce) rft_tag="_RFT-legacy_ce" ;;
-        distill_ce) rft_tag="_RFT-distill_ce" ;;
-        router_compensated_norm_distill) rft_tag="_RFT-router_compensated_norm_distill-lr${rft_lr_tag}" ;;
-        layerwise_teacher)
-            rft_timing="${RFT_TIMING:-after_each_layer_quantization}"
-            timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"
-            rft_router_loss="${RFT_ROUTER_LOSS:-kd_tail}"
-            alpha_tag="${RFT_ROUTER_ALPHA:-1.0}"; alpha_tag="${alpha_tag//./p}"
-            router_weight_tag="${RFT_ROUTER_LOSS_WEIGHT:-1.0}"; router_weight_tag="${router_weight_tag//./p}"
-            output_weight_tag="${RFT_OUTPUT_KL_WEIGHT:-0.0}"; output_weight_tag="${output_weight_tag//./p}"
-            rft_tag="_RFT-${timing_tag}-${rft_router_loss}-a${alpha_tag}-rw${router_weight_tag}-ow${output_weight_tag}"
-            ;;
+        router_ft) rft_tag="_RFT-router_ft" ;;
+        norm_ft|roco) rft_tag="_RFT-${rft_trainer}-lr${rft_lr_tag}" ;;
         *) echo "Unsupported RFT_TRAINER: ${rft_trainer}" >&2; exit 1 ;;
     esac
 fi
-default_fq_path="results/fake_quant_models/${model_name}/GEMQ/${allocation_tag}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
+if [[ -n "${MIXED_PREC+x}" ]]; then
+    echo "MIXED_PREC is no longer supported; use an allocated model path." >&2
+    exit 1
+fi
+allocation_metric="${ALLOCATION_METRIC:-pop}"
+if [[ -n "${WBITS:-}" ]]; then
+    wbits="${WBITS}"
+elif [[ "${allocation_metric}" == "pop" ]]; then
+    wbits="0,2,3"
+else
+    wbits="1,2,3"
+fi
+bpe_tag="$(printf '%.1f' "${bpe}")"
+if [[ -n "${BIT_CFG_PATH:-}" ]]; then
+    bit_cfg="${BIT_CFG_PATH}"
+elif [[ "${allocation_metric}" == "pop" ]]; then
+    context_bit="${POP_CONTEXT_BIT:-${AVERAGE_BITS:-2}}"
+    count_tag=""
+    [[ "${NORMALIZE_BY_ACTIVATION_COUNT:-true}" == "false" ]] && count_tag="-NoCountNorm"
+    bit_cfg="configs/${model_name}/ProQuant/${allocation_tag}_Metric-pop-Ctxuniform${context_bit}${count_tag}_E${bpe_tag}_B${wbits}"
+    if [[ ",${wbits}," == *,0,* ]]; then
+        bit_cfg+="_Pmax$(printf '%g' "${MAX_PRUNE_RATIO:-0.25}")_EqPrune"
+    fi
+    bit_cfg+=".pkl"
+elif [[ "${allocation_metric}" == "layer_re" ]]; then
+    constraint="${EXTRA_CONSTR:-c2c3}"
+    constraint_tag=""; [[ "${constraint}" != "none" ]] && constraint_tag="_${constraint}"
+    bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-layer_re_E${bpe_tag}_B${wbits}${constraint_tag}.pkl"
+else
+    echo "ALLOCATION_METRIC must be pop or layer_re." >&2
+    exit 1
+fi
+qtype="$(basename "$(dirname "${bit_cfg}")")"
+prefix="$(basename "${bit_cfg}" .pkl)"
+default_fq_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
 
 case "${model_variant}" in
     FP)

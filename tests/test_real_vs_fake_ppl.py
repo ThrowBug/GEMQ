@@ -12,7 +12,7 @@ Three variants are measured, matching the three code paths that exist today:
     real-unpatched HQQLinear                   + HF MoE blocks   (no --compile)
     real-patched  GemLiteLinearTriton          + QuantFused*MoEBlock (--compile)
 
-Note that gemq/quantize.py evaluates perplexity *before* replace_linears packs the
+Note that proquant/quantize.py evaluates perplexity *before* replace_linears packs the
 weights, so the number printed by a --real_quant run has always been the fake-quant
 perplexity. This file measures the other two for the first time.
 
@@ -38,7 +38,7 @@ def _free(*objs):
 def _load_real(model_path, trust_remote_code=True, device="cuda", compute_dtype=torch.float16,
                mscale_fix=True):
     """Load a real-quant checkpoint on the modeling code it was quantized with."""
-    from gemq.utils.hf_loading import load_quantized_model, align_deepseek_softmax_scale
+    from proquant.utils.hf_loading import load_quantized_model, align_deepseek_softmax_scale
 
     model = load_quantized_model(
         model_path, compute_dtype=compute_dtype, device=device,
@@ -78,7 +78,7 @@ def _hqq_to_dense(module):
 
 
 def _perplexity(model, tokenizer, seqlen, nseq, tag):
-    from gemq.utils.eval_utils import get_testenc, compute_perplexity
+    from proquant.utils.eval_utils import get_testenc, compute_perplexity
 
     model.seqlen = seqlen
     testenc = get_testenc(tokenizer, "wikitext2", seqlen)
@@ -106,9 +106,9 @@ def ppl_table(model_path, model_name, seqlen, nseq, trust_remote_code, mscale_fi
         pytest.skip("needs a CUDA device")
 
     from transformers import AutoTokenizer
-    from gemq.inference.patch import prepare_for_inference
+    from proquant.inference.patch import prepare_for_inference
 
-    from gemq.utils.hf_loading import describe_model_impl, uses_remote_code
+    from proquant.utils.hf_loading import describe_model_impl, uses_remote_code
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     results = {}
@@ -119,7 +119,7 @@ def ppl_table(model_path, model_name, seqlen, nseq, trust_remote_code, mscale_fi
     ships_remote_code = bool(getattr(model.config, "auto_map", None))
 
     if not uses_remote_code(model):
-        from gemq.utils.hf_loading import deepseek_mscale_correction
+        from proquant.utils.hf_loading import deepseek_mscale_correction
         factor = deepseek_mscale_correction(model.config)
         if factor != 1.0:
             state = "applied" if mscale_fix else "skipped"

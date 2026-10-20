@@ -35,7 +35,7 @@ if (( ${#weight_files[@]} == 0 )); then
     exit 1
 fi
 if ! command -v python >/dev/null 2>&1; then
-    echo "python command not found. Activate the GEMQ environment first." >&2
+    echo "python command not found. Activate the ProQuant environment first." >&2
     exit 1
 fi
 
@@ -81,4 +81,4 @@ echo " Attention impl:   ${attn_impl}"
 echo " Layer offloading: ${offload}"
 echo "=============================================="
 
-CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.evaluate_ppl "${eval_args[@]}"
+CUDA_VISIBLE_DEVICES="${gpus}" python -m proquant.evaluate_ppl "${eval_args[@]}"

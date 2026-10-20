@@ -61,7 +61,7 @@ def test_repo_gemm_kernel_matches_fp16_matmul(device, nbits, group_size):
     for shared experts. Expert weights never reach GemLite's own forward -- the fused
     blocks pull .W_q/.scales/.zeros off the GemLite object and run these kernels.
     """
-    from gemq.triton_kernels.dequant_gemm import dequant_gemm_triton
+    from proquant.triton_kernels.dequant_gemm import dequant_gemm_triton
 
     torch.manual_seed(0)
     W = (torch.randn(OUT_FEATURES, IN_FEATURES, device=device) * 0.02).half()
@@ -88,7 +88,7 @@ def test_repo_gemm_kernel_matches_fp16_matmul(device, nbits, group_size):
 @pytest.mark.parametrize("nbits", [1, 2, 3, 4])
 def test_repo_gemv_kernel_matches_fp16_matmul(device, nbits):
     """Same, at the decode shape, through the split-k GEMV the shared experts use."""
-    from gemq.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
+    from proquant.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
 
     torch.manual_seed(0)
     W = (torch.randn(OUT_FEATURES, IN_FEATURES, device=device) * 0.02).half()

@@ -1,0 +1,806 @@
+import os
+import argparse
+import sys
+import time
+import math
+import gc
+import json
+from functools import partial
+from tqdm import tqdm
+
+import torch
+from transformers import AutoTokenizer, logging
+from hqq.models.hf.base import AutoHQQHFModel
+
+from proquant.quantizers.gptq import MCMoeGPTQWeightQuantizer, GPTQWeightQuantizer
+from proquant.utils.data_utils import get_calib_loader
+from proquant.utils.gptq_checkpoint import (
+    build_gptq_checkpoint_identity,
+    build_gptq_checkpoint_metadata,
+    load_gptq_checkpoint_metadata,
+    save_gptq_checkpoint,
+)
+from proquant.utils.model_utils import *
+from proquant.utils.quant_utils import *
+from proquant.utils.eval_utils import evaluate_perplexity, run_lm_eval
+from proquant.utils.hf_loading import load_causal_lm_checkpoint
+from proquant.router_finetune.config import (
+    DistillCEConfig,
+    NORM_DISTILL_MODES,
+    RFT_TRAINERS,
+)
+from proquant.router_finetune.norm_distill import finetune_norms_distill_ce
+from proquant.router_finetune.targets import (
+    get_or_collect_teacher_targets,
+    materialize_calibration_inputs,
+    project_teacher_router_logits,
+)
+from proquant.pruning import (
+    has_zero_bit_experts,
+    kept_expert_ids_from_pruning_metadata,
+    load_expert_bit_config,
+    prune_qwen3_experts,
+)
+
+logging.set_verbosity_error()
+
+
+def load_causal_lm(model_path, args, description="model"):
+    print(f"Loading {description} ...")
+    model = load_causal_lm_checkpoint(
+        model_path,
+        model_dtype=args.model_dtype,
+        attn_implementation=args.attn_impl,
+        trust_remote_code=args.trust_remote_code,
+        device_map="cpu",
+    )
+    model.seqlen = args.seqlen
+    if args.cuda_diagnostics:
+        report_cuda_diagnostics(f"{description} loaded", model=model)
+    return model
+
+
+def save_quantized_model(model, tokenizer, save_path, save_dtype, real_quant):
+    """
+    Save the real/pseudo quantized model.
+    """
+    if real_quant:
+        tokenizer.save_pretrained(save_path)
+        AutoHQQHFModel.save_quantized(model, save_path)
+    else:
+        dtype = torch.float16 if save_dtype == "float16" else torch.bfloat16
+        model = model.to(dtype)
+        tokenizer.save_pretrained(save_path)
+        model.save_pretrained(save_path)
+
+
+def finetune_routers(model, dataloader, args):
+    """
+    Fine-tune all router modules in the MoE model.
+    """
+    # disable kv cahce
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    org_dtype = next(model.parameters()).dtype
+
+    model.train()
+    model = model.to(torch.bfloat16)
+
+    # prepare dataset
+    input_ids = []
+    for data in dataloader:
+        input_ids.append(data[0])  # (1, seqlen)
+    input_ids = torch.cat(input_ids, dim=0)  # (nsamples, seqlen)
+
+    # enable gradients for all routers
+    router_params = get_router_params(model, args.model_name)  # NOTE: return a list of parameters
+    for p in model.parameters():
+        p.requires_grad = False
+    for p in router_params:
+        p.requires_grad = True
+
+    # sanity check
+    org_pmean, org_gmean = 0.0, 0.0
+    for name, param in model.named_parameters():
+        if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+            org_gmean += param.mean().item()
+        else:
+            org_pmean += param.mean().item()
+    if args.verbose:
+        print("Router stats before fine-tuning:", org_gmean)
+
+    # start fine-tuning
+    optimizer = torch.optim.AdamW(router_params, lr=args.rft_lr, weight_decay=args.rft_wd)
+    for epoch in range(args.rft_epochs):
+        loss_sum = 0.
+        start = time.time()
+        for i in range(args.nsamples // args.rft_batch_size):
+            idx = i * args.rft_batch_size
+            data = input_ids[idx: idx + args.rft_batch_size].to("cuda")  # (bsz, seqlen)
+            outputs = model(input_ids=data, labels=data)
+            loss = outputs.loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            loss_sum += loss.item()
+            if i % 32 == 0:
+                print(f"[epoch {epoch} | iter {i:>3d}] loss: {loss_sum / (i+1):.6f}")
+        elapse = time.time() - start
+        print(f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, elapse: {elapse:.2f} seconds")
+
+        # sanity check
+        if epoch == 0:
+            pmean, gmean = 0., 0.
+            for name, param in model.named_parameters():
+                if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+                    gmean += param.mean().item()
+                else:
+                    pmean += param.mean().item()
+
+            assert math.fabs(org_pmean - pmean) < 1e-8, "Other parameters are changing during router fine-tuning!"
+            assert math.fabs(org_gmean - gmean) > 1e-10, "Routers are not changing during fine-tuning!"
+            print("Sanity check passed!")
+            if args.verbose:
+                print("Sum of routers params after finetuning:", gmean)
+
+    # restore
+    model = model.to(org_dtype)
+    model.config.use_cache = use_cache
+
+
+@torch.no_grad()
+def quantize_weights_gptq(
+    model,
+    dataloader,
+    args,
+    expert_bit_cfg=None,
+):
+    """
+    Perform mixed-precision weight-only quantization with GPTQ quantizer.
+    At the end of this function, the model weights are replaced with dequantized weights in fp16.
+
+    NOTE: only supports single GPU quantization.
+    """
+    # disable KV cache for quantization
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    cuda_diagnostics = getattr(args, "cuda_diagnostics", False)
+
+    if cuda_diagnostics:
+        report_cuda_diagnostics("before GPTQ quantization", model=model)
+
+    # build a bit allocation config for each Linear module
+    bit_cfg = build_alloc_cfg(model, args, expert_bit_cfg=expert_bit_cfg)
+
+    # prepare decoder inputs and kwargs for model forward
+    inps, layer_kwargs = compute_decoder_inputs(model, dataloader, args.model_name, "cuda")
+
+    # retrieve decoder blocks
+    layers = get_blocks(model, args.model_name)
+
+    # perform quantization for each block
+    quant_modules = {}
+    outs = torch.zeros_like(inps)
+    for i in tqdm(range(len(layers)), desc="GPTQ Quantizing"):
+        if args.verbose:
+            print("+" + "="*57 + "+")
+            print(f"| block {i:<24} | {'bit':<3} |  gs  | {'time (s)':>9} |")
+            print("+" + "-"*57 + "+")
+        start = time.time()
+
+        # retrieve linear modules in the current block
+        layer = layers[i].to("cuda")
+        named_linears = get_named_linears(layer)
+
+        # create a quantizer for each linear module that requires quantization
+        quantizers = {}
+        for name, m in named_linears.items():
+            wbits = bit_cfg[i][name]
+
+            # skip
+            if wbits >= 16:
+                continue
+
+            # NOTE: adjust groupsize to fit the hidden size
+            hidden_size = m.weight.shape[1]
+            if hidden_size % args.groupsize == 0:
+                groupsize = args.groupsize
+            else:
+                assert hidden_size % 64 == 0, "Currently only supports groupsize=64 as fallback."
+                groupsize = 64
+                if args.verbose:
+                    print(f"Forcing groupsize from {args.groupsize} to 64 for module: {name}")
+
+            if args.reproduce_mcmoe:
+                quantizers[name] = MCMoeGPTQWeightQuantizer(
+                    m.weight.data, name, wbits, args.blocksize, args.percdamp,
+                    groupsize, args.actorder, args.static_groups, args.mse
+                )
+            else:
+                quantizers[name] = GPTQWeightQuantizer(
+                    m.weight.data, name, wbits, args.blocksize, args.percdamp,
+                    groupsize, args.actorder, args.static_groups, args.mse
+                )
+            
+            # collect quantized modules for real quantization saving
+            quant_modules[f"{i}.{name}"] = m
+
+        # update Hessian using a batch of input data for each linear module
+        def update_hessian_hook(m, x, y, quantizer):
+            x = x[0].detach()
+            quantizer.add_batch(x)
+
+        handles = []
+        for name in named_linears:
+            if name not in quantizers:
+                continue
+            handles.append(
+                named_linears[name].register_forward_hook(
+                    partial(update_hessian_hook, quantizer=quantizers[name])
+                )
+            )
+        for j in range(inps.shape[0]):
+            outs[j] = layer(inps[j: j+1], **layer_kwargs)[0]
+        for h in handles:
+            h.remove()
+
+        elapse = time.time() - start
+        if args.verbose:
+            print(f"| {'pre-quantization':<30}   {' ':<3} | {' ':>4} | {elapse:>9.2f} |")
+            print("+" + "-"*57 + "+")
+
+        # quantize each linear module
+        for name, m in named_linears.items():
+            if name not in quantizers:
+                continue
+
+            # quantize
+            start = time.time()
+            Q, scales, zeros = quantizers[name].quantize()
+
+            # dequantize
+            W = quantizers[name].dequantize(Q, scales, zeros)
+
+            # replace weights and register quantization params
+            m.weight.data = W.reshape_as(m.weight.data)
+            m.register_buffer("quant_scales", scales)
+            m.register_buffer("quant_zeros", zeros)
+            m.register_buffer("quant_nbits", torch.tensor(quantizers[name].nbits))
+            m.register_buffer("quant_groupsize", torch.tensor(quantizers[name].groupsize))
+
+            elapse = time.time() - start
+            if args.verbose:
+                print(f"| {name:<30} | {quantizers[name].nbits:<3} | {quantizers[name].groupsize:>4} | {elapse:>9.2f} |")
+
+        # compute layer outputs using quantized weights
+        start = time.time()
+
+        for j in range(inps.shape[0]):
+            outs[j] = layer(inps[j: j+1], **layer_kwargs)[0]
+
+        elapse = time.time() - start
+        if args.verbose:
+            print("+" + "-"*57 + "+")
+            print(f"| {'post-quantization':<30}   {' ':<3} | {' ':>4} | {elapse:>9.2f} |")
+            print("+" + "="*57 + "+")
+
+        # update inputs for the next layer
+        inps, outs = outs, inps
+
+        # save memory
+        layers[i] = layer.to("cpu")
+        del quantizers
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    model.config.use_cache = use_cache  # restore
+
+    if cuda_diagnostics:
+        report_cuda_diagnostics(
+            "GPTQ complete, before input/output cleanup", model=model
+        )
+    del inps, outs, layer_kwargs
+    gc.collect()
+    torch.cuda.empty_cache()
+    if cuda_diagnostics:
+        report_cuda_diagnostics(
+            "GPTQ complete, after input/output cleanup", model=model
+        )
+
+    return quant_modules
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="ProQuant Qwen3-MoE quantization.")
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Whether to enable verbose logging"
+    )
+    parser.add_argument(
+        "--cuda_diagnostics", action="store_true",
+        help="Print read-only CUDA memory and model-placement diagnostics",
+    )
+    
+    # model args
+    parser.add_argument(
+        "--model", type=str, required=True,
+        help="Path to the pre-trained model or shortcut name",
+    )
+    parser.add_argument(
+        "--model_name", type=str, required=True,
+        help="Name of the model; used to load model-specific modules",
+    )
+    parser.add_argument(
+        "--model_dtype", type=str, default="float16", choices=["auto", "float16", "bfloat16"],
+        help="Data type of the model weights; use `auto` to load the model in the default dtype",
+    )
+    parser.add_argument(
+        "--use_fast", action="store_true",
+        help="Whether to use the fast tokenizer implementation",
+    )
+    parser.add_argument(
+        "--attn_impl", type=str, default="eager", choices=["eager", "sdpa"],
+        help="Implementation of attention to use",
+    )
+    parser.add_argument(
+        "--disable_cache", action="store_true",
+        help="Disable KV cache",
+    )
+    parser.add_argument(
+        "--trust_remote_code", action="store_true",
+        help="Enable `trust_remote_code` when loading the model from HuggingFace Hub",
+    )
+
+    # dataset args
+    parser.add_argument(
+        "--calib_dataset", type=str, default="c4",
+        help="Which calibration dataset to use",
+    )
+    parser.add_argument(
+        "--nsamples", type=int, default=128,
+        help="Number of calibration sequences"
+    )
+    parser.add_argument(
+        "--seqlen", type=int, default=2048,
+        help="Length of each sequence",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=1,
+        help="Batch size of the data loader"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="Seed for sampling the calibration data"
+    )
+
+    # expert bit allocation
+    parser.add_argument(
+        "--bit_cfg", type=str, required=True,
+        help="Required path to the expert bit-allocation config file"
+    )
+
+    # quantization args
+    parser.add_argument(
+        "--eval_fp", action="store_true",
+        help="Whether to skip quantization and evaluate the full-precision model"
+    )
+    parser.add_argument(
+        "--quantizer", type=str, default="gptq",
+        help="Which quantizer to use"
+    )
+    parser.add_argument(
+        "--attn_wbits", type=int, default=4,
+        help="#bits for quantization of attention modules"
+    )
+    parser.add_argument(
+        "--gate_wbits", type=int, default=16,
+        help="#bits for quantization of gate (router) modules"
+    )
+    parser.add_argument(
+        "--dense_wbits", type=int, default=4,
+        help="#bits for quantization of dense modules"
+    )
+    parser.add_argument(
+        "--expert_wbits", type=int, default=4,
+        help="#bits for quantization of expert modules"
+    )
+    parser.add_argument(
+        "--groupsize", type=int, default=128,
+        help="Groupsize to use for quantization"
+    )
+    
+    # quantizer-specific args
+    parser.add_argument(
+        "--blocksize", type=int, default=128,
+        help="Blocksize to use for quantization"
+    )
+    parser.add_argument(
+        "--percdamp", type=float, default=0.01,
+        help="Percent of the average Hessian diagonal to use for dampening"
+    )
+    parser.add_argument(
+        "--mse", action="store_true",
+        help="Whether to seach for quantization parameters (range)"
+    )
+    parser.add_argument(
+        "--actorder", action="store_true",
+        help="Whether to apply the activation order GPTQ heuristic (never used)"
+    )
+    parser.add_argument(
+        "--static_groups", action="store_true",
+        help="Whether to use static groups; recommended when using `--actorder` for more efficient inference. (never used)"
+    )
+    parser.add_argument(
+        "--reproduce_mcmoe", action="store_true",
+        help="Whether to use the GPTQ implementation from MC-MoE"
+    )
+
+    # post-quantization fine-tuning args
+    parser.add_argument(
+        "--finetune", action="store_true",
+        help="Whether to run the selected post-quantization fine-tuning stage"
+    )
+    parser.add_argument(
+        "--rft_trainer", type=str, default="roco",
+        choices=RFT_TRAINERS,
+        help="Post-quantization training: router CE, dual-norm distillation, or RoCo"
+    )
+    parser.add_argument(
+        "--rft_epochs", type=int, default=1,
+        help="Number of epochs for post-quantization fine-tuning"
+    )
+    parser.add_argument(
+        "--rft_batch_size", type=int, default=1,
+        help="Batch size for post-quantization fine-tuning"
+    )
+    parser.add_argument(
+        "--rft_lr", type=float, default=0.0001,
+        help="Learning rate for post-quantization fine-tuning"
+    )
+    parser.add_argument(
+        "--rft_wd", type=float, default=0.0001,
+        help="Weight decay for post-quantization fine-tuning"
+    )
+    parser.add_argument(
+        "--rft_teacher_cache_dir", type=str, default="cache/router_finetune",
+        help="Base directory for validated full-precision teacher targets"
+    )
+    parser.add_argument(
+        "--rft_rebuild_teacher_cache", action="store_true",
+        help="Recompute teacher targets even when a matching cache exists"
+    )
+
+    # evaluation args
+    parser.add_argument(
+        "--eval_downstream", action="store_true",
+        help="Whether to run evaluation on downstream tasks"
+    )
+    parser.add_argument(
+        "--downstream_tasks", type=str, default="piqa,arc_easy,arc_challenge,hellaswag,winogrande,mathqa,mmlu",
+        help="Tasks to evaluate on; ignored if `--eval_downstream` is False"
+    )
+    parser.add_argument(
+        "--lm_eval_batchsize", type=int, default=32,
+        help="Batch size for lm_eval downstream evaluation"
+    )
+    parser.add_argument(
+        "--num_fewshot", type=int, default=0,
+        help="Few-shot examples to use for downstream evaluation"
+    )
+
+    # i/o args
+    parser.add_argument(
+        "--real_quant", action="store_true",
+        help="Whether to conduct real quantization and save the int weights (using HQQ)"
+    )
+    parser.add_argument(
+        "--save_path", type=str, default="",
+        help="Save quantized checkpoint under this path"
+    )
+    parser.add_argument(
+        "--save_dtype", type=str, default="float16", choices=["float16", "bfloat16"],
+        help="Data type to save the quantized model"
+    )
+    parser.add_argument(
+        "--save_gptq_checkpoint", action="store_true",
+        help="Save a reusable checkpoint after GPTQ and before fine-tuning",
+    )
+    parser.add_argument(
+        "--load_gptq_checkpoint", action="store_true",
+        help="Load a reusable post-GPTQ checkpoint and skip pruning and GPTQ",
+    )
+    parser.add_argument(
+        "--gptq_checkpoint_path", type=str, default="",
+        help="Automatically derived reusable GPTQ checkpoint directory",
+    )
+    
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    # parse args
+    args = parse_args()
+    print(json.dumps(vars(args), indent=4))
+
+    if args.cuda_diagnostics:
+        original_excepthook = sys.excepthook
+
+        def cuda_diagnostics_excepthook(exc_type, exc_value, exc_traceback):
+            error_text = str(exc_value).lower()
+            is_cuda_runtime_error = (
+                issubclass(exc_type, RuntimeError)
+                and any(marker in error_text for marker in ("cuda", "cublas", "cudnn"))
+            )
+            if is_cuda_runtime_error:
+                try:
+                    report_cuda_diagnostics(
+                        "uncaught CUDA RuntimeError",
+                        model=globals().get("model"),
+                        device_map=getattr(globals().get("model"), "hf_device_map", None),
+                    )
+                except Exception as diagnostic_error:
+                    print(
+                        "[CUDA diagnostics] failed while reporting the exception: "
+                        f"{diagnostic_error}"
+                    )
+            original_excepthook(exc_type, exc_value, exc_traceback)
+
+        sys.excepthook = cuda_diagnostics_excepthook
+        report_cuda_diagnostics("startup", include_versions=True)
+
+    if args.save_gptq_checkpoint and args.load_gptq_checkpoint:
+        raise ValueError(
+            "--save_gptq_checkpoint and --load_gptq_checkpoint are mutually exclusive."
+        )
+    checkpoint_enabled = args.save_gptq_checkpoint or args.load_gptq_checkpoint
+    if checkpoint_enabled and not args.gptq_checkpoint_path:
+        raise ValueError(
+            "--gptq_checkpoint_path is required when saving or loading a GPTQ checkpoint."
+        )
+    if (
+        checkpoint_enabled
+        and args.save_path
+        and os.path.abspath(args.gptq_checkpoint_path) == os.path.abspath(args.save_path)
+    ):
+        raise ValueError("GPTQ checkpoint path and final model save path must differ.")
+    if checkpoint_enabled and args.eval_fp:
+        raise ValueError("Reusable GPTQ checkpoints cannot be combined with --eval_fp.")
+    if checkpoint_enabled and args.real_quant:
+        raise ValueError("Reusable GPTQ checkpoints currently support fake quantization only.")
+    if args.save_gptq_checkpoint and os.path.exists(args.gptq_checkpoint_path):
+        raise FileExistsError(
+            "GPTQ checkpoint already exists and will not be overwritten: "
+            f"{args.gptq_checkpoint_path}"
+        )
+    if (
+        args.finetune
+        and args.rft_trainer in NORM_DISTILL_MODES
+        and args.save_path
+        and os.path.exists(args.save_path)
+    ):
+        raise FileExistsError(
+            "Norm-distilled model output already exists and will not be overwritten: "
+            f"{args.save_path}"
+        )
+
+    # The tokenizer and calibration inputs always retain the original model identity,
+    # even when the student weights are loaded from a post-GPTQ checkpoint.
+    needs_teacher_targets = args.finetune and args.rft_trainer in NORM_DISTILL_MODES
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, use_fast=args.use_fast, trust_remote_code=args.trust_remote_code
+    )
+
+    # Preserve the historical model-before-data order for every fresh quantization.
+    # Only legacy CE checkpoint reuse can avoid loading the source weights entirely.
+    model = None
+    if not args.load_gptq_checkpoint or needs_teacher_targets:
+        description = "source model" if args.load_gptq_checkpoint else "model"
+        model = load_causal_lm(args.model, args, description=description)
+
+    print("Loading calibration data ...")
+    dataloader = get_calib_loader(tokenizer, args)
+
+    # Load the allocation before collecting teacher signals, but do not mutate the
+    # model yet: pruning-aware distillation uses the original full model as teacher.
+    expert_bit_cfg = load_expert_bit_config(args.bit_cfg)
+    pruning_result = None
+    pruning_metadata = None
+
+    router_ft_config = None
+    teacher_targets = None
+    if needs_teacher_targets:
+        if args.eval_fp:
+            raise ValueError("Teacher-guided fine-tuning requires quantization; disable --eval_fp.")
+        router_ft_config = DistillCEConfig.from_args(args)
+
+    calibration_input_ids = None
+    calibration_attention_mask = None
+    if needs_teacher_targets or checkpoint_enabled:
+        calibration_input_ids, calibration_attention_mask = materialize_calibration_inputs(dataloader)
+
+    checkpoint_identity = None
+    loaded_checkpoint_metadata = None
+    if checkpoint_enabled:
+        checkpoint_identity = build_gptq_checkpoint_identity(
+            args, calibration_input_ids, calibration_attention_mask
+        )
+    if args.load_gptq_checkpoint:
+        loaded_checkpoint_metadata = load_gptq_checkpoint_metadata(
+            args.gptq_checkpoint_path, checkpoint_identity
+        )
+        pruning_metadata = loaded_checkpoint_metadata.get("pruning")
+
+    if needs_teacher_targets:
+        if args.cuda_diagnostics:
+            report_cuda_diagnostics("before collecting teacher targets", model=model)
+        teacher_targets = get_or_collect_teacher_targets(
+            model,
+            tokenizer,
+            dataloader,
+            calibration_input_ids,
+            calibration_attention_mask,
+            args,
+            router_ft_config,
+        )
+        if args.cuda_diagnostics:
+            report_cuda_diagnostics("after collecting teacher targets", model=model)
+
+        # A reusable checkpoint already contains the physically pruned student.
+        if args.load_gptq_checkpoint and pruning_metadata is not None:
+            teacher_targets = project_teacher_router_logits(
+                teacher_targets,
+                kept_expert_ids_from_pruning_metadata(pruning_metadata),
+            )
+
+    quant_modules = {}
+    if args.load_gptq_checkpoint:
+        if model is not None:
+            del model
+            model = None
+            gc.collect()
+            torch.cuda.empty_cache()
+        model = load_causal_lm(
+            args.gptq_checkpoint_path, args, description="reusable GPTQ student"
+        )
+    else:
+        if (
+            not args.eval_fp
+            and expert_bit_cfg is not None
+            and has_zero_bit_experts(expert_bit_cfg)
+        ):
+            pruning_result = prune_qwen3_experts(model, args.model_name, expert_bit_cfg)
+            expert_bit_cfg = pruning_result.remapped_bit_config
+            pruning_metadata = dict(pruning_result.metadata)
+            pruning_metadata["source_bit_config"] = args.bit_cfg
+            teacher_targets = project_teacher_router_logits(
+                teacher_targets, pruning_result.kept_expert_ids
+            )
+
+    # quantize model weights unless a validated post-GPTQ student was loaded
+    if not args.eval_fp and not args.load_gptq_checkpoint:
+        # quantize and get a name-module mapping of quantized modules
+        print(f"Start quantizing model weights ...")
+        quantizer = args.quantizer.lower().split("-")[0]
+        if quantizer == "gptq":
+            quant_modules = quantize_weights_gptq(
+                model,
+                dataloader,
+                args,
+                expert_bit_cfg,
+            )
+        else:
+            raise ValueError(f"Unsupported weight quantizer: {args.quantizer}")
+
+        if args.save_gptq_checkpoint:
+            checkpoint_metadata = build_gptq_checkpoint_metadata(
+                checkpoint_identity, model, pruning_metadata
+            )
+            save_gptq_checkpoint(
+                model,
+                tokenizer,
+                args.gptq_checkpoint_path,
+                checkpoint_metadata,
+            )
+    
+    # Run the selected post-quantization fine-tuning stage.
+    if args.finetune:
+        if args.rft_trainer == "router_ft":
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
+
+            print("Evaluating quantized model before fine-tuning ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics("before pre-finetune evaluation", model=model)
+            evaluate_perplexity(
+                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
+            )
+
+            print("Fine-tuning routers with legacy autoregressive CE ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics("before legacy router fine-tuning", model=model)
+            finetune_routers(model, dataloader, args)
+        elif args.rft_trainer in NORM_DISTILL_MODES:
+            norm_mode = NORM_DISTILL_MODES[args.rft_trainer]
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
+
+            print("Evaluating quantized model before norm distillation ...")
+            if args.cuda_diagnostics:
+                report_cuda_diagnostics(
+                    "before router-compensated norm distillation", model=model
+                )
+            evaluate_perplexity(
+                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
+            )
+
+            norm_scope = (
+                "input and post-attention norms"
+                if norm_mode["optimize_input_norm"]
+                else "post-attention norms"
+            )
+            print(f"Fine-tuning {norm_scope} jointly with distilled CE ...")
+            finetune_norms_distill_ce(
+                model,
+                teacher_targets,
+                args,
+                optimize_input_norm=norm_mode["optimize_input_norm"],
+                router_compensated=norm_mode["router_compensated"],
+            )
+
+    # evaluate model
+    print("Evaluating model ...")
+    model.eval()
+    if args.cuda_diagnostics:
+        report_cuda_diagnostics("before final evaluation", model=model)
+    if args.eval_downstream or args.finetune:
+        # move all model weights onto gpus and use model() for forwarding
+        if not args.finetune:
+            model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
+
+        evaluate_perplexity(model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False)
+        if args.eval_downstream:
+            if args.disable_cache:
+                model.config.use_cache = False
+            try:
+                run_lm_eval(
+                    model, tokenizer, tasks=args.downstream_tasks.split(","),
+                    batch_size=args.lm_eval_batchsize, num_fewshot=args.num_fewshot
+                )
+            except:
+                print("Downstream evaluation failed. Skipping ...")
+    else:
+        # memory-efficient evaluation with layer offloading
+        evaluate_perplexity(model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=True)
+
+    # save model
+    if args.save_path:
+        print("Saving model ...")
+        os.makedirs(args.save_path, exist_ok=True)
+        if pruning_metadata is not None:
+            with open(
+                os.path.join(args.save_path, "expert_pruning_map.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(pruning_metadata, f, indent=2, ensure_ascii=False)
+        if router_ft_config is not None:
+            with open(
+                os.path.join(args.save_path, "router_ft_config.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump({"trainer": args.rft_trainer, **vars(router_ft_config)}, f, indent=4)
+
+        if args.real_quant:
+            # for real quant, replace nn.Linear to HQQLinear for weight packing and saving
+            replace_linears(model, args.model_name, quant_modules, quant_weight=True)
+            check_packing(model, quant_modules, args)
+        else:
+            # for fake quant, remove the extra quantization parameters for saving
+            for name, m in quant_modules.items():
+                m.quant_scales = None
+                m.quant_zeros = None
+                m.quant_nbits = None
+                m.quant_groupsize = None
+
+        # save the quantized model
+        save_quantized_model(model, tokenizer, args.save_path, args.save_dtype, args.real_quant)
+        print(f"Quantized model saved to:", args.save_path)

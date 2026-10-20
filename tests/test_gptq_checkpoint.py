@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from gemq.utils.gptq_checkpoint import (
+from proquant.utils.gptq_checkpoint import (
     METADATA_FILENAME,
     PRUNING_FILENAME,
     SUCCESS_FILENAME,
@@ -20,9 +20,8 @@ def _args(**overrides):
         "model_name": "org/example-model",
         "model_dtype": "bfloat16",
         "attn_impl": "eager",
-        "calib_dataset": "mixed_chat_en",
+        "calib_dataset": "c4",
         "seed": 0,
-        "mixed": False,
         "bit_cfg": "",
         "quantizer": "gptq",
         "reproduce_mcmoe": False,
@@ -60,9 +59,18 @@ class _FakeModel(torch.nn.Module):
         (path / "config.json").write_text("{}", encoding="utf-8")
 
 
+def test_checkpoint_identity_requires_bit_allocation():
+    with pytest.raises(ValueError, match="requires --bit_cfg"):
+        build_gptq_checkpoint_identity(_args(), torch.arange(12).reshape(2, 6), None)
+
+
 def test_checkpoint_save_is_complete_non_mutating_and_non_overwriting(tmp_path):
     input_ids = torch.arange(12).reshape(2, 6)
-    identity = build_gptq_checkpoint_identity(_args(), input_ids, None)
+    bit_cfg = tmp_path / "bits.pkl"
+    bit_cfg.write_bytes(b"allocated-expert-bits")
+    identity = build_gptq_checkpoint_identity(_args(bit_cfg=str(bit_cfg)), input_ids, None)
+    assert identity["allocation"]["mixed"] is True
+    assert identity["allocation"]["bit_config_sha256"] is not None
     model = _FakeModel()
     pruning_metadata = {"original_num_experts": 4, "num_experts": 3}
     metadata = build_gptq_checkpoint_metadata(identity, model, pruning_metadata)
@@ -84,7 +92,9 @@ def test_checkpoint_save_is_complete_non_mutating_and_non_overwriting(tmp_path):
 
 def test_checkpoint_load_validates_identity_and_completion(tmp_path):
     input_ids = torch.arange(12).reshape(2, 6)
-    identity = build_gptq_checkpoint_identity(_args(), input_ids, None)
+    bit_cfg = tmp_path / "bits.pkl"
+    bit_cfg.write_bytes(b"allocated-expert-bits")
+    identity = build_gptq_checkpoint_identity(_args(bit_cfg=str(bit_cfg)), input_ids, None)
     model = _FakeModel()
     metadata = build_gptq_checkpoint_metadata(identity, model)
     checkpoint = tmp_path / "checkpoint"
@@ -93,7 +103,7 @@ def test_checkpoint_load_validates_identity_and_completion(tmp_path):
     loaded = load_gptq_checkpoint_metadata(checkpoint, identity)
     assert loaded["identity"] == identity
 
-    different = build_gptq_checkpoint_identity(_args(seed=1), input_ids, None)
+    different = build_gptq_checkpoint_identity(_args(seed=1, bit_cfg=str(bit_cfg)), input_ids, None)
     with pytest.raises(ValueError, match="does not match"):
         load_gptq_checkpoint_metadata(checkpoint, different)
 

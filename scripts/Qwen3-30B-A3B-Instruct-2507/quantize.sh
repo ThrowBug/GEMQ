@@ -9,41 +9,41 @@ cd "${repo_root}"
 #  Model settings
 # ===============================
 model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"
-model="${model_name}"
+model="${MODEL:-${model_name}}"
 model_dtype="bfloat16"
 gpus="${CUDA_VISIBLE_DEVICES:-0,1,2}"
 
 # ===============================
 #  Dataset settings
 # ===============================
-calib_dataset="${CALIB_DATASET:-mixed_chat_en}"
+calib_dataset="${CALIB_DATASET:-c4}"
 nsamples="${NSAMPLES:-128}"
 seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
-calib_data_path="${CALIB_DATA_PATH:-}"
-calib_path_args=()
 
 # ===============================
 #  Quantization settings
 # ===============================
 quantizer="gptq"
-allocation_metric="${ALLOCATION_METRIC:-expert_cost}" # expert_cost | layer_re
+allocation_metric="${ALLOCATION_METRIC:-pop}" # pop | layer_re
 normalize_by_activation_count="${NORMALIZE_BY_ACTIVATION_COUNT:-true}"
 bpe="${BPE:-2.0}"
 if [[ -n "${WBITS:-}" ]]; then
     wbits="${WBITS}"
-elif [[ "${allocation_metric}" == "expert_cost" ]]; then
+elif [[ "${allocation_metric}" == "pop" ]]; then
     wbits="0,2,3"
 else
     wbits="1,2,3"
 fi
 max_prune_ratio="${MAX_PRUNE_RATIO:-0.25}"
-expert_cost_context_bit="${EXPERT_COST_CONTEXT_BIT:-2}"
-mixed_prec="${MIXED_PREC:-true}"
+expert_cost_context_bit="${POP_CONTEXT_BIT:-${AVERAGE_BITS:-2}}"
+if [[ -n "${MIXED_PREC+x}" ]]; then
+    echo "MIXED_PREC is no longer supported; quantization always requires a bit-allocation file." >&2
+    exit 1
+fi
 allocation_tag="${ALLOCATION_TAG:-}"
 if [[ -z "${allocation_tag}" ]]; then
     case "${calib_dataset}" in
-        mixed_chat_en) allocation_tag="MixedChatEn-Seed${seed}" ;;
         c4) allocation_tag="C4-Seed${seed}" ;;
         math) allocation_tag="MATH-Seed${seed}" ;;
         math+c4) allocation_tag="MATH+C4-Seed${seed}" ;;
@@ -55,7 +55,7 @@ if [[ -z "${allocation_tag}" ]]; then
     esac
 fi
 bpe_tag="$(printf '%.1f' "${bpe}")"
-if [[ "${allocation_metric}" == "expert_cost" ]]; then
+if [[ "${allocation_metric}" == "pop" ]]; then
     if [[ "${normalize_by_activation_count}" != "true" && "${normalize_by_activation_count}" != "false" ]]; then
         echo "NORMALIZE_BY_ACTIVATION_COUNT must be 'true' or 'false'." >&2
         exit 1
@@ -69,7 +69,7 @@ if [[ "${allocation_metric}" == "expert_cost" ]]; then
     if [[ "${normalize_by_activation_count}" == "false" ]]; then
         cost_norm_tag="-NoCountNorm"
     fi
-    default_bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-expert_cost-Ctxuniform${expert_cost_context_bit}${cost_norm_tag}_E${bpe_tag}_B${wbits}"
+    default_bit_cfg="configs/${model_name}/ProQuant/${allocation_tag}_Metric-pop-Ctxuniform${expert_cost_context_bit}${cost_norm_tag}_E${bpe_tag}_B${wbits}"
     if [[ ",${wbits}," == *,0,* ]]; then
         max_prune_ratio_tag="$(printf '%g' "${max_prune_ratio}")"
         default_bit_cfg+="_Pmax${max_prune_ratio_tag}_EqPrune"
@@ -80,25 +80,25 @@ elif [[ "${allocation_metric}" == "layer_re" ]]; then
     constraint_tag=""; [[ "${extra_constr}" != "none" ]] && constraint_tag="_${extra_constr}"
     default_bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-layer_re_E${bpe_tag}_B${wbits}${constraint_tag}.pkl"
 else
-    echo "ALLOCATION_METRIC must be expert_cost or layer_re, got: ${allocation_metric}" >&2
+    echo "ALLOCATION_METRIC must be pop or layer_re, got: ${allocation_metric}" >&2
     exit 1
 fi
 bit_cfg="${BIT_CFG_PATH:-${default_bit_cfg}}"
+if [[ ! -f "${bit_cfg}" ]]; then
+    echo "Bit allocation config not found: ${bit_cfg}" >&2
+    echo "Run scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh first or set BIT_CFG_PATH." >&2
+    exit 1
+fi
 # The legacy Qwen script warns that the MC-MoE GPTQ implementation can produce NaNs.
 reproduce_mcmoe="${REPRODUCE_MCMOE:-false}"
 attn_wbits="${ATTN_WBITS:-4}"
 dense_wbits="${DENSE_WBITS:-4}"
 
 # ===============================
-#  Router fine-tuning
+#  Post-quantization fine-tuning
 # ===============================
-finetune_routers="${FINETUNE_ROUTERS:-true}"
-rft_trainer="${RFT_TRAINER:-layerwise_teacher}" # legacy_ce | distill_ce | norm_distill | dual_norm_distill | router_compensated_norm_distill | router_compensated_dual_norm_distill | layerwise_teacher
-rft_timing="${RFT_TIMING:-after_each_layer_quantization}" # after_all_quantization | after_each_layer_quantization
-rft_router_loss="${RFT_ROUTER_LOSS:-kd_tail}" # kd | kd_tail | l2 | l2_center
-rft_router_alpha="${RFT_ROUTER_ALPHA:-1.0}"
-rft_router_loss_weight="${RFT_ROUTER_LOSS_WEIGHT:-1.0}"
-rft_output_kl_weight="${RFT_OUTPUT_KL_WEIGHT:-0.0}"
+finetune="${FINETUNE:-true}"
+rft_trainer="${RFT_TRAINER:-roco}" # roco | norm_ft | router_ft
 rft_epochs="${RFT_EPOCHS:-1}"
 rft_batch_size="${RFT_BATCH_SIZE:-1}"
 rft_lr="${RFT_LR:-1e-4}"
@@ -129,23 +129,6 @@ save_gptq_checkpoint="${SAVE_GPTQ_CHECKPOINT:-false}"
 load_gptq_checkpoint="${LOAD_GPTQ_CHECKPOINT:-false}"
 gptq_checkpoint_root="${GPTQ_CHECKPOINT_ROOT:-results/gptq_checkpoints}"
 
-if [[ "${calib_dataset}" == "mixed_chat_en" ]]; then
-    if [[ -z "${calib_data_path}" ]]; then
-        calib_data_path="cache/calibration/${model_name}/${calib_dataset}-N${nsamples}-L${seqlen}-Seed${seed}.pt"
-    fi
-    if [[ ! -f "${calib_data_path}" ]]; then
-        echo "Prepared calibration data not found: ${calib_data_path}" >&2
-        echo "Run scripts/Qwen3-30B-A3B-Instruct-2507/prepare_calib.sh first." >&2
-        exit 1
-    fi
-    calib_path_args=(--calib_data_path "${calib_data_path}")
-fi
-if [[ "${mixed_prec}" == "true" && ! -f "${bit_cfg}" ]]; then
-    echo "Bit allocation config not found: ${bit_cfg}" >&2
-    echo "Run scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh first." >&2
-    exit 1
-fi
-
 # ===============================
 #  AUTO argument construction
 # ===============================
@@ -157,7 +140,6 @@ model_args=(
 )
 data_args=(
     --calib_dataset "${calib_dataset}"
-    "${calib_path_args[@]}"
     --nsamples "${nsamples}"
     --seqlen "${seqlen}"
     --seed "${seed}"
@@ -168,20 +150,15 @@ quant_args=(--quantizer "${quantizer}" --expert_wbits "${bpe_int}" --groupsize 1
 if [[ "${reproduce_mcmoe}" == "true" ]]; then
     quant_args+=(--reproduce_mcmoe)
 fi
-if [[ "${mixed_prec}" == "true" ]]; then
-    qtype="$(basename "$(dirname "${bit_cfg}")")"
-    bit_cfg_filename="$(basename "${bit_cfg}")"
-    quant_allocation_tag="${bit_cfg_filename%.pkl}"
-    quant_args+=(--mixed --bit_cfg "${bit_cfg}")
-else
-    qtype="Uniform"
-    quant_allocation_tag="${allocation_tag}"
-fi
+qtype="$(basename "$(dirname "${bit_cfg}")")"
+bit_cfg_filename="$(basename "${bit_cfg}")"
+quant_allocation_tag="${bit_cfg_filename%.pkl}"
+quant_args+=(--bit_cfg "${bit_cfg}")
 
 rft_tag=""
-if [[ "${finetune_routers}" == "true" ]]; then
+if [[ "${finetune}" == "true" ]]; then
     quant_args+=(
-        --finetune_routers
+        --finetune
         --rft_trainer "${rft_trainer}"
         --rft_epochs "${rft_epochs}"
         --rft_batch_size "${rft_batch_size}"
@@ -189,38 +166,19 @@ if [[ "${finetune_routers}" == "true" ]]; then
         --rft_wd "${rft_wd}"
     )
     case "${rft_trainer}" in
-        legacy_ce)
-            rft_tag="_RFT-legacy_ce"
+        router_ft)
+            rft_tag="_RFT-router_ft"
             ;;
-        distill_ce)
-            rft_tag="_RFT-distill_ce"
-            quant_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
-            ;;
-        norm_distill|dual_norm_distill|router_compensated_norm_distill|router_compensated_dual_norm_distill)
+        norm_ft|roco)
             rft_tag="_RFT-${rft_trainer}-lr${rft_lr_tag}"
             quant_args+=(--rft_teacher_cache_dir "${rft_teacher_cache_dir}")
-            ;;
-        layerwise_teacher)
-            timing_tag="all"; [[ "${rft_timing}" == "after_each_layer_quantization" ]] && timing_tag="each"
-            alpha_tag="${rft_router_alpha//./p}"
-            router_weight_tag="${rft_router_loss_weight//./p}"
-            output_weight_tag="${rft_output_kl_weight//./p}"
-            rft_tag="_RFT-${timing_tag}-${rft_router_loss}-a${alpha_tag}-rw${router_weight_tag}-ow${output_weight_tag}"
-            quant_args+=(
-                --rft_timing "${rft_timing}"
-                --rft_router_loss "${rft_router_loss}"
-                --rft_router_alpha "${rft_router_alpha}"
-                --rft_router_loss_weight "${rft_router_loss_weight}"
-                --rft_output_kl_weight "${rft_output_kl_weight}"
-                --rft_teacher_cache_dir "${rft_teacher_cache_dir}"
-            )
             ;;
         *)
             echo "Unsupported rft_trainer: ${rft_trainer}" >&2
             exit 1
             ;;
     esac
-    if [[ "${rft_trainer}" != "legacy_ce" && "${rft_rebuild_teacher_cache}" == "true" ]]; then
+    if [[ "${rft_trainer}" != "router_ft" && "${rft_rebuild_teacher_cache}" == "true" ]]; then
         quant_args+=(--rft_rebuild_teacher_cache)
     fi
 fi
@@ -236,7 +194,7 @@ if [[ "${cuda_diagnostics}" == "true" ]]; then
 fi
 
 prefix="${quant_allocation_tag}"
-gptq_checkpoint_path="${gptq_checkpoint_root}/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}"
+gptq_checkpoint_path="${GPTQ_CHECKPOINT_PATH:-${gptq_checkpoint_root}/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}}"
 checkpoint_args=()
 if [[ "${save_gptq_checkpoint}" == "true" && "${load_gptq_checkpoint}" == "true" ]]; then
     echo "SAVE_GPTQ_CHECKPOINT and LOAD_GPTQ_CHECKPOINT cannot both be true." >&2
@@ -259,8 +217,8 @@ fi
 if [[ "${save_model}" == "true" ]]; then
     save_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_A${attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
     case "${rft_trainer}" in
-        norm_distill|dual_norm_distill|router_compensated_norm_distill|router_compensated_dual_norm_distill)
-            if [[ "${finetune_routers}" == "true" && -e "${save_path}" ]]; then
+        norm_ft|roco)
+            if [[ "${finetune}" == "true" && -e "${save_path}" ]]; then
                 echo "Norm-distilled model output already exists and will not be overwritten: ${save_path}" >&2
                 exit 1
             fi
@@ -282,43 +240,25 @@ echo " Model:            ${model_name}"
 echo " Model dtype:      ${model_dtype}"
 echo " CUDA devices:     ${gpus}"
 echo " Dataset:          ${calib_dataset} (nsamples=${nsamples}, seqlen=${seqlen})"
-if [[ "${calib_dataset}" == "mixed_chat_en" ]]; then
-    echo " Calibration file: ${calib_data_path}"
-else
-    echo " Calibration file: legacy ${calib_dataset} loader"
-fi
+echo " Calibration loader: ${calib_dataset}"
 echo " Quantizer:        ${quantizer} (reproduce_mcmoe=${reproduce_mcmoe})"
 echo " Allocation metric:${allocation_metric}"
-echo " Expert bits:      ${bpe} (mixed: ${mixed_prec})"
+echo " Expert budget:    ${bpe} bits"
 echo " Bit config:       ${bit_cfg}"
 echo " Allocation tag:   ${quant_allocation_tag}"
 echo " Attn wbits:       ${attn_wbits}"
 echo " Dense wbits:      ${dense_wbits}"
-echo " Finetune routers: ${finetune_routers} (trainer=${rft_trainer})"
-if [[ "${rft_trainer}" == "legacy_ce" ]]; then
+echo " Fine-tuning:      ${finetune} (trainer=${rft_trainer})"
+if [[ "${finetune}" == "true" && "${rft_trainer}" == "router_ft" ]]; then
     echo " Router objective: hard-label autoregressive CE"
-elif [[ "${rft_trainer}" == "distill_ce" ]]; then
-    echo " Router objective: teacher soft-label autoregressive CE"
-elif [[ "${rft_trainer}" == "norm_distill" ]]; then
-    echo " Norm parameters: post-attention only"
-    echo " Norm objective:   teacher soft-label autoregressive CE"
-    echo " Router update:    none"
-elif [[ "${rft_trainer}" == "dual_norm_distill" ]]; then
+elif [[ "${finetune}" == "true" && "${rft_trainer}" == "norm_ft" ]]; then
     echo " Norm parameters: input + post-attention"
     echo " Norm objective:   teacher soft-label autoregressive CE"
     echo " Router update:    none"
-elif [[ "${rft_trainer}" == "router_compensated_norm_distill" ]]; then
-    echo " Norm parameters: post-attention only"
-    echo " Norm objective:   teacher soft-label autoregressive CE"
-    echo " Router update:    inverse scale folding only (no optimizer)"
-elif [[ "${rft_trainer}" == "router_compensated_dual_norm_distill" ]]; then
+elif [[ "${finetune}" == "true" && "${rft_trainer}" == "roco" ]]; then
     echo " Norm parameters: input + post-attention"
     echo " Norm objective:   teacher soft-label autoregressive CE"
     echo " Router update:    inverse scale folding only (no optimizer)"
-else
-    echo " RFT timing:       ${rft_timing}"
-    echo " Router objective: ${rft_router_loss} (alpha=${rft_router_alpha}, weight=${rft_router_loss_weight})"
-    echo " Output KL weight: ${rft_output_kl_weight}"
 fi
 echo " RFT optimizer:    epochs=${rft_epochs}, batch=${rft_batch_size}, lr=${rft_lr}, wd=${rft_wd}"
 echo " Real quant:       ${real_quant}"
@@ -332,7 +272,7 @@ fi
 echo " CUDA diagnostics: ${cuda_diagnostics}"
 echo "=============================================="
 
-CUDA_VISIBLE_DEVICES="${gpus}" python -m gemq.quantize \
+CUDA_VISIBLE_DEVICES="${gpus}" python -m proquant.quantize \
     "${model_args[@]}" \
     "${data_args[@]}" \
     "${quant_args[@]}" \

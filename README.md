@@ -1,181 +1,104 @@
-<div align="center">
+# ProQuant
 
-<h1>GEMQ: Global Expert-Level Mixed-Precision Quantization for MoE LLMs</h1>
+This branch reproduces ProQuant on **Qwen3-30B-A3B-Instruct-2507**. Qwen3 and Qwen3.5 require different dependency versions. To reproduce Qwen3.5, switch to the `qwen35` branch and use a separate Conda environment for its dependencies.
 
-[![arXiv](https://img.shields.io/badge/arXiv-2605.23078-b31b1b?logo=arxiv&logoColor=red)](https://arxiv.org/abs/2605.23078)
+## Setup
 
-</div>
-
-GEMQ is a post-training quantization framework for Mixture-of-Experts (MoE) LLMs that enables extreme low-bit quantization (down to 1.5 bits per expert) with minimal accuracy degradation. It works by:
-1. automatically assigning different bit-widths to experts based on their importance;
-2. fine-tuning the routers so they can better work with quantized experts;
-3. optionally using progressive quantization to refine the bit allocation.
-
-
-### What's in this repo
-* An ILP solver for global expert-level bit allocation
-* GPTQ-based quantization and router fine-tuning pipelines
-* Efficient low-bit MoE triton kernels for **real** quantized inference
-
-
-## Updates
-
-- [2026/08] Bit allocation now runs on **HiGHS**, the ILP solver bundled with SciPy, so regenerating the bit configs no longer needs a Gurobi license. Gurobi stays available as an optional backend.
-- [2026/08] Active workflows are organized by model under `scripts/<model>/`; the original real-quant scripts are retained under `scripts/deprecated/`.
-- [2026/08] Added mixed-data calibration, teacher-guided router fine-tuning, and BF16 fake-quant/vLLM workflows for **OLMoE-1B-7B-0125-Instruct** and **Qwen3-30B-A3B-Instruct-2507**.
-- [2026/08] Fixed a ~15% perplexity regression on DeepSeek-V2 caused by a missing YaRN `mscale` in HF's built-in implementation ([transformers#47435](https://github.com/huggingface/transformers/pull/47435)).
-
-
-## Installation
+Install this branch in a CUDA-enabled Python environment:
 
 ```bash
-conda create -n gemq python=3.10 -y
-conda activate gemq
-git clone https://github.com/jndeng/GEMQ
-cd GEMQ
 pip install -e .
-
-# (Optional) only needed if you want to solve the bit allocation with Gurobi
-# instead of the default HiGHS solver (and thus requires a Gurobi license):
-# pip install -e ".[gurobi]"
 ```
 
-> [!NOTE]
->
-> By default, bit allocation is solved with **HiGHS**, which does not require a commercial license.
-> In our experiments, however, we used **Gurobi** to produce the configs under `configs/`.
-> Gurobi remains available as an optional backend -- install it as shown above, then run a model's `allocate.sh` with `ILP_BACKEND=gurobi`.
+Place `c4-train.00000-of-01024.json` in `data/`. The statistics and quantization scripts use `Qwen/Qwen3-30B-A3B-Instruct-2507` by default; set `MODEL` to a local model directory if needed. Run the following commands from the repository root.
 
-
-## Usage
-
-Active workflows are grouped by model:
-
-| Model | Script directory | Default BPE |
-| --- | --- | ---: |
-| OLMoE-1B-7B-0125-Instruct | `scripts/OLMoE-1B-7B-0125-Instruct/` | 2.0 |
-| Qwen3-30B-A3B-Instruct-2507 | `scripts/Qwen3-30B-A3B-Instruct-2507/` | 2.5 |
-
-The old paper-reproduction and packed real-quant workflows are available under
-`scripts/deprecated/`.
-
-### Calibration, allocation, and quantization
-
-Both active workflows default to one prepared calibration tensor containing 50% English
-WildChat, 40% UltraChat 200k, and 10% FineWeb-Edu blocks. The preparation command streams
-only the records needed for the cache. The exact same input IDs are then used for
-bit-allocation statistics, GPTQ, teacher-target collection, and router fine-tuning.
-
-For OLMoE:
+## 1. Compute expert quantization costs
 
 ```bash
-bash scripts/OLMoE-1B-7B-0125-Instruct/prepare_calib.sh
-bash scripts/OLMoE-1B-7B-0125-Instruct/compute_stats.sh
-bash scripts/OLMoE-1B-7B-0125-Instruct/allocate.sh
-bash scripts/OLMoE-1B-7B-0125-Instruct/quantize.sh
+AVERAGE_BITS=2 \
+  CANDIDATE_BITS=0,2,3 \
+  FORWARD_BATCH_SIZE=16 \
+  bash scripts/Qwen3-30B-A3B-Instruct-2507/compute_pop_costs.sh
 ```
 
-For Qwen3-MoE:
+## 2. Allocate expert bit-widths
 
 ```bash
-bash scripts/Qwen3-30B-A3B-Instruct-2507/prepare_calib.sh
-bash scripts/Qwen3-30B-A3B-Instruct-2507/compute_stats.sh
-bash scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh
-bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize.sh
+MAX_PRUNE_RATIO=1.0 \
+  BITS_PER_EXPERT=2.0 \
+  WBITS=0,2,3 \
+  POP_COST_BITS=0,2,3 \
+  bash scripts/Qwen3-30B-A3B-Instruct-2507/allocate.sh
 ```
 
-`SEED`, `NSAMPLES`, and `SEQLEN` are shared by the four stages. Set
-`REBUILD_CALIB_CACHE=true` to rebuild an existing mixed cache. To use GEMQ's legacy C4
-loader and C4 naming, skip `prepare_calib.sh` and pass `CALIB_DATASET=c4` to the remaining
-three scripts. Qwen statistics default to `CUDA_VISIBLE_DEVICES=0,1,2`; override it for a
-different machine.
-
-> [!IMPORTANT]
->
-> The configs reported in the original paper were produced with Gurobi. HiGHS solves the
-> same ILP without a commercial license, but a non-unique optimum may result in a different
-> allocation. Use `ILP_BACKEND=gurobi` when exact solver reproduction is required.
-
-The quantization scripts expose router trainer, router loss, timing, loss weights, optimizer,
-dataset, bit-width, and cache controls as environment variables near the top of each file.
-They save dequantized approximate weights as standard BF16 Hugging Face checkpoints under
-`results/fake_quant_models/`, which vLLM can load without a GEMQ runtime patch.
-
-### PMQ baseline for Qwen3-MoE
-
-The Qwen3-30B-A3B-Instruct-2507 workflow also includes an isolated MC-MoE PMQ
-baseline. It uses C4 with seed 0, the released PMQ objective and per-layer ILP,
-and expert bit candidates `{1,2,3}` without pruning. Final quantization uses the
-same GEMQ GPTQ implementation as the GEMQ method: attention projections are 4-bit,
-routers remain BF16, experts average 2 bits, and the dequantized approximate weights
-are saved as a standard BF16 Hugging Face checkpoint.
-
-Place `c4-train.00000-of-01024.json` under `data/`, then run the complete workflow:
+## 3. Quantize and save a reusable GPTQ checkpoint
 
 ```bash
-bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_pipeline.sh
+CUDA_VISIBLE_DEVICES=0,1 \
+  MAX_PRUNE_RATIO=1.0 \
+  BPE=2.0 WBITS=0,2,3 \
+  FINETUNE=false \
+  SAVE_GPTQ_CHECKPOINT=true \
+  bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize.sh
 ```
 
-The three stages can also be run separately:
+## 4. Fine-tune with RoCo
 
 ```bash
-bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_compute_stats.sh
-bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_allocate.sh
-bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_quantize.sh
+CUDA_VISIBLE_DEVICES=0,1 \
+  MAX_PRUNE_RATIO=1.0 \
+  BPE=2.0 WBITS=0,2,3 \
+  FINETUNE=true RFT_TRAINER=roco \
+  RFT_LR=5e-3 LOAD_GPTQ_CHECKPOINT=true \
+  bash scripts/Qwen3-30B-A3B-Instruct-2507/quantize.sh
 ```
 
-By default, PMQ statistics are written below `cache/.../PMQ/`, the independent
-allocation and its JSON metadata below `configs/.../PMQ/`, and the loadable model
-below `results/fake_quant_models/.../PMQ/`. `MODEL`, `CUDA_VISIBLE_DEVICES`,
-`PMQ_STATS_DIR`, `PMQ_BIT_CONFIG`, and `PMQ_SAVE_PATH` can override their respective
-locations. This baseline intentionally does not pass `--reproduce_mcmoe`,
-`--finetune_routers`, or `--real_quant`.
+The allocation file is required for both runs of `quantize.sh`. To select one explicitly, set `BIT_CFG_PATH` in both commands. Set `MODEL` consistently whenever using a local model directory.
 
-### vLLM serving, benchmarking, and evaluation
+## 5. Serve the fine-tuned model
 
-Start OLMoE on one GPU:
+We recommend installing vLLM in a separate Conda environment:
 
 ```bash
-MODEL_VARIANT=FQ CUDA_VISIBLE_DEVICES=0 \
-    bash scripts/OLMoE-1B-7B-0125-Instruct/serve_vllm.sh
+conda create -n proquant-vllm python=3.12 -y
+conda activate proquant-vllm
+pip install vllm
 ```
-
-Start Qwen with its default tensor parallel size of two:
 
 ```bash
-MODEL_VARIANT=FQ CUDA_VISIBLE_DEVICES=0,1 \
-    bash scripts/Qwen3-30B-A3B-Instruct-2507/serve_vllm.sh
+CUDA_VISIBLE_DEVICES=0,1 \
+  DATA_PARALLEL_SIZE=2 \
+  TENSOR_PARALLEL_SIZE=1 \
+  MODEL_VARIANT=FQ \
+  FQ_MODEL_PATH=/path/to/quantized/model \
+  bash scripts/Qwen3-30B-A3B-Instruct-2507/serve_vllm.sh \
+    --enable-auto-tool-choice \
+    --tool-call-parser hermes
 ```
 
-Set `MODEL_VARIANT=FP` to serve the original checkpoint. With the service running, use the
-matching model directory for API performance and EvalScope accuracy evaluation:
+## 6. Evaluate with EvalScope
+
+We recommend installing EvalScope in another Conda environment:
 
 ```bash
-MODEL_VARIANT=FQ bash scripts/Qwen3-30B-A3B-Instruct-2507/bench_vllm.sh
-MODEL_VARIANT=FQ LIMIT=10 bash scripts/Qwen3-30B-A3B-Instruct-2507/eval_vllm.sh
+conda create -n proquant-eval python=3.10 -y
+conda activate proquant-eval
+pip install evalscope
 ```
 
-The service, benchmark, and evaluation scripts share `VLLM_HOST`, `VLLM_PORT`,
-`VLLM_API_KEY`, `MODEL_VARIANT`, and `SERVED_MODEL_NAME`. `FQ_MODEL_PATH` overrides the
-automatically derived quantized checkpoint path. When quantization used a nonzero `SEED`,
-set the serving and benchmark scripts' `CALIB_SEED` to the same value; benchmark `SEED`
-remains reserved for request generation.
+Run this in another terminal while the service is active:
 
+```bash
+VLLM_HOST=127.0.0.1 \
+  VLLM_PORT=8000 \
+  MODEL_VARIANT=FQ \
+  DATASET_HUB=modelscope \
+  EVAL_BATCH_SIZE=8 \
+  DATASETS="gpqa_diamond" \
+  GENERATION_CONFIG='{"temperature":0.7,"top_p":0.8,"top_k":20,"max_tokens":8192,"seed":0,"timeout":3200,"retries":3,"extra_body":{"min_p":0.0}}' \
+  bash scripts/Qwen3-30B-A3B-Instruct-2507/eval_vllm.sh
+```
 
 ## License
 
-Released under the [MIT License](LICENSE).
-
-## Acknowledgements
-This repository builds upon several excellent open-source projects, including [MC-MoE](https://github.com/Aaronhuang-778/Mixture-Compressor-MoE), [GPTQ](https://github.com/IST-DASLab/gptq), [HQQ](https://github.com/dropbox/hqq), [GemLite](https://github.com/dropbox/gemlite), and [gpt-fast](https://github.com/meta-pytorch/gpt-fast). We sincerely thank the authors and contributors for making their code publicly available.
-
-## Citation
-If you find GEMQ useful for your research or project, please consider citing:
-```bibtex
-@article{deng2026gemq,
-  title={GEMQ: Global Expert-Level Mixed-Precision Quantization for MoE LLMs},
-  author={Deng, Jianing and Wang, Song and Wang, Dongwei and Liu, Zijie and Chen, Tianlong and Yang, Huanrui and Hu, Jingtong},
-  journal={arXiv preprint arXiv:2605.23078},
-  year={2026}
-}
-```
+This repository is derived from [GEMQ](https://github.com/jndeng/GEMQ). The original copyright notice and MIT license are retained in [LICENSE](LICENSE), alongside the notice for Jiaqi Chen's additions. See [third-party notices](THIRD_PARTY_NOTICES.md) for inherited source attribution.

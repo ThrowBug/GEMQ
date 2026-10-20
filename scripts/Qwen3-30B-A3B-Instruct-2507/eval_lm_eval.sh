@@ -31,7 +31,7 @@ if (( ${#weight_files[@]} == 0 )); then
     exit 1
 fi
 if ! command -v python >/dev/null 2>&1; then
-    echo "python not found. Activate the GEMQ evaluation environment first." >&2
+    echo "python not found. Activate the ProQuant evaluation environment first." >&2
     exit 1
 fi
 python -c 'from lm_eval.models.huggingface import HFLM' || {
@@ -57,7 +57,7 @@ if [[ ! "${eval_batch_size}" =~ ^[1-9][0-9]*$ || ! "${num_fewshot}" =~ ^[0-9]+$ 
     exit 1
 fi
 
-# lm_eval splits --model_args on commas. GEMQ bit-allocation directory names
+# lm_eval splits --model_args on commas. Bit-allocation directory names
 # contain commas (for example B0,2,3), so use a temporary comma-free alias.
 model_arg_path="${model_path}"
 alias_dir=""
@@ -68,7 +68,7 @@ cleanup_alias() {
     fi
 }
 if [[ "${model_path}" == *,* ]]; then
-    alias_dir="$(mktemp -d /tmp/gemq-lm-eval.XXXXXXXX)"
+    alias_dir="$(mktemp -d /tmp/proquant-lm-eval.XXXXXXXX)"
     trap cleanup_alias EXIT
     ln -s -- "${model_path}" "${alias_dir}/model"
     model_arg_path="${alias_dir}/model"

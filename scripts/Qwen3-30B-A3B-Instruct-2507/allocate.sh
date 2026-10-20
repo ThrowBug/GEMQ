@@ -6,20 +6,19 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
 
 model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"
-allocation_metric="${ALLOCATION_METRIC:-expert_cost}" # expert_cost | layer_re
+allocation_metric="${ALLOCATION_METRIC:-pop}" # pop | layer_re
 normalize_by_activation_count="${NORMALIZE_BY_ACTIVATION_COUNT:-true}"
 bits_per_expert="${BITS_PER_EXPERT:-2.0}"
 if [[ -n "${WBITS:-}" ]]; then
     wbits="${WBITS}"
-elif [[ "${allocation_metric}" == "expert_cost" ]]; then
+elif [[ "${allocation_metric}" == "pop" ]]; then
     wbits="0,2,3"
 else
     wbits="1,2,3"
 fi
-ilp_solver="${ILP_SOLVER:-gemq}"
 ilp_backend="${ILP_BACKEND:-highs}"
 max_prune_ratio="${MAX_PRUNE_RATIO:-0.25}"
-calib_dataset="${CALIB_DATASET:-mixed_chat_en}"
+calib_dataset="${CALIB_DATASET:-c4}"
 nsamples="${NSAMPLES:-128}"
 seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
@@ -27,7 +26,7 @@ output_path="${ALLOCATION_OUTPUT_PATH:-}"
 
 stat_args=()
 case "${allocation_metric}" in
-    expert_cost)
+    pop)
         if [[ "${normalize_by_activation_count}" != "true" && "${normalize_by_activation_count}" != "false" ]]; then
             echo "NORMALIZE_BY_ACTIVATION_COUNT must be 'true' or 'false'." >&2
             exit 1
@@ -37,19 +36,19 @@ case "${allocation_metric}" in
             echo "EXTRA_CONSTR is only valid with ALLOCATION_METRIC=layer_re." >&2
             exit 1
         fi
-        expert_cost_bits="${EXPERT_COST_BITS:-0,1,2,3}"
-        expert_cost_context_bit="${EXPERT_COST_CONTEXT_BIT:-2}"
-        default_expert_cost_path="cache/${model_name}/ExpertCosts_${calib_dataset}-N${nsamples}-L${seqlen}-Seed${seed}_uniform${expert_cost_context_bit}bit_B${expert_cost_bits}.pt"
+        expert_cost_bits="${POP_COST_BITS:-${CANDIDATE_BITS:-0,1,2,3}}"
+        expert_cost_context_bit="${POP_CONTEXT_BIT:-${AVERAGE_BITS:-2}}"
+        default_expert_cost_path="cache/${model_name}/PopCosts_${calib_dataset}-N${nsamples}-L${seqlen}-Seed${seed}_uniform${expert_cost_context_bit}bit_B${expert_cost_bits}.pt"
         if [[ "${normalize_by_activation_count}" == "false" ]]; then
             default_expert_cost_path="${default_expert_cost_path%.pt}_NoCountNorm.pt"
         fi
-        expert_cost_path="${EXPERT_COST_PATH:-${default_expert_cost_path}}"
+        expert_cost_path="${POP_COST_PATH:-${default_expert_cost_path}}"
         if [[ ! -f "${expert_cost_path}" ]]; then
             echo "Expert-cost artifact not found: ${expert_cost_path}" >&2
-            echo "Run scripts/Qwen3-30B-A3B-Instruct-2507/compute_expert_costs.sh first." >&2
+            echo "Run scripts/Qwen3-30B-A3B-Instruct-2507/compute_pop_costs.sh first." >&2
             exit 1
         fi
-        stat_args=(--expert_cost_path "${expert_cost_path}")
+        stat_args=(--pop_cost_path "${expert_cost_path}")
         ;;
     layer_re)
         extra_constr="${EXTRA_CONSTR:-c2c3}"
@@ -63,7 +62,7 @@ case "${allocation_metric}" in
         stat_args=(--layer_re_path "${layer_re_path}")
         ;;
     *)
-        echo "ALLOCATION_METRIC must be expert_cost or layer_re, got: ${allocation_metric}" >&2
+        echo "ALLOCATION_METRIC must be pop or layer_re, got: ${allocation_metric}" >&2
         exit 1
         ;;
 esac
@@ -73,13 +72,12 @@ if [[ -n "${output_path}" ]]; then
     save_args=(--save_path "${output_path}")
 fi
 
-python -m gemq.allocate_bits \
+python -m proquant.allocate_bits \
     --model_name "${model_name}" \
     --allocation_metric "${allocation_metric}" \
     "${stat_args[@]}" \
     --bit_budget "${bits_per_expert}" \
     --bit_candidates "${wbits}" \
-    --ilp_solver "${ilp_solver}" \
     --ilp_backend "${ilp_backend}" \
     --extra_constr "${extra_constr}" \
     --max_prune_ratio "${max_prune_ratio}" \

@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
 
-from gemq.expert_costs import _collect_active_inputs, _compute_layer_costs
-from gemq.quantizers.rtn import MCMoeRTNWeightQuantizer
-from gemq.utils.expert_cost_utils import (
+from proquant.expert_costs import _collect_active_inputs, _compute_layer_costs
+from proquant.quantizers.rtn import MCMoeRTNWeightQuantizer
+from proquant.utils.expert_cost_utils import (
     impute_zero_frequency_costs,
     load_expert_cost_artifact,
     select_candidate_costs,
@@ -76,7 +76,7 @@ def test_zero_bit_cost_and_zero_frequency_policy():
 
 
 def test_expert_cost_without_count_normalization_scales_both_bit_types(monkeypatch):
-    import gemq.expert_costs as expert_costs
+    import proquant.expert_costs as expert_costs
 
     moe_block = _TinyMoe(num_experts=2, hidden_size=2)
     hidden_states = torch.tensor([[[3.0, 4.0], [0.0, 2.0]]])

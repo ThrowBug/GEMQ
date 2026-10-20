@@ -1,0 +1,17 @@
+"""Utilities for turning zero-bit allocations into physically pruned models."""
+
+from proquant.pruning.qwen3 import (
+    PruningResult,
+    has_zero_bit_experts,
+    kept_expert_ids_from_pruning_metadata,
+    load_expert_bit_config,
+    prune_qwen3_experts,
+)
+
+__all__ = [
+    "PruningResult",
+    "has_zero_bit_experts",
+    "kept_expert_ids_from_pruning_metadata",
+    "load_expert_bit_config",
+    "prune_qwen3_experts",
+]

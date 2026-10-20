@@ -2,16 +2,16 @@ from types import SimpleNamespace
 
 import torch
 
-from gemq.allocation.ilp_solvers import ExpertCostSolver
-from gemq.allocate_bits import _auto_save_path
+from proquant.allocation.ilp_solvers import PoPSolver
+from proquant.allocate_bits import _auto_save_path
 
 
-def test_expert_cost_output_names_preserve_legacy_default():
+def test_pop_output_names_and_count_normalization_tag():
     args = SimpleNamespace(
-        allocation_metric="expert_cost", bit_budget=2.0, max_prune_ratio=0.3,
+        allocation_metric="pop", bit_budget=2.0, max_prune_ratio=0.3,
         model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
     )
-    source = "cache/Qwen/Qwen3-30B-A3B-Instruct-2507/ExpertCosts_C4-N128-L2048-Seed0_uniform2bit_B0,1,2,3.pt"
+    source = "cache/Qwen/Qwen3-30B-A3B-Instruct-2507/PopCosts_C4-N128-L2048-Seed0_uniform2bit_B0,1,2,3.pt"
     metadata = {"context_mode": "uniform_bit", "average_bits": 2}
     legacy = _auto_save_path(args, source, [0, 2, 3], SimpleNamespace(artifact_metadata=metadata))
     normalized = _auto_save_path(
@@ -24,6 +24,8 @@ def test_expert_cost_output_names_preserve_legacy_default():
     )
 
     assert normalized == legacy
+    assert "/ProQuant/" in normalized
+    assert "Metric-pop" in normalized
     assert "-Ctxuniform2_E2.0_" in legacy
     assert "-Ctxuniform2-NoCountNorm_E2.0_" in summed
 
@@ -48,7 +50,7 @@ def test_expert_cost_solver_global_budget_and_equal_pruning(tmp_path):
         },
         path,
     )
-    solver = ExpertCostSolver(
+    solver = PoPSolver(
         path,
         x_space=[0, 2, 3],
         max_prune_ratio=0.34,
@@ -74,7 +76,7 @@ def test_expert_cost_solver_rejects_infeasible_prune_cap(tmp_path):
         },
         path,
     )
-    solver = ExpertCostSolver(
+    solver = PoPSolver(
         path, x_space=[0, 2], max_prune_ratio=0.0, top_k=1, backend="highs"
     )
     try:

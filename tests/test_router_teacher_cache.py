@@ -5,7 +5,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
-from gemq.router_finetune.targets import (  # noqa: E402
+from proquant.router_finetune.targets import (  # noqa: E402
     TeacherTargets,
     _load_cached_targets,
     _save_targets,
