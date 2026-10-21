@@ -25,4 +25,4 @@ args=(
 args+=("$@")
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}" \
-    python -m gemq.evaluate_ppl "${args[@]}"
+    python -m proquant.evaluate_ppl "${args[@]}"

@@ -5,64 +5,76 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/../.." && pwd)"
 cd "${repo_root}"
 
-# FP loads the original checkpoint. FQ loads GEMQ's standard BF16 fake-quant
+# FP loads the original checkpoint. FQ loads a standard BF16 fake-quant
 # checkpoint containing dequantized approximate weights W_hat.
 model_name="Qwen/Qwen3.5-35B-A3B"
 model_variant="${MODEL_VARIANT:-FQ}"
 model_variant="${model_variant^^}"
 
-seed="${SEED:-0}"
-metric="${ALLOCATION_METRIC:-expert_cost}"
-mixed_prec="${MIXED_PREC:-true}"
-bpe="${BITS_PER_EXPERT:-${BPE:-2.0}}"
-bpe_tag="$(printf '%.1f' "${bpe}")"
-expert_wbits="${EXPERT_WBITS:-2}"
+bpe="${BPE:-2.0}"
 linear_attn_wbits="${LINEAR_ATTN_WBITS:-4}"
 softmax_attn_wbits="${SOFTMAX_ATTN_WBITS:-4}"
 dense_wbits="${DENSE_WBITS:-4}"
-
-case "${metric}" in
-    expert_cost)
-        alloc_bits="${WBITS:-0,2,3}"
-        max_prune_ratio="${MAX_PRUNE_RATIO:-0.1}"
-        context_bit="${EXPERT_COST_CONTEXT_BIT:-2}"
-        allocation_tag="C4-Seed${seed}_Metric-expert_cost-Ctxuniform${context_bit}_E${bpe_tag}_B${alloc_bits}_Pmax${max_prune_ratio}_EqPrune"
-        ;;
-    layer_re)
-        alloc_bits="${WBITS:-1,2,3}"
-        extra_constr="${EXTRA_CONSTR:-c2c3}"
-        allocation_tag="C4-Seed${seed}_Metric-layer_re_E${bpe_tag}_B${alloc_bits}_${extra_constr}"
-        ;;
-    *)
-        echo "ALLOCATION_METRIC must be expert_cost or layer_re." >&2
-        exit 1
-        ;;
-esac
-
-if [[ "${mixed_prec}" == "true" ]]; then
-    quant_tag="${allocation_tag}_LA${linear_attn_wbits}-SA${softmax_attn_wbits}-G16-D${dense_wbits}"
-else
-    quant_tag="C4-Seed${seed}_Uniform-E${expert_wbits}_LA${linear_attn_wbits}-SA${softmax_attn_wbits}-G16-D${dense_wbits}"
-fi
-
-finetune_routers="${FINETUNE_ROUTERS:-false}"
-rft_trainer="${RFT_TRAINER:-router_compensated_dual_norm_distill}"
-rft_tag=""
-if [[ "${finetune_routers}" == "true" ]]; then
-    case "${rft_trainer}" in
-        legacy_ce|dual_norm_distill|router_compensated_dual_norm_distill)
-            rft_lr="${RFT_LR:-1e-4}"
-            rft_lr_tag="$(python -c 'import sys; from decimal import Decimal; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "${rft_lr}")"
-            rft_tag="_RFT-${rft_trainer}-lr${rft_lr_tag}"
-            ;;
-        *)
-            echo "Qwen3.5 supports only legacy_ce, dual_norm_distill, or router_compensated_dual_norm_distill; got ${rft_trainer}." >&2
-            exit 1
-            ;;
+calib_dataset="${CALIB_DATASET:-c4}"
+calib_seed="${CALIB_SEED:-${SEED:-0}}"
+allocation_tag="${ALLOCATION_TAG:-}"
+if [[ -z "${allocation_tag}" ]]; then
+    case "${calib_dataset}" in
+        c4) allocation_tag="C4-Seed${calib_seed}" ;;
+        math) allocation_tag="MATH-Seed${calib_seed}" ;;
+        math+c4) allocation_tag="MATH+C4-Seed${calib_seed}" ;;
+        *) echo "Set ALLOCATION_TAG for CALIB_DATASET=${calib_dataset}." >&2; exit 1 ;;
     esac
 fi
 
-default_fq_path="results/fake_quant_models/${model_name}/GEMQ/${quant_tag}${rft_tag}"
+finetune="${FINETUNE:-true}"
+rft_trainer="${RFT_TRAINER:-roco}"
+rft_lr="${RFT_LR:-1e-4}"
+rft_lr_tag="$(python -c 'import sys; from decimal import Decimal; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "${rft_lr}")"
+rft_tag=""
+if [[ "${finetune}" == "true" ]]; then
+    case "${rft_trainer}" in
+        router_ft) rft_tag="_RFT-router_ft" ;;
+        norm_ft|roco) rft_tag="_RFT-${rft_trainer}-lr${rft_lr_tag}" ;;
+        *) echo "Unsupported RFT_TRAINER: ${rft_trainer}" >&2; exit 1 ;;
+    esac
+fi
+if [[ -n "${MIXED_PREC+x}" ]]; then
+    echo "MIXED_PREC is no longer supported; use an allocated model path." >&2
+    exit 1
+fi
+allocation_metric="${ALLOCATION_METRIC:-pop}"
+if [[ -n "${WBITS:-}" ]]; then
+    wbits="${WBITS}"
+elif [[ "${allocation_metric}" == "pop" ]]; then
+    wbits="0,2,3"
+else
+    wbits="1,2,3"
+fi
+bpe_tag="$(printf '%.1f' "${bpe}")"
+if [[ -n "${BIT_CFG_PATH:-}" ]]; then
+    bit_cfg="${BIT_CFG_PATH}"
+elif [[ "${allocation_metric}" == "pop" ]]; then
+    context_bit="${POP_CONTEXT_BIT:-${AVERAGE_BITS:-2}}"
+    count_tag=""
+    [[ "${NORMALIZE_BY_ACTIVATION_COUNT:-true}" == "false" ]] && count_tag="-NoCountNorm"
+    bit_cfg="configs/${model_name}/ProQuant/${allocation_tag}_Metric-pop-Ctxuniform${context_bit}${count_tag}_E${bpe_tag}_B${wbits}"
+    if [[ ",${wbits}," == *,0,* ]]; then
+        bit_cfg+="_Pmax$(printf '%g' "${MAX_PRUNE_RATIO:-0.25}")_EqPrune"
+    fi
+    bit_cfg+=".pkl"
+elif [[ "${allocation_metric}" == "layer_re" ]]; then
+    constraint="${EXTRA_CONSTR:-c2c3}"
+    constraint_tag=""; [[ "${constraint}" != "none" ]] && constraint_tag="_${constraint}"
+    bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-layer_re_E${bpe_tag}_B${wbits}${constraint_tag}.pkl"
+else
+    echo "ALLOCATION_METRIC must be pop or layer_re." >&2
+    exit 1
+fi
+qtype="$(basename "$(dirname "${bit_cfg}")")"
+prefix="$(basename "${bit_cfg}" .pkl)"
+default_fq_path="results/fake_quant_models/${model_name}/${qtype}/${prefix}_LA${linear_attn_wbits}-SA${softmax_attn_wbits}-G16-D${dense_wbits}-E${bpe}${rft_tag}"
+
 case "${model_variant}" in
     FP)
         model_path="${FP_MODEL_PATH:-${model_name}}"
@@ -88,10 +100,7 @@ case "${model_variant}" in
             exit 1
         fi
         ;;
-    *)
-        echo "MODEL_VARIANT must be FP or FQ, got: ${model_variant}" >&2
-        exit 1
-        ;;
+    *) echo "MODEL_VARIANT must be FP or FQ, got: ${model_variant}" >&2; exit 1 ;;
 esac
 
 if ! command -v vllm >/dev/null 2>&1; then
@@ -131,7 +140,7 @@ serve_args=(
     --data-parallel-size "${data_parallel_size}"
     --gpu-memory-utilization "${gpu_memory_utilization}"
     --generation-config vllm
-    --no-enable-log-requests
+    --disable-log-requests
 )
 if [[ -n "${MAX_MODEL_LEN:-}" ]]; then serve_args+=(--max-model-len "${MAX_MODEL_LEN}"); fi
 if [[ "${ENABLE_EXPERT_PARALLEL:-false}" == "true" ]]; then serve_args+=(--enable-expert-parallel); fi

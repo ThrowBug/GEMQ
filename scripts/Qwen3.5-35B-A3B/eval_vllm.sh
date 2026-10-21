@@ -14,7 +14,7 @@ case "${model_variant}" in
 esac
 
 if ! command -v evalscope >/dev/null 2>&1; then
-    echo "evalscope command not found. Activate the GEMQ/EvalScope environment first." >&2
+    echo "evalscope command not found. Activate the ProQuant/EvalScope environment first." >&2
     exit 1
 fi
 if ! command -v curl >/dev/null 2>&1; then echo "curl is required." >&2; exit 1; fi

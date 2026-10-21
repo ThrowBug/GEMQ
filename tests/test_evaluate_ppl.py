@@ -5,7 +5,7 @@ import pytest
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
-from gemq import evaluate_ppl  # noqa: E402
+from proquant import evaluate_ppl  # noqa: E402
 
 
 def _patch_runtime(monkeypatch):

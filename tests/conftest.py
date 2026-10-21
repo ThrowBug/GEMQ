@@ -22,7 +22,7 @@ def pytest_addoption(parser):
     )
     parser.addoption(
         "--model-name", action="store", default="deepseek-ai/DeepSeek-V2-Lite",
-        help="Key into gemq.utils.model_utils.NAME_TO_MODEL for the checkpoint",
+        help="Key into proquant.utils.model_utils.NAME_TO_MODEL for the checkpoint",
     )
     parser.addoption(
         "--nseq", action="store", type=int, default=8,
@@ -123,7 +123,7 @@ def quantize_weight(W, nbits, group_size):
     [num_groups, group_size] / [num_groups, 1] / [num_groups, 1] and W_dequant is
     the fp16 weight the *fake* quant model would carry.
     """
-    from gemq.quantizers.rtn import RTNWeightQuantizer
+    from proquant.quantizers.rtn import RTNWeightQuantizer
 
     quantizer = RTNWeightQuantizer(W, nbits=nbits, groupsize=group_size)
     Q, scales, zeros = quantizer.quantize()
@@ -138,8 +138,8 @@ def make_gemlite_linear(W, nbits, group_size, bias=None, device="cuda"):
 
     Returns (gemlite_linear, hqq_linear, W_dequant).
     """
-    from gemq.utils.quant_utils import create_hqq_linear_from_quantized_weights
-    from gemq.inference.patch import create_gemlite_from_hqq
+    from proquant.utils.quant_utils import create_hqq_linear_from_quantized_weights
+    from proquant.inference.patch import create_gemlite_from_hqq
 
     Q, scales, zeros, W_deq = quantize_weight(W, nbits, group_size)
     hqq_linear = create_hqq_linear_from_quantized_weights(

@@ -1,21 +1,16 @@
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
 
-from gemq.compute_model_stats import _compute_qwen35_mcmoe_losses
-from gemq.pruning.qwen35 import prune_qwen35_experts
-from gemq.utils.model_utils import (
+from proquant.pruning.qwen35 import prune_qwen35_experts
+from proquant.utils.model_utils import (
     LinearModuleType,
     get_module_type,
     get_router_params,
 )
-from gemq.utils.qwen35 import (
-    clone_packed_expert_weights,
-    copy_packed_expert_weights_,
+from proquant.utils.qwen35 import (
     forward_packed_expert,
-    install_rtn_packed_expert_,
 )
 
 
@@ -194,45 +189,3 @@ def test_qwen35_router_params_exclude_shared_expert_gate():
         id(layer.mlp.shared_expert_gate.weight) for layer in model.model.layers
     }
     assert all(id(param) not in shared_gate_ids for param in router_params)
-
-
-def test_active_token_pmq_loss_matches_full_moe_recomputation():
-    torch.manual_seed(7)
-    moe = _Moe()
-    with torch.no_grad():
-        for parameter in moe.parameters():
-            parameter.copy_(torch.randn_like(parameter))
-    block_inputs = [torch.randn(1, 5, 2), torch.randn(1, 3, 2)]
-    baseline = [moe(values).clone() for values in block_inputs]
-    bits = (1, 2, 3)
-
-    expected = {}
-    for expert_idx in range(moe.num_experts):
-        original = clone_packed_expert_weights(moe, expert_idx)
-        expected[expert_idx] = {}
-        try:
-            for bit in bits:
-                install_rtn_packed_expert_(
-                    moe, expert_idx, original, bit, blocksize=2
-                )
-                expected[expert_idx][bit] = sum(
-                    torch.norm(reference.double() - moe(values).double()).item()
-                    for values, reference in zip(block_inputs, baseline)
-                )
-                copy_packed_expert_weights_(moe, expert_idx, original)
-        finally:
-            copy_packed_expert_weights_(moe, expert_idx, original)
-
-    actual = _compute_qwen35_mcmoe_losses(
-        moe,
-        block_inputs,
-        bits,
-        blocksize=2,
-        expert_batch_size=2,
-    )
-
-    for expert_idx in range(moe.num_experts):
-        for bit in bits:
-            assert actual[expert_idx][bit] == pytest.approx(
-                expected[expert_idx][bit], rel=1e-5, abs=1e-6
-            )

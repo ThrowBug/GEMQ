@@ -4,11 +4,11 @@ import pytest
 import torch
 import torch.nn as nn
 
-from gemq.pruning.qwen3 import (
+from proquant.pruning.qwen3 import (
     kept_expert_ids_from_pruning_metadata,
     prune_qwen3_experts,
 )
-from gemq.router_finetune.targets import TeacherTargets, project_teacher_router_logits
+from proquant.router_finetune.targets import TeacherTargets, project_teacher_router_logits
 
 
 MODEL_NAME = "Qwen/Qwen3-30B-A3B-Instruct-2507"

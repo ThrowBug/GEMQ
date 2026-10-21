@@ -1,4 +1,4 @@
-from gemq.utils.model_utils import NAME_TO_MODEL, ModelType, get_model_info
+from proquant.utils.model_utils import NAME_TO_MODEL, ModelType, get_model_info
 
 
 def test_olmoe_0125_instruct_registry_and_metadata():

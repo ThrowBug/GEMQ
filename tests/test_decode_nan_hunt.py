@@ -132,8 +132,8 @@ def test_deepseek_decode_stage_by_stage(device):
     Walk DeepSeek's forward_one_token manually and report which stage first goes
     dirty. Mirrors moe_block.QuantFusedDeepseekV2MoEBlock.forward_one_token exactly.
     """
-    from gemq.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
-    from gemq.triton_kernels.fused_dequant_bmm import (
+    from proquant.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
+    from proquant.triton_kernels.fused_dequant_bmm import (
         fused_dequant_up_proj_triton, fused_dequant_down_proj_triton,
     )
 
@@ -207,7 +207,7 @@ def test_shared_expert_gemv_shapes_are_written_fully(device):
     dequant_splitk_gemv_triton at 256x512; the shared experts use different ones
     (n_shared * moe_intermediate), which is the untested corner.
     """
-    from gemq.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
+    from proquant.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
     from conftest import make_gemlite_linear, relative_error, fp16_matmul_noise
 
     # shapes taken from build_deepseek_blocks: 2 shared experts x 512 intermediate
@@ -254,7 +254,7 @@ def test_splitk_gemv_is_nondeterministic(device, nbits):
     only fails if the variation is large enough to be a correctness problem rather than
     accumulation-order rounding.
     """
-    from gemq.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
+    from proquant.triton_kernels.dequant_gemv import dequant_splitk_gemv_triton
     from conftest import make_gemlite_linear, relative_error
 
     torch.manual_seed(0)

@@ -5,7 +5,7 @@ pytest.importorskip("transformers")
 pytest.importorskip("accelerate")
 from torch import nn  # noqa: E402
 
-import gemq.router_finetune.norm_distill as norm_distill  # noqa: E402
+import proquant.router_finetune.norm_distill as norm_distill  # noqa: E402
 
 
 class _RMSNorm(nn.Module):

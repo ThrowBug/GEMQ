@@ -4,7 +4,7 @@ Level 4: the decode path, end to end.
 A perplexity run feeds whole sequences, so QuantFused*MoEBlock.forward always takes
 the forward_n_tokens branch. Everything benchmark_generate does after prefill takes
 the forward_one_token branch instead, through a different set of Triton kernels and
-through gemq/inference/kv_cache.StaticCache -- none of which a perplexity number can
+through proquant/inference/kv_cache.StaticCache -- none of which a perplexity number can
 reach.
 
 Comparison is **teacher forced**: both models are fed exactly the same tokens at every
@@ -61,7 +61,7 @@ def _forward_stepwise(model, input_ids, prompt_len, n_steps):
     Returns logits [n_steps, vocab]; row t is the prediction made after seeing
     input_ids[:prompt_len + t].
     """
-    from gemq.inference.kv_cache import StaticCache
+    from proquant.inference.kv_cache import StaticCache
 
     device = input_ids.device
     total = prompt_len + n_steps
@@ -97,7 +97,7 @@ def decode_traces(model_path, model_name, ndecode, trust_remote_code):
         pytest.skip("needs a CUDA device")
 
     from transformers import AutoTokenizer
-    from gemq.inference.patch import prepare_for_inference
+    from proquant.inference.patch import prepare_for_inference
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
     input_ids = tokenizer(TEXT, return_tensors="pt").input_ids.to("cuda")

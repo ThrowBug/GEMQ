@@ -127,7 +127,7 @@ def _quantize_linear_in_place(hf_module, ref_module, attr, nbits, device):
     Quantize `hf_module.<attr>`, write the dequantized fp16 weight into the
     reference module, and swap the HF module's linear for an HQQLinear.
     """
-    from gemq.utils.quant_utils import create_hqq_linear_from_quantized_weights
+    from proquant.utils.quant_utils import create_hqq_linear_from_quantized_weights
 
     linear = getattr(hf_module, attr)
     W = linear.weight.data
@@ -145,8 +145,8 @@ def _quantize_linear_in_place(hf_module, ref_module, attr, nbits, device):
 def build_deepseek_blocks(device):
     """Returns (quant_fused_block, reference_block_with_dequantized_weights, config)."""
     from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2MoE
-    from gemq.inference.patch import replace_linear_recursive
-    from gemq.inference.moe_block import QuantFusedDeepseekV2MoEBlock
+    from proquant.inference.patch import replace_linear_recursive
+    from proquant.inference.moe_block import QuantFusedDeepseekV2MoEBlock
 
     config = _deepseek_config()
     torch.manual_seed(0)
@@ -176,8 +176,8 @@ def build_deepseek_blocks(device):
 def build_mixtral_blocks(device):
     """Returns (quant_fused_block, reference_block_with_dequantized_weights, config)."""
     from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
-    from gemq.inference.patch import replace_linear_recursive
-    from gemq.inference.moe_block import QuantFusedMixtralMoEBlock
+    from proquant.inference.patch import replace_linear_recursive
+    from proquant.inference.moe_block import QuantFusedMixtralMoEBlock
 
     config = _mixtral_config()
     torch.manual_seed(0)
@@ -199,7 +199,7 @@ def _build_gated_expert_blocks(device, config, hf_cls, quant_cls):
     Shared by OLMoE and Qwen3-MoE: both are Mixtral-shaped blocks whose sub-linears are
     named gate_proj/up_proj/down_proj.
     """
-    from gemq.inference.patch import replace_linear_recursive
+    from proquant.inference.patch import replace_linear_recursive
 
     torch.manual_seed(0)
     hf_block = hf_cls(config).to(device).half().eval()
@@ -218,7 +218,7 @@ def _build_gated_expert_blocks(device, config, hf_cls, quant_cls):
 def build_olmoe_blocks(device):
     """Returns (quant_fused_block, reference_block_with_dequantized_weights, config)."""
     from transformers.models.olmoe.modeling_olmoe import OlmoeSparseMoeBlock
-    from gemq.inference.moe_block import QuantFusedOlmoeMoEBlock
+    from proquant.inference.moe_block import QuantFusedOlmoeMoEBlock
 
     return _build_gated_expert_blocks(
         device, _olmoe_config(), OlmoeSparseMoeBlock, QuantFusedOlmoeMoEBlock
@@ -228,7 +228,7 @@ def build_olmoe_blocks(device):
 def build_qwen3moe_blocks(device):
     """Returns (quant_fused_block, reference_block_with_dequantized_weights, config)."""
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
-    from gemq.inference.moe_block import QuantFusedQwen3MoeMoEBlock
+    from proquant.inference.moe_block import QuantFusedQwen3MoeMoEBlock
 
     return _build_gated_expert_blocks(
         device, _qwen3moe_config(), Qwen3MoeSparseMoeBlock, QuantFusedQwen3MoeMoEBlock
@@ -255,7 +255,7 @@ _OfficialBlockStub.__module__ = "transformers_modules.deepseek.modeling_deepseek
 @pytest.mark.cuda
 def test_deepseek_feature_guard_accepts_default_config(device):
     """Expert-selection features the fused forward does not implement."""
-    from gemq.inference.moe_block import check_deepseek_routing_supported
+    from proquant.inference.moe_block import check_deepseek_routing_supported
 
     check_deepseek_routing_supported(_deepseek_config())
 
@@ -266,7 +266,7 @@ def test_deepseek_feature_guard_accepts_default_config(device):
     [("topk_method", "group_limited_greedy"), ("scoring_func", "sigmoid")],
 )
 def test_deepseek_feature_guard_rejects_unsupported_config(device, field, value):
-    from gemq.inference.moe_block import check_deepseek_routing_supported
+    from proquant.inference.moe_block import check_deepseek_routing_supported
 
     config = _deepseek_config()
     setattr(config, field, value)
@@ -298,7 +298,7 @@ def test_deepseek_gate_guard_matches_reference_semantics(
     truth table rather than one config.
     """
     from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2MoE
-    from gemq.inference.moe_block import check_deepseek_gate_matches
+    from proquant.inference.moe_block import check_deepseek_gate_matches
 
     config = _deepseek_config()
     config.norm_topk_prob = norm_topk_prob

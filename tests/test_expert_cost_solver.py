@@ -1,6 +1,6 @@
 import torch
 
-from gemq.allocation.ilp_solvers import ExpertCostSolver
+from proquant.allocation.ilp_solvers import PoPSolver
 
 
 def test_expert_cost_solver_global_budget_and_equal_pruning(tmp_path):
@@ -23,7 +23,7 @@ def test_expert_cost_solver_global_budget_and_equal_pruning(tmp_path):
         },
         path,
     )
-    solver = ExpertCostSolver(
+    solver = PoPSolver(
         path,
         x_space=[0, 2, 3],
         max_prune_ratio=0.34,
@@ -49,7 +49,7 @@ def test_expert_cost_solver_rejects_infeasible_prune_cap(tmp_path):
         },
         path,
     )
-    solver = ExpertCostSolver(
+    solver = PoPSolver(
         path, x_space=[0, 2], max_prune_ratio=0.0, top_k=1, backend="highs"
     )
     try:
