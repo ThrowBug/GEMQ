@@ -17,6 +17,8 @@ import os
 import torch
 import transformers
 
+from proquant.utils.extended_moe import NATIVE_MODEL_TYPES, routing_biases
+
 
 def load_causal_lm_checkpoint(
     model_path,
@@ -24,15 +26,23 @@ def load_causal_lm_checkpoint(
     attn_implementation="eager",
     trust_remote_code=False,
     device_map="cpu",
+    model_name=None,
 ):
     """Load a standard Hugging Face causal-LM checkpoint for ProQuant workflows."""
+    native_type = NATIVE_MODEL_TYPES.get(model_name)
     model = transformers.AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map=device_map,
         torch_dtype=model_dtype,
         attn_implementation=attn_implementation,
-        trust_remote_code=trust_remote_code,
+        trust_remote_code=False if native_type else trust_remote_code,
     )
+    if native_type is not None:
+        if model.config.model_type != native_type:
+            raise ValueError(f"{model_name} expects model_type={native_type}, got {model.config.model_type}.")
+        for module, name in routing_biases(model):
+            bias = getattr(module, name)
+            bias.data = bias.detach().float()
     # This is a no-op for Qwen and for implementations that already apply the
     # correction, while keeping standalone evaluation aligned with quantize.py.
     align_deepseek_softmax_scale(model)

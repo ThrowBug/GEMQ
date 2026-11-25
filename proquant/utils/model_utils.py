@@ -61,6 +61,13 @@ class ModelType(Enum):
     OLMOE = auto()
     QWEN3MOE = auto()
     QWEN35MOE = auto()
+    GLM4MOELITE = auto()
+    TRINITY = auto()
+
+
+EXTENDED_MOE_TYPES = {ModelType.GLM4MOELITE, ModelType.TRINITY}
+RELEASE_MOE_TYPES = EXTENDED_MOE_TYPES | {ModelType.QWEN35MOE}
+PACKED_MOE_TYPES = {ModelType.QWEN35MOE, ModelType.GLM4MOELITE}
     
 
 class LinearModuleType(Enum):
@@ -84,6 +91,8 @@ NAME_TO_MODEL = {
     "Qwen/Qwen3-30B-A3B": ModelType.QWEN3MOE,
     "Qwen/Qwen3-30B-A3B-Instruct-2507": ModelType.QWEN3MOE,
     "Qwen/Qwen3.5-35B-A3B": ModelType.QWEN35MOE,
+    "zai-org/GLM-4.7-Flash": ModelType.GLM4MOELITE,
+    "arcee-ai/Trinity-Mini": ModelType.TRINITY,
 }
 
 
@@ -247,6 +256,11 @@ def dispatch_model_to_all_devices(model, cuda_diagnostics=False):
         report_cuda_diagnostics("before model dispatch", model=model)
     print("Dispatching model weights to all devices ... ", end="")
     t0 = time.time()
+    native_decoder = {
+        "glm4_moe_lite": "Glm4MoeLiteDecoderLayer",
+        "afmoe": "AfmoeDecoderLayer",
+    }.get(model.config.model_type)
+    balance_kwargs = {"no_split_module_classes": [native_decoder]} if native_decoder else {}
     device_map = infer_auto_device_map(
         model,
         no_split_module_classes=[
@@ -257,8 +271,10 @@ def dispatch_model_to_all_devices(model, cuda_diagnostics=False):
             "OlmoeDecoderLayer",
             "Qwen3MoeDecoderLayer",
             "Qwen3_5MoeDecoderLayer",
+            "Glm4MoeLiteDecoderLayer",
+            "AfmoeDecoderLayer",
         ],
-        max_memory=get_balanced_memory(model),
+        max_memory=get_balanced_memory(model, **balance_kwargs),
     )
     if cuda_diagnostics:
         report_cuda_diagnostics("after inferring the device map", device_map=device_map)
@@ -320,6 +336,24 @@ def get_model_info(model_name):
             num_experts_per_token=8,
             shared_experts_participate_in_allocation=False,
         )
+    elif model_type == ModelType.GLM4MOELITE:
+        model_info = ModelInfo(
+            num_layers=47,
+            first_k_dense_layers=1,
+            num_routed_experts_per_layer=64,
+            num_shared_experts_per_layer=1,
+            num_experts_per_token=4,
+            shared_experts_participate_in_allocation=False,
+        )
+    elif model_type == ModelType.TRINITY:
+        model_info = ModelInfo(
+            num_layers=32,
+            first_k_dense_layers=2,
+            num_routed_experts_per_layer=128,
+            num_shared_experts_per_layer=1,
+            num_experts_per_token=8,
+            shared_experts_participate_in_allocation=False,
+        )
     else:
         raise NotImplementedError(f"Model type {model_type} not supported for getting model info.")
 
@@ -334,7 +368,7 @@ def get_blocks(model, model_name):
     if model_type in (
         ModelType.LLAMA2, ModelType.QWEN3, 
         ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE,
-        ModelType.QWEN3MOE, ModelType.QWEN35MOE,
+        ModelType.QWEN3MOE, ModelType.QWEN35MOE, ModelType.GLM4MOELITE, ModelType.TRINITY,
     ):
         blocks = model.model.layers
     else:
@@ -350,11 +384,11 @@ def move_embed(model, model_name, device):
     if model_type in (
         ModelType.LLAMA2, ModelType.QWEN3,
         ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE,
-        ModelType.QWEN3MOE, ModelType.QWEN35MOE,
+        ModelType.QWEN3MOE, ModelType.QWEN35MOE, ModelType.GLM4MOELITE, ModelType.TRINITY,
     ):
         model.model.embed_tokens = model.model.embed_tokens.to(device)
         if (
-            model_type == ModelType.QWEN35MOE
+            model_type in RELEASE_MOE_TYPES
             and hasattr(model.model, "rotary_emb")
         ):
             model.model.rotary_emb = model.model.rotary_emb.to(device)
@@ -368,7 +402,7 @@ def move_head(model, model_name, device):
     if model_type in (
         ModelType.LLAMA2, ModelType.QWEN3,
         ModelType.MIXTRAL, ModelType.DEEPSEEKV2, ModelType.OLMOE,
-        ModelType.QWEN3MOE, ModelType.QWEN35MOE,
+        ModelType.QWEN3MOE, ModelType.QWEN35MOE, ModelType.GLM4MOELITE, ModelType.TRINITY,
     ):
         model.model.norm = model.model.norm.to(device)
         model.lm_head = model.lm_head.to(device)
@@ -401,6 +435,8 @@ def get_moe_block(layer, model_name):
         moe_block = layer.mlp
     elif model_type == ModelType.QWEN35MOE:
         moe_block = layer.mlp
+    elif model_type in EXTENDED_MOE_TYPES:
+        moe_block = layer.mlp if hasattr(layer.mlp, "experts") else None
     return moe_block
 
 
@@ -409,7 +445,7 @@ def get_shared_expert_block(moe_block, model_name):
     Get the shared expert FFN from a moe block.
     """
     model_type = NAME_TO_MODEL[model_name]
-    if model_type == ModelType.DEEPSEEKV2:
+    if model_type == ModelType.DEEPSEEKV2 or model_type in EXTENDED_MOE_TYPES:
         shared_expert = moe_block.shared_experts
     elif model_type == ModelType.QWEN35MOE:
         shared_expert = moe_block.shared_expert
@@ -430,6 +466,8 @@ def get_sublinear_names(model_name):
         ModelType.OLMOE,
         ModelType.QWEN3MOE,
         ModelType.QWEN35MOE,
+        ModelType.GLM4MOELITE,
+        ModelType.TRINITY,
     ):
         sublinear_names = ["gate_proj", "up_proj", "down_proj"]
     
@@ -441,6 +479,23 @@ def get_module_type(module_name, model_name):
     Parse the type of **linear module** based on its name.
     """
     model_type = NAME_TO_MODEL[model_name]
+
+    if model_type in EXTENDED_MOE_TYPES:
+        attention_targets = {
+            ModelType.GLM4MOELITE: {
+                "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
+            },
+            ModelType.TRINITY: {"q_proj", "k_proj", "v_proj", "o_proj"},
+        }[model_type]
+        if module_name.startswith("self_attn.") and module_name.removeprefix("self_attn.") in attention_targets:
+            return LinearModuleType.SOFTMAX_ATTN
+        if module_name in {"mlp.gate", "mlp.router.gate"}:
+            return LinearModuleType.GATE
+        if module_name in {"mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"} or module_name.startswith("mlp.shared_experts."):
+            return LinearModuleType.DENSE
+        if module_name.startswith("mlp.experts."):
+            return LinearModuleType.EXPERT
+        return LinearModuleType.OTHERS
 
     if model_type == ModelType.LLAMA2:
         if "attn" in module_name:
@@ -527,7 +582,7 @@ def get_expert_id(name, model_name):
     Get the expert id from the name of the Linear module.
     """
     model_type = NAME_TO_MODEL[model_name]
-    if model_type in (ModelType.MIXTRAL, ModelType.OLMOE, ModelType.QWEN3MOE):
+    if model_type in (ModelType.MIXTRAL, ModelType.OLMOE, ModelType.QWEN3MOE, ModelType.TRINITY):
         exp_id = int(name.split(".")[-2])
     elif model_type == ModelType.DEEPSEEKV2:
         exp_id = 64 if "shared_experts" in name else int(name.split(".")[-2])
@@ -549,9 +604,8 @@ def get_all_expert_names(model_name):
         all_expert_names = [f"mlp.experts.{i}" for i in range(model_info.num_routed_experts_per_layer)]
     elif model_type == ModelType.QWEN3MOE:
         all_expert_names = [f"mlp.experts.{i}" for i in range(model_info.num_routed_experts_per_layer)]
-    elif model_type == ModelType.QWEN35MOE:
-        # These are logical names. Transformers stores their weights in packed
-        # tensors rather than actual child modules.
+    elif model_type in RELEASE_MOE_TYPES:
+        # These are logical names when the model uses packed expert tensors.
         all_expert_names = [
             f"mlp.experts.{i}"
             for i in range(model_info.num_routed_experts_per_layer)
@@ -641,13 +695,13 @@ def move_tree_to_device(value, device):
 def capture_qwen35_decoder_context(model, batches, model_name, device="cuda"):
     """Capture text inputs and the per-layer masks built by the HF model.
 
-    Qwen3.5 alternates linear and full attention, so a single kwargs dictionary
-    cannot be shared by every layer. All decoder layers are temporarily replaced
-    by identity recorders; this lets the text model build the authoritative mask
-    for each layer without loading the vision tower or executing decoder weights.
+    Qwen3.5 and Trinity mix attention types. Temporarily replace decoder layers
+    with identity recorders so the native model builds each mask and embedding
+    context without executing decoder weights.
     """
-    if NAME_TO_MODEL[model_name] != ModelType.QWEN35MOE:
-        raise ValueError("Per-layer decoder-context capture is Qwen3.5-specific.")
+    model_type = NAME_TO_MODEL[model_name]
+    if model_type not in RELEASE_MOE_TYPES:
+        raise ValueError(f"Per-layer decoder-context capture is unsupported for {model_name}.")
     layers = get_blocks(model, model_name)
     originals = list(layers)
     hidden_batches = []
@@ -671,7 +725,9 @@ def capture_qwen35_decoder_context(model, batches, model_name, device="cuda"):
             # type. Keep just the first CPU copy for each type; copying rotary
             # embeddings and a 2048x2048 causal mask for every sample/layer would
             # otherwise consume many gigabytes of host memory.
-            context_key = getattr(self, "layer_type", self.layer_idx)
+            context_key = getattr(self, "layer_type", getattr(self, "attention_type", self.layer_idx))
+            if model_type == ModelType.GLM4MOELITE:
+                context_key = "full_attention"
             if context_key not in context_by_layer_type:
                 context_by_layer_type[context_key] = (
                     _tree_to_cpu(args),
@@ -725,7 +781,16 @@ def compute_decoder_inputs(model, dataloader, model_name, device="cuda"):
     Prepare input data for the first decoder block, and shared kwargs for all blocks.
     """
     layers = get_blocks(model, model_name)
-    if NAME_TO_MODEL[model_name] == ModelType.QWEN35MOE:
+    model_type = NAME_TO_MODEL[model_name]
+    if model_type in RELEASE_MOE_TYPES:
+        if model_type in EXTENDED_MOE_TYPES:
+            # GPTQ, teacher collection and offloaded PPL replay one sequence
+            # at a time. Match the native mask batch dimension to that replay.
+            dataloader = (
+                sequence.unsqueeze(0)
+                for batch in dataloader
+                for sequence in (batch[0] if isinstance(batch, (tuple, list)) else batch)
+            )
         hidden, positional, keywords = capture_qwen35_decoder_context(
             model, dataloader, model_name, device
         )

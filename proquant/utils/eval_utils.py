@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 
 from proquant.utils.model_utils import (
-    ModelType,
+    RELEASE_MOE_TYPES,
     NAME_TO_MODEL,
     compute_decoder_inputs,
     get_blocks,
@@ -76,7 +76,7 @@ def compute_perplexity_offload(model, model_name, input_ids, dataset_name):
     # retrieve blocks that require quantization
     layers = get_blocks(model, model_name)
 
-    if NAME_TO_MODEL[model_name] == ModelType.QWEN35MOE:
+    if NAME_TO_MODEL[model_name] in RELEASE_MOE_TYPES:
         batches = [
             (
                 input_ids[

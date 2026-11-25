@@ -8,7 +8,8 @@ from proquant.pruning.qwen3 import (
     prune_qwen3_experts,
 )
 from proquant.pruning.qwen35 import prune_qwen35_experts
-from proquant.utils.model_utils import ModelType, NAME_TO_MODEL
+from proquant.pruning.extended_moe import prune_extended_moe_experts
+from proquant.utils.model_utils import EXTENDED_MOE_TYPES, ModelType, NAME_TO_MODEL
 
 
 def prune_zero_bit_experts(model, model_name, bit_config):
@@ -17,6 +18,8 @@ def prune_zero_bit_experts(model, model_name, bit_config):
         return prune_qwen3_experts(model, model_name, bit_config)
     if model_type == ModelType.QWEN35MOE:
         return prune_qwen35_experts(model, model_name, bit_config)
+    if model_type in EXTENDED_MOE_TYPES:
+        return prune_extended_moe_experts(model, model_name, bit_config)
     raise NotImplementedError(
         f"Physical zero-bit pruning is not implemented for {model_name!r}."
     )

@@ -1,4 +1,4 @@
-"""Layer-wise expert quantization costs for Qwen3-MoE.
+"""Layer-wise expert quantization costs for routed experts.
 
 For routed expert ``i`` in decoder layer ``l`` and candidate bit-width ``b``
 this module computes
@@ -20,9 +20,11 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from proquant.quantizers.rtn import MCMoeRTNWeightQuantizer
+from proquant.utils.extended_moe import glm_topk_routes, trinity_topk_routes
 from proquant.utils.model_utils import (
     ModelType,
     NAME_TO_MODEL,
+    RELEASE_MOE_TYPES,
     capture_qwen35_decoder_context,
     get_blocks,
     get_moe_block,
@@ -87,7 +89,7 @@ def _empty_cuda_cache(device: torch.device):
 @torch.inference_mode()
 def _capture_decoder_inputs(model, dataloader, model_name, device):
     """Capture first-layer inputs and kwargs, offloading every batch to CPU."""
-    if NAME_TO_MODEL[model_name] == ModelType.QWEN35MOE:
+    if NAME_TO_MODEL[model_name] in RELEASE_MOE_TYPES:
         return capture_qwen35_decoder_context(
             model, dataloader, model_name, device
         )
@@ -167,6 +169,7 @@ def _capture_qwen3_moe_inputs(
     keyword_batches,
     device,
     stop_at_moe,
+    route_tokens=_qwen3_topk_routes,
 ):
     """Capture MoE inputs/routes, optionally stopping before any expert runs."""
     moe_input_batches = []
@@ -176,9 +179,7 @@ def _capture_qwen3_moe_inputs(
 
     def capture_hook(module, inputs):
         hidden_states = inputs[0]
-        selected_experts, routing_weights = _qwen3_topk_routes(
-            module, hidden_states
-        )
+        selected_experts, routing_weights = route_tokens(module, hidden_states)
         moe_input_batches.append(_to_cpu(hidden_states))
         selected_expert_batches.append(_to_cpu(selected_experts))
         routing_weight_batches.append(_to_cpu(routing_weights))
@@ -304,7 +305,7 @@ def _install_quantized_expert(expert, original, bit, blocksize):
 def _num_routed_experts(moe_block):
     if hasattr(moe_block.experts, "gate_up_proj"):
         return get_num_routed_experts(moe_block)
-    return int(moe_block.num_experts)
+    return len(moe_block.experts)
 
 
 def _restore_weights(linears, original_weights):
@@ -512,13 +513,9 @@ def compute_qwen3_expert_costs(
 ):
     """Compute ``[layer, expert, candidate_bit]`` costs and active counts."""
     model_type = NAME_TO_MODEL.get(model_name)
-    if model_type not in {
-        ModelType.QWEN3MOE,
-        ModelType.QWEN35MOE,
-    }:
+    if model_type not in RELEASE_MOE_TYPES and model_type != ModelType.QWEN3MOE:
         raise NotImplementedError(
-            "Expert-cost collection supports Qwen3/Qwen3.5-MoE only; "
-            f"got model_name={model_name!r}."
+            f"Expert-cost collection is unsupported for model_name={model_name!r}."
         )
     if context_mode not in {"fp", "uniform_bit"}:
         raise ValueError(
@@ -553,39 +550,51 @@ def compute_qwen3_expert_costs(
         model, dataloader, model_name, device
     )
 
-    num_layers = len(layers)
-    first_moe = get_moe_block(layers[0], model_name)
+    moe_layer_ids = [i for i, layer in enumerate(layers) if get_moe_block(layer, model_name) is not None]
+    if not moe_layer_ids or moe_layer_ids != list(range(moe_layer_ids[0], len(layers))):
+        raise ValueError("PoP requires a contiguous block of MoE layers after the dense prefix.")
+    first_moe = get_moe_block(layers[moe_layer_ids[0]], model_name)
     num_experts = _num_routed_experts(first_moe)
     costs = torch.full(
-        (num_layers, num_experts, len(candidate_bits)),
+        (len(moe_layer_ids), num_experts, len(candidate_bits)),
         torch.nan,
         dtype=torch.float64,
     )
-    counts = torch.zeros((num_layers, num_experts), dtype=torch.long)
+    counts = torch.zeros((len(moe_layer_ids), num_experts), dtype=torch.long)
+    route_tokens = {
+        ModelType.GLM4MOELITE: glm_topk_routes,
+        ModelType.TRINITY: trinity_topk_routes,
+    }.get(model_type, _qwen3_topk_routes)
 
     try:
         for layer_idx in tqdm(
-            range(num_layers), desc="expert cost layers", dynamic_ncols=True
+            range(len(layers)), desc="expert cost layers", dynamic_ncols=True
         ):
             layer = layers[layer_idx].to(device)
             moe_block = get_moe_block(layer, model_name)
-            layer_num_experts = _num_routed_experts(moe_block)
-            if layer_num_experts != num_experts:
-                raise ValueError(
-                    f"Layer {layer_idx} has {layer_num_experts} experts; "
-                    f"expected {num_experts}."
-                )
 
             layer_positional_batches = (
                 positional_batches[layer_idx]
-                if model_type == ModelType.QWEN35MOE
+                if model_type in RELEASE_MOE_TYPES
                 else positional_batches
             )
             layer_keyword_batches = (
                 keyword_batches[layer_idx]
-                if model_type == ModelType.QWEN35MOE
+                if model_type in RELEASE_MOE_TYPES
                 else keyword_batches
             )
+            if moe_block is None:
+                hidden_batches = _forward_layer_batches(
+                    layer, hidden_batches, layer_positional_batches, layer_keyword_batches, device
+                )
+                layers[layer_idx] = layer.to("cpu")
+                continue
+
+            layer_num_experts = _num_routed_experts(moe_block)
+            if layer_num_experts != num_experts:
+                raise ValueError(
+                    f"Layer {layer_idx} has {layer_num_experts} experts; expected {num_experts}."
+                )
 
             (
                 moe_input_batches,
@@ -600,6 +609,7 @@ def compute_qwen3_expert_costs(
                 layer_keyword_batches,
                 device,
                 stop_at_moe=(context_mode == "uniform_bit"),
+                route_tokens=route_tokens,
             )
 
             layer_costs, layer_counts = _compute_layer_costs(
@@ -615,8 +625,9 @@ def compute_qwen3_expert_costs(
                 device,
                 normalize_by_activation_count,
             )
-            costs[layer_idx] = layer_costs
-            counts[layer_idx] = layer_counts
+            cost_row = layer_idx - moe_layer_ids[0]
+            costs[cost_row] = layer_costs
+            counts[cost_row] = layer_counts
 
             del (
                 moe_input_batches,

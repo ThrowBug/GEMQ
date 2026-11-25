@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, logging
 
 from proquant.utils.eval_utils import evaluate_perplexity
 from proquant.utils.hf_loading import load_causal_lm_checkpoint
+from proquant.utils.extended_moe import NATIVE_MODEL_TYPES
 from proquant.utils.model_utils import (
     dispatch_model_to_all_devices,
     report_cuda_diagnostics,
@@ -60,20 +61,23 @@ def parse_args(argv=None):
 
 
 def run(args):
+    native = args.model_name in NATIVE_MODEL_TYPES
     print("Loading tokenizer ...")
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         use_fast=args.use_fast,
-        trust_remote_code=args.trust_remote_code,
+        trust_remote_code=args.trust_remote_code and not native,
     )
 
     print("Loading saved model ...")
+    model_args = {"model_name": args.model_name} if native else {}
     model = load_causal_lm_checkpoint(
         args.model,
         model_dtype=args.model_dtype,
         attn_implementation=args.attn_impl,
         trust_remote_code=args.trust_remote_code,
         device_map="cpu",
+        **model_args,
     )
     model.seqlen = args.seqlen
     if args.cuda_diagnostics:

@@ -110,14 +110,13 @@ def install_rtn_packed_expert_(
 
 
 @torch.no_grad()
-def prune_packed_experts_(moe_block, kept_ids) -> None:
-    """Slice packed expert tensors and router rows while preserving HF key names."""
+def slice_packed_expert_weights_(experts, kept_ids) -> None:
+    """Slice the expert axis of native packed weights."""
     kept = torch.as_tensor(
         tuple(int(expert_id) for expert_id in kept_ids),
         dtype=torch.long,
-        device=moe_block.experts.gate_up_proj.device,
+        device=experts.gate_up_proj.device,
     )
-    experts = moe_block.experts
     gate_up_requires_grad = experts.gate_up_proj.requires_grad
     down_requires_grad = experts.down_proj.requires_grad
     gate_up = experts.gate_up_proj.index_select(0, kept).clone()
@@ -130,8 +129,14 @@ def prune_packed_experts_(moe_block, kept_ids) -> None:
     )
     experts.num_experts = len(kept_ids)
 
+
+@torch.no_grad()
+def prune_packed_experts_(moe_block, kept_ids) -> None:
+    """Slice packed expert tensors and router rows while preserving HF key names."""
+    experts = moe_block.experts
+    slice_packed_expert_weights_(experts, kept_ids)
     router = moe_block.gate
-    router_kept = kept.to(router.weight.device)
+    router_kept = torch.as_tensor(kept_ids, dtype=torch.long, device=router.weight.device)
     router_requires_grad = router.weight.requires_grad
     router_weight = router.weight.index_select(0, router_kept).clone()
     router.weight = nn.Parameter(

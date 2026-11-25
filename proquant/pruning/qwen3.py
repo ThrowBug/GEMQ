@@ -41,8 +41,10 @@ def has_zero_bit_experts(bit_config):
     return any(bit == 0 for experts in bit_config.values() for bit in experts.values())
 
 
-def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
-    expected_layers = set(range(num_layers))
+def _build_pruning_result(
+    bit_config, num_layers, num_experts, top_k, *, first_moe_layer=0, model_type="Qwen3-MoE"
+):
+    expected_layers = set(range(first_moe_layer, num_layers))
     if set(bit_config) != expected_layers:
         raise ValueError(
             "Bit allocation layer IDs must exactly match model layers: "
@@ -53,16 +55,16 @@ def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
     kept_by_layer = []
     pruned_by_layer = []
     remapped = {}
-    for layer_idx in range(num_layers):
+    for layer_idx in sorted(expected_layers):
         layer_config = bit_config[layer_idx]
         if set(layer_config) != expected_experts:
             raise ValueError(
                 f"Layer {layer_idx} expert IDs must be 0..{num_experts - 1}; "
                 f"got {sorted(layer_config)}"
             )
-        invalid_bits = [bit for bit in layer_config.values() if bit < 0]
+        invalid_bits = [bit for bit in layer_config.values() if not 0 <= bit <= 16]
         if invalid_bits:
-            raise ValueError(f"Layer {layer_idx} contains negative bit-widths")
+            raise ValueError(f"Layer {layer_idx} contains bit-widths outside [0, 16]")
         kept = tuple(i for i in range(num_experts) if layer_config[i] > 0)
         pruned = tuple(i for i in range(num_experts) if layer_config[i] == 0)
         if len(kept) < top_k:
@@ -78,30 +80,32 @@ def _build_pruning_result(bit_config, num_layers, num_experts, top_k):
     prune_counts = {len(ids) for ids in pruned_by_layer}
     if len(prune_counts) != 1:
         raise ValueError(
-            "Physical Qwen3 pruning requires every layer to prune the same number "
+            "Physical pruning requires every MoE layer to prune the same number "
             f"of experts, got counts {[len(ids) for ids in pruned_by_layer]}."
         )
     pruned_count = prune_counts.pop()
     remaining = num_experts - pruned_count
     metadata = {
         "format_version": 1,
-        "model_type": "Qwen3-MoE",
+        "model_type": model_type,
         "allocation_id_space": "original_expert_ids",
         "original_num_experts": num_experts,
         "num_experts": remaining,
         "pruned_experts_per_layer": pruned_count,
         "layers": {
             str(layer_idx): {
-                "kept_old_ids": list(kept_by_layer[layer_idx]),
-                "pruned_old_ids": list(pruned_by_layer[layer_idx]),
+                "kept_old_ids": list(kept),
+                "pruned_old_ids": list(pruned),
                 "old_to_new": {
                     str(old_id): new_id
-                    for new_id, old_id in enumerate(kept_by_layer[layer_idx])
+                    for new_id, old_id in enumerate(kept)
                 },
             }
-            for layer_idx in range(num_layers)
+            for layer_idx, (kept, pruned) in enumerate(zip(kept_by_layer, pruned_by_layer), first_moe_layer)
         },
     }
+    if first_moe_layer:
+        metadata["first_moe_layer"] = first_moe_layer
     return PruningResult(remapped, tuple(kept_by_layer), metadata)
 
 
@@ -126,10 +130,14 @@ def kept_expert_ids_from_pruning_metadata(metadata):
             raise ValueError(f"Duplicate layer ID in pruning metadata: {layer_idx}")
         indexed_layers[layer_idx] = layer_metadata
 
-    expected_layers = list(range(len(indexed_layers)))
+    first_moe_layer = int(metadata.get("first_moe_layer", 0))
+    if first_moe_layer < 0:
+        raise ValueError("Pruning metadata first_moe_layer must be non-negative.")
+    expected_layers = list(range(first_moe_layer, first_moe_layer + len(indexed_layers)))
     if sorted(indexed_layers) != expected_layers:
+        start = "zero" if first_moe_layer == 0 else str(first_moe_layer)
         raise ValueError(
-            "Pruning metadata layer IDs must be contiguous from zero: "
+            f"Pruning metadata layer IDs must be contiguous from {start}: "
             f"expected {expected_layers}, got {sorted(indexed_layers)}"
         )
 
@@ -175,7 +183,7 @@ def _slice_linear_output_rows(linear, kept_ids):
     index = torch.tensor(kept_ids, dtype=torch.long, device=linear.weight.device)
     weight = linear.weight.detach().index_select(0, index).clone()
     linear.weight = nn.Parameter(weight, requires_grad=linear.weight.requires_grad)
-    if linear.bias is not None:
+    if getattr(linear, "bias", None) is not None:
         bias = linear.bias.detach().index_select(0, index).clone()
         linear.bias = nn.Parameter(bias, requires_grad=linear.bias.requires_grad)
     if hasattr(linear, "out_features"):

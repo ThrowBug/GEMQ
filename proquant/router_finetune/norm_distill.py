@@ -5,10 +5,13 @@ import time
 import torch
 
 from proquant.router_finetune.losses import compute_causal_output_distill_ce
+from proquant.utils.extended_moe import cast_model_preserving_fp32
 from proquant.utils.model_utils import (
+    EXTENDED_MOE_TYPES,
     NAME_TO_MODEL,
     ModelType,
     get_blocks,
+    get_moe_block,
     get_router_module,
 )
 
@@ -82,7 +85,11 @@ class RouterCompensatedNorm(NormScale):
     """Learn a post-attention norm scale while preserving router inputs."""
 
     def __init__(self, layer, model_name):
-        super().__init__(layer.post_attention_layernorm)
+        norm = (
+            layer.pre_mlp_layernorm if NAME_TO_MODEL.get(model_name) == ModelType.TRINITY
+            else layer.post_attention_layernorm
+        )
+        super().__init__(norm)
         _, self.router = get_router_module(layer, model_name)
         if self.router.weight.shape[1] != self.norm.weight.numel():
             raise ValueError("Router input width differs from post-attention norm width.")
@@ -258,7 +265,7 @@ def finetune_norms_distill_ce(
     original_dtype = next(model.parameters()).dtype
     model.config.use_cache = False
     model.train()
-    model.to(torch.bfloat16)
+    cast_model_preserving_fp32(model, torch.bfloat16)
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
@@ -282,7 +289,13 @@ def finetune_norms_distill_ce(
             )
             controllers.append(input_controller)
             controller_groups["input"].append(input_controller)
-        if router_compensated:
+        if model_type in EXTENDED_MOE_TYPES and get_moe_block(layer, args.model_name) is None:
+            norm = (
+                layer.pre_mlp_layernorm if model_type == ModelType.TRINITY
+                else layer.post_attention_layernorm
+            )
+            post_controller = NormScale(norm)
+        elif router_compensated:
             post_controller = (
                 Qwen35RouterCompensatedNorm(layer, args.model_name)
                 if zero_centered
@@ -374,4 +387,4 @@ def finetune_norms_distill_ce(
                     [learned_scales[id(controller)] for controller in group],
                     [realized_scales[id(controller)] for controller in group],
                 )
-    model.to(original_dtype)
+    cast_model_preserving_fp32(model, original_dtype)

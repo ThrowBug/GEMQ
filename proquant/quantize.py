@@ -23,6 +23,7 @@ from proquant.utils.gptq_checkpoint import (
 from proquant.utils.model_utils import *
 from proquant.utils.quant_utils import *
 from proquant.utils.eval_utils import evaluate_perplexity, run_lm_eval
+from proquant.utils.extended_moe import cast_model_preserving_fp32, glm_topk_routes
 from proquant.utils.hf_loading import load_causal_lm_checkpoint
 from proquant.router_finetune.config import (
     DistillCEConfig,
@@ -87,7 +88,7 @@ def _effective_groupsize(weight, requested, name, verbose=False):
     return 64
 
 
-def _collect_qwen35_active_inputs(moe_inputs, selected_batches, expert_idx):
+def _collect_packed_expert_inputs(moe_inputs, selected_batches, expert_idx):
     active = []
     for hidden_states, selected in zip(moe_inputs, selected_batches):
         flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -100,10 +101,10 @@ def _collect_qwen35_active_inputs(moe_inputs, selected_batches, expert_idx):
 
 
 @torch.no_grad()
-def _quantize_qwen35_packed_experts(
+def _quantize_packed_experts(
     moe_block, moe_inputs, selected_batches, expert_bits, layer_idx, args
 ):
-    """GPTQ Qwen3.5 routed experts while retaining their packed HF tensors."""
+    """GPTQ routed experts while retaining their packed HF tensors."""
     num_experts = get_num_routed_experts(moe_block)
     expected = set(range(num_experts))
     if set(expert_bits) != expected:
@@ -125,7 +126,7 @@ def _quantize_qwen35_packed_experts(
         weights = get_packed_expert_weights(moe_block, expert_idx)
         original_gate_up = weights.gate_up_proj.detach().clone()
         original_down = weights.down_proj.detach().clone()
-        active_inputs = _collect_qwen35_active_inputs(
+        active_inputs = _collect_packed_expert_inputs(
             moe_inputs, selected_batches, expert_idx
         )
 
@@ -222,6 +223,7 @@ def load_causal_lm(model_path, args, description="model"):
         attn_implementation=args.attn_impl,
         trust_remote_code=args.trust_remote_code,
         device_map="cpu",
+        model_name=args.model_name,
     )
     model.seqlen = args.seqlen
     if args.cuda_diagnostics:
@@ -240,7 +242,7 @@ def save_quantized_model(model, tokenizer, save_path, save_dtype, real_quant):
         AutoHQQHFModel.save_quantized(model, save_path)
     else:
         dtype = torch.float16 if save_dtype == "float16" else torch.bfloat16
-        model = model.to(dtype)
+        model = cast_model_preserving_fp32(model, dtype)
         tokenizer.save_pretrained(save_path)
         model.save_pretrained(save_path)
 
@@ -327,6 +329,8 @@ def quantize_weights_gptq(
     dataloader,
     args,
     expert_bit_cfg=None,
+    *,
+    device="cuda",
 ):
     """
     Perform mixed-precision weight-only quantization with GPTQ quantizer.
@@ -346,7 +350,8 @@ def quantize_weights_gptq(
     bit_cfg = build_alloc_cfg(model, args, expert_bit_cfg=expert_bit_cfg)
 
     # prepare decoder inputs and kwargs for model forward
-    inps, layer_kwargs = compute_decoder_inputs(model, dataloader, args.model_name, "cuda")
+    device = torch.device(device)
+    inps, layer_kwargs = compute_decoder_inputs(model, dataloader, args.model_name, device)
 
     # retrieve decoder blocks
     layers = get_blocks(model, args.model_name)
@@ -360,7 +365,7 @@ def quantize_weights_gptq(
             layer_kwargs[i] if isinstance(layer_kwargs, list) else layer_kwargs
         )
         current_layer_kwargs = move_tree_to_device(
-            current_layer_kwargs, torch.device("cuda")
+            current_layer_kwargs, device
         )
         if args.verbose:
             print("+" + "="*57 + "+")
@@ -369,7 +374,7 @@ def quantize_weights_gptq(
         start = time.time()
 
         # retrieve linear modules in the current block
-        layer = layers[i].to("cuda")
+        layer = layers[i].to(device)
         named_linears = get_named_linears(layer)
 
         # create a quantizer for each linear module that requires quantization
@@ -406,24 +411,27 @@ def quantize_weights_gptq(
                 )
             )
 
-        qwen35_moe_inputs = []
-        qwen35_selected_experts = []
-        if model_type == ModelType.QWEN35MOE:
-            moe_block = get_moe_block(layer, args.model_name)
+        packed_moe_inputs = []
+        packed_selected_experts = []
+        packed_moe = get_moe_block(layer, args.model_name) if model_type in PACKED_MOE_TYPES else None
+        if packed_moe is not None:
+            route_tokens = glm_topk_routes if model_type == ModelType.GLM4MOELITE else qwen35_topk_routes
 
-            def capture_qwen35_routes(module, inputs):
+            def capture_packed_routes(module, inputs):
                 hidden_states = inputs[0].detach()
-                selected, _ = qwen35_topk_routes(module, hidden_states)
-                qwen35_moe_inputs.append(hidden_states.to("cpu"))
-                qwen35_selected_experts.append(selected.detach().to("cpu"))
+                selected, _ = route_tokens(module, hidden_states)
+                packed_moe_inputs.append(hidden_states.to("cpu"))
+                packed_selected_experts.append(selected.detach().to("cpu"))
 
-            handles.append(moe_block.register_forward_pre_hook(capture_qwen35_routes))
-        for j in range(inps.shape[0]):
-            outs[j] = _first_tensor(
-                layer(inps[j: j+1], **current_layer_kwargs)
-            )
-        for h in handles:
-            h.remove()
+            handles.append(packed_moe.register_forward_pre_hook(capture_packed_routes))
+        try:
+            for j in range(inps.shape[0]):
+                outs[j] = _first_tensor(
+                    layer(inps[j: j+1], **current_layer_kwargs)
+                )
+        finally:
+            for h in handles:
+                h.remove()
 
         elapse = time.time() - start
         if args.verbose:
@@ -433,6 +441,20 @@ def quantize_weights_gptq(
         # quantize each linear module
         for name, m in named_linears.items():
             if name not in quantizers:
+                continue
+
+            if (
+                model_type == ModelType.TRINITY
+                and name.startswith("mlp.experts.")
+                and quantizers[name].nsamples == 0
+            ):
+                # Match the packed path for experts with no calibration tokens.
+                m.weight.copy_(MCMoeRTNWeightQuantizer.normal_quantize(
+                    m.weight, blocksize=args.blocksize, wbit=bit_cfg[i][name]
+                ))
+                del quant_modules[f"{i}.{name}"]
+                if args.verbose:
+                    print(f"| {name:<30} | RTN | active_tokens=0")
                 continue
 
             # quantize
@@ -453,12 +475,12 @@ def quantize_weights_gptq(
             if args.verbose:
                 print(f"| {name:<30} | {quantizers[name].nbits:<3} | {quantizers[name].groupsize:>4} | {elapse:>9.2f} |")
 
-        if model_type == ModelType.QWEN35MOE:
+        if packed_moe is not None:
             packed_bits = expert_bit_cfg[i]
-            _quantize_qwen35_packed_experts(
-                moe_block,
-                qwen35_moe_inputs,
-                qwen35_selected_experts,
+            _quantize_packed_experts(
+                packed_moe,
+                packed_moe_inputs,
+                packed_selected_experts,
                 packed_bits,
                 i,
                 args,
@@ -720,12 +742,16 @@ if __name__ == "__main__":
     args = parse_args()
     print(json.dumps(vars(args), indent=4))
 
-    if args.model_name not in NAME_TO_MODEL or NAME_TO_MODEL[args.model_name] != ModelType.QWEN35MOE:
-        raise ValueError("This release supports Qwen3.5-MoE only.")
+    model_type = NAME_TO_MODEL.get(args.model_name)
+    if model_type not in RELEASE_MOE_TYPES:
+        raise ValueError("This release supports Qwen3.5, GLM-4.7-Flash and Trinity-Mini.")
+    extended_model = model_type in EXTENDED_MOE_TYPES
+    if extended_model and args.finetune and args.rft_trainer != "roco":
+        raise ValueError("GLM-4.7-Flash and Trinity-Mini support only RoCo fine-tuning.")
     if args.real_quant:
-        raise ValueError("Qwen3.5 supports pseudo-quantization only.")
+        raise ValueError("This release supports pseudo-quantization only.")
     if args.gate_wbits != 16:
-        raise ValueError("Qwen3.5 routers must remain full precision (gate_wbits=16).")
+        raise ValueError("Routers must remain full precision (gate_wbits=16).")
     for argument_name in ("linear_attn_wbits", "softmax_attn_wbits", "dense_wbits", "expert_wbits"):
         value = getattr(args, argument_name)
         if not 1 <= value <= 16:
@@ -796,7 +822,8 @@ if __name__ == "__main__":
     # even when the student weights are loaded from a post-GPTQ checkpoint.
     needs_teacher_targets = args.finetune and args.rft_trainer in NORM_DISTILL_MODES
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model, use_fast=args.use_fast, trust_remote_code=args.trust_remote_code
+        args.model, use_fast=args.use_fast,
+        trust_remote_code=args.trust_remote_code and not extended_model,
     )
 
     # Preserve the historical model-before-data order for every fresh quantization.
@@ -875,15 +902,16 @@ if __name__ == "__main__":
         if (
             not args.eval_fp
             and expert_bit_cfg is not None
-            and has_zero_bit_experts(expert_bit_cfg)
+            and (has_zero_bit_experts(expert_bit_cfg) or extended_model)
         ):
             pruning_result = prune_zero_bit_experts(model, args.model_name, expert_bit_cfg)
             expert_bit_cfg = pruning_result.remapped_bit_config
-            pruning_metadata = dict(pruning_result.metadata)
-            pruning_metadata["source_bit_config"] = args.bit_cfg
-            teacher_targets = project_teacher_router_logits(
-                teacher_targets, pruning_result.kept_expert_ids
-            )
+            if pruning_result.metadata["pruned_experts_per_layer"]:
+                pruning_metadata = dict(pruning_result.metadata)
+                pruning_metadata["source_bit_config"] = args.bit_cfg
+                teacher_targets = project_teacher_router_logits(
+                    teacher_targets, pruning_result.kept_expert_ids
+                )
 
     # quantize model weights unless a validated post-GPTQ student was loaded
     if not args.eval_fp and not args.load_gptq_checkpoint:

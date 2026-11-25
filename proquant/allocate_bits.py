@@ -11,7 +11,7 @@ from proquant.allocation.ilp_solvers import (
     PoPSolver,
     GEMQSolver,
 )
-from proquant.utils.model_utils import get_model_info
+from proquant.utils.model_utils import EXTENDED_MOE_TYPES, NAME_TO_MODEL, get_model_info
 
 
 ALLOCATION_METRICS = ("layer_re", "pop")
@@ -80,6 +80,8 @@ def _auto_save_path(args, source_path, bit_cands, solver):
     bc_str = ",".join(map(str, bit_cands))
     common = f"{calib_str}_Metric-{args.allocation_metric}"
     if args.allocation_metric == "layer_re":
+        if NAME_TO_MODEL[args.model_name] in EXTENDED_MOE_TYPES:
+            raise ValueError("GLM-4.7-Flash and Trinity-Mini use PoP allocation.")
         constraint_tag = "" if args.extra_constr == "none" else f"_{args.extra_constr}"
         filename = (
             f"{common}_E{args.bit_budget:.1f}_B{bc_str}"
@@ -140,6 +142,12 @@ def run_solver(args):
             backend=args.ilp_backend,
         )
         expected_layers = m.num_layers - m.first_k_dense_layers
+        metadata = global_solver.artifact_metadata
+        if metadata.get("model_name", args.model_name) != args.model_name:
+            raise ValueError("The PoP cost artifact was collected for a different model.")
+        layer_ids = metadata.get("layer_ids")
+        if layer_ids is not None and layer_ids != list(range(m.first_k_dense_layers, m.num_layers)):
+            raise ValueError("The PoP cost artifact does not match the model's routed layer IDs.")
         if global_solver.num_moe_layers != expected_layers:
             raise ValueError(
                 f"Expert-cost artifact has {global_solver.num_moe_layers} layers, "

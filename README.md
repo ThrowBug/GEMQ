@@ -1,6 +1,6 @@
 # ProQuant
 
-This branch reproduces ProQuant on **Qwen3.5-35B-A3B**. Qwen3 and Qwen3.5 require different dependency versions. To reproduce Qwen3-30B-A3B-Instruct-2507, switch to the main branch and use a separate Conda environment for its dependencies.
+This branch supports ProQuant on **Qwen3.5-35B-A3B**, **GLM-4.7-Flash**, and **Trinity-Mini** with Transformers 5.2.0. To reproduce Qwen3-30B-A3B-Instruct-2507, use the Qwen3 release branch and a separate Conda environment.
 
 ## Setup
 
@@ -114,6 +114,44 @@ VLLM_HOST=127.0.0.1 \
   GENERATION_CONFIG='{"temperature":0.7,"top_p":0.8,"top_k":20,"max_tokens":8192,"seed":0,"timeout":3200,"retries":3,"extra_body":{"min_p":0.0, "chat_template_kwargs":{"enable_thinking":false}}}' \
   bash scripts/Qwen3.5-35B-A3B/eval_vllm.sh
 ```
+
+## GLM-4.7-Flash and Trinity-Mini
+
+Use the same quantization environment and C4 calibration file. Select `GLM-4.7-Flash` or `Trinity-Mini` below. The launchers use the Qwen3.5 PoP and RoCo parameters and infer the paths for each stage. Set `MODEL` consistently if you use a local checkpoint.
+
+```bash
+SCRIPTS=scripts/GLM-4.7-Flash  # or scripts/Trinity-Mini
+
+AVERAGE_BITS=2 CANDIDATE_BITS=0,2,3 \
+  bash "$SCRIPTS/compute_pop_costs.sh"
+
+MAX_PRUNE_RATIO=0.15 BITS_PER_EXPERT=2.0 WBITS=0,2,3 POP_COST_BITS=0,2,3 \
+  bash "$SCRIPTS/allocate.sh"
+
+CUDA_VISIBLE_DEVICES=0,1 MAX_PRUNE_RATIO=0.15 BPE=2.0 WBITS=0,2,3 \
+  FINETUNE=false SAVE_GPTQ_CHECKPOINT=true bash "$SCRIPTS/quantize.sh"
+
+CUDA_VISIBLE_DEVICES=0,1 MAX_PRUNE_RATIO=0.15 BPE=2.0 WBITS=0,2,3 \
+  FINETUNE=true RFT_TRAINER=roco RFT_LR=3e-3 LOAD_GPTQ_CHECKPOINT=true bash "$SCRIPTS/quantize.sh"
+
+bash "$SCRIPTS/eval_ppl.sh" /path/to/quantized/model
+```
+
+Use `POP_COST_PATH`, `BIT_CFG_PATH`, and `GPTQ_CHECKPOINT_PATH` to select specific files. `SOFTMAX_ATTN_WBITS` and `DENSE_WBITS` default to 4. Trinity's attention gate and both models' router weights retain their original precision. Routing correction biases are used in FP32. GLM is exported for standard generation without MTP speculative decoding.
+
+In the separate vLLM and EvalScope environments, use the matching script directory in both terminals:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 TENSOR_PARALLEL_SIZE=2 MODEL_VARIANT=FQ \
+  MAX_PRUNE_RATIO=0.15 BPE=2.0 WBITS=0,2,3 FINETUNE=true RFT_TRAINER=roco RFT_LR=3e-3 \
+  bash "$SCRIPTS/serve_vllm.sh"
+```
+
+```bash
+DATASETS="math_500" bash "$SCRIPTS/eval_vllm.sh"
+```
+
+Set `FQ_MODEL_PATH` to serve a specific saved model, including one written to a custom `SAVE_PATH`.
 
 ## License
 

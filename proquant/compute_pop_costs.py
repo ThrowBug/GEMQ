@@ -6,12 +6,13 @@ import os
 from datetime import datetime, timezone
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, logging
+from transformers import AutoTokenizer, logging
 
 from proquant.expert_costs import compute_qwen3_expert_costs
 from proquant.utils.data_utils import get_calib_loader
 from proquant.utils.expert_cost_utils import impute_zero_frequency_costs
-from proquant.utils.model_utils import ModelType, NAME_TO_MODEL
+from proquant.utils.hf_loading import load_causal_lm_checkpoint
+from proquant.utils.model_utils import EXTENDED_MOE_TYPES, RELEASE_MOE_TYPES, NAME_TO_MODEL, get_model_info
 
 
 logging.set_verbosity_error()
@@ -51,7 +52,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Compute the mean or sum over Top-K-selected tokens of "
-            "g[l,i](x) ||f[l,i](x)-f_b[l,i](x)||_2 for Qwen3.5-MoE."
+            "g[l,i](x) ||f[l,i](x)-f_b[l,i](x)||_2 for supported MoE models."
         )
     )
     parser.add_argument("--model", required=True)
@@ -108,8 +109,8 @@ def parse_args(argv=None):
 def _validate_args(args):
     if args.model_name not in NAME_TO_MODEL:
         raise ValueError(f"Unknown --model_name: {args.model_name}")
-    if NAME_TO_MODEL[args.model_name] != ModelType.QWEN35MOE:
-        raise ValueError("PoP expert-cost collection supports Qwen3.5-MoE only.")
+    if NAME_TO_MODEL[args.model_name] not in RELEASE_MOE_TYPES:
+        raise ValueError("PoP expert-cost collection supports Qwen3.5, GLM-4.7-Flash and Trinity-Mini.")
     if args.average_bits > 16:
         raise ValueError("--average_bits must be at most 16.")
     if args.seed < 0:
@@ -136,15 +137,16 @@ def main(argv=None):
     if not torch.cuda.is_available():
         raise RuntimeError("Expert-cost collection requires a CUDA-capable PyTorch.")
 
+    extended_model = NAME_TO_MODEL[args.model_name] in EXTENDED_MOE_TYPES
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model, use_fast=args.use_fast, trust_remote_code=True
+        args.model, use_fast=args.use_fast, trust_remote_code=not extended_model
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model = load_causal_lm_checkpoint(
         args.model,
-        device_map="cpu",
-        torch_dtype=args.model_dtype,
+        model_dtype=args.model_dtype,
         attn_implementation=args.attn_impl,
         trust_remote_code=True,
+        model_name=args.model_name,
     )
     model.eval()
     model.seqlen = args.seqlen
@@ -196,6 +198,8 @@ def main(argv=None):
             ),
             "counts_definition": "number of tokens whose Top-K contains expert i",
             "routing_weight_definition": (
+                "native sigmoid Top-K weight after renormalization and route scaling"
+                if extended_model else
                 "softmax router probability after optional Top-K renormalization"
             ),
             "quantizer": "MCMoeRTN block-wise weight-only fake quantization",
@@ -207,6 +211,9 @@ def main(argv=None):
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
         },
     }
+    if extended_model:
+        info = get_model_info(args.model_name)
+        artifact["metadata"]["layer_ids"] = list(range(info.first_k_dense_layers, info.num_layers))
 
     output_dir = os.path.dirname(os.path.abspath(args.output_path))
     os.makedirs(output_dir, exist_ok=True)
