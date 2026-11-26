@@ -7,6 +7,7 @@ from scipy.optimize import Bounds, LinearConstraint, milp
 
 
 PMQ_CANDIDATE_BITS = (1, 2, 3)
+PMQ_SUPPORTED_CANDIDATE_BITS = (PMQ_CANDIDATE_BITS, (2, 3))
 
 
 def _as_nonnegative_vector(value, *, label, expected_size=None):
@@ -48,10 +49,11 @@ class PMQSolver:
     ):
         if backend not in ("highs", "gurobi"):
             raise ValueError(f"Unknown ILP backend: {backend!r}.")
-        if tuple(candidate_bits) != PMQ_CANDIDATE_BITS:
+        candidate_bits = tuple(candidate_bits)
+        if candidate_bits not in PMQ_SUPPORTED_CANDIDATE_BITS:
             raise ValueError(
-                "Source-faithful PMQ requires candidate_bits=(1, 2, 3); "
-                f"got {tuple(candidate_bits)!r}."
+                "PMQ requires candidate_bits=(1, 2, 3) or (2, 3); "
+                f"got {candidate_bits!r}."
             )
         for name, value in (("alpha", alpha), ("beta", beta), ("gama", gama)):
             if not math.isfinite(value) or value < 0:
@@ -60,13 +62,13 @@ class PMQSolver:
         self.act_counts = act_counts
         self.act_weights = act_weights
         self.quant_loss = quant_loss
-        self.candidate_bits = tuple(candidate_bits)
+        self.candidate_bits = candidate_bits
         self.alpha = float(alpha)
         self.beta = float(beta)
         self.gama = float(gama)
         self.backend = backend
 
-        self.layer_ids, self.num_experts = self._validate_stats()
+        self.layer_ids, self.num_experts, self.statistics_candidate_bits = self._validate_stats()
         self.coefficients = self._build_coefficients()
         self.last_objective = None
         self.used_bits_per_layer = None
@@ -106,6 +108,7 @@ class PMQSolver:
 
         expected_experts = set(range(num_experts))
         expected_bits = set(self.candidate_bits)
+        common_stat_bits = None
         for layer_id in layer_ids:
             counts = _as_nonnegative_vector(
                 self.act_counts[layer_id],
@@ -130,11 +133,15 @@ class PMQSolver:
                 )
             for expert_id in range(num_experts):
                 expert_loss = layer_loss[expert_id]
-                if not isinstance(expert_loss, Mapping) or set(expert_loss) != expected_bits:
+                if not isinstance(expert_loss, Mapping) or not expected_bits.issubset(expert_loss):
                     raise ValueError(
                         f"quant_loss[{layer_id}][{expert_id}] must contain bits "
                         f"{self.candidate_bits}."
                     )
+                if common_stat_bits is None:
+                    common_stat_bits = set(expert_loss)
+                else:
+                    common_stat_bits.intersection_update(expert_loss)
                 losses = _as_nonnegative_vector(
                     [expert_loss[bit] for bit in self.candidate_bits],
                     label=f"quant_loss[{layer_id}][{expert_id}]",
@@ -145,7 +152,7 @@ class PMQSolver:
                         f"quant_loss[{layer_id}][{expert_id}] contains non-finite values."
                     )
 
-        return layer_ids, num_experts
+        return layer_ids, num_experts, sorted(common_stat_bits)
 
     def _build_coefficients(self):
         coefficients = {}
@@ -291,10 +298,10 @@ class PMQSolver:
                 f"{bits_per_expert} * {self.num_experts} = {raw_budget}."
             )
 
-        min_feasible = self.num_experts * min(self.candidate_bits) + 3
-        # At least one expert must remain at 2-bit, so an all-3-bit layer is not
-        # feasible under the released PMQ constraints.
-        max_feasible = self.num_experts * max(self.candidate_bits) - 1
+        # Reserve one expert at each of 2 and 3 bits for the presence constraints.
+        free_experts = self.num_experts - 2
+        min_feasible = 5 + free_experts * min(self.candidate_bits)
+        max_feasible = 5 + free_experts * max(self.candidate_bits)
         if not min_feasible <= budget_per_layer <= max_feasible:
             raise ValueError(
                 f"Per-layer budget {budget_per_layer} is infeasible for "

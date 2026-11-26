@@ -9,12 +9,13 @@ model_name="Qwen/Qwen3-30B-A3B-Instruct-2507"
 nsamples="${NSAMPLES:-128}"
 seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
-candidate_bits="1,2,3"
+candidate_bits="${WBITS:-1,2,3}"
 bits_per_expert="${BITS_PER_EXPERT:-2.0}"
 backend="${ILP_BACKEND:-highs}"
 
 bpe_tag="$(printf '%.1f' "${bits_per_expert}")"
-stats_dir="${PMQ_STATS_DIR:-cache/${model_name}/PMQ/C4-N${nsamples}-L${seqlen}-Seed${seed}_B${candidate_bits}}"
+# Reuse the full PMQ statistics regardless of the candidates used in the ILP.
+stats_dir="${PMQ_STATS_DIR:-cache/${model_name}/PMQ/C4-N${nsamples}-L${seqlen}-Seed${seed}_B1,2,3}"
 bit_config="${PMQ_BIT_CONFIG:-configs/${model_name}/PMQ/C4-Seed${seed}_E${bpe_tag}_B${candidate_bits}.pkl}"
 
 for stats_file in experts_act_counts.pkl experts_act_weights.pkl experts_quant_loss.pkl; do

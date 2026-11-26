@@ -17,7 +17,7 @@ seqlen="${SEQLEN:-2048}"
 seed="${SEED:-0}"
 batch_size="${BATCH_SIZE:-1}"
 
-candidate_bits="1,2,3"
+candidate_bits="${WBITS:-1,2,3}"
 bits_per_expert="${BITS_PER_EXPERT:-2.0}"
 bpe_tag="$(printf '%.1f' "${bits_per_expert}")"
 attn_wbits=4

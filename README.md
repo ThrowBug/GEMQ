@@ -124,6 +124,14 @@ bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_allocate.sh
 bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_quantize.sh
 ```
 
+For the 2.5-bit PMQ ablation with only `{2,3}` as allocation candidates,
+reuse the `{1,2,3}` statistics from `pmq_compute_stats.sh`:
+
+```bash
+WBITS=2,3 BITS_PER_EXPERT=2.5 bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_allocate.sh
+WBITS=2,3 BITS_PER_EXPERT=2.5 bash scripts/Qwen3-30B-A3B-Instruct-2507/pmq_quantize.sh
+```
+
 By default, PMQ statistics are written below `cache/.../PMQ/`, the independent
 allocation and its JSON metadata below `configs/.../PMQ/`, and the loadable model
 below `results/fake_quant_models/.../PMQ/`. `MODEL`, `CUDA_VISIBLE_DEVICES`,

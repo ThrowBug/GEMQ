@@ -5,7 +5,11 @@ import os
 import os.path as osp
 import pickle
 
-from gemq.allocation.pmq_solver import PMQ_CANDIDATE_BITS, PMQSolver
+from gemq.allocation.pmq_solver import (
+    PMQ_CANDIDATE_BITS,
+    PMQ_SUPPORTED_CANDIDATE_BITS,
+    PMQSolver,
+)
 from gemq.utils.model_utils import get_model_info
 
 
@@ -30,9 +34,9 @@ def _parse_candidate_bits(value):
         raise argparse.ArgumentTypeError(
             f"Candidate bits must be comma-separated integers, got {value!r}."
         ) from error
-    if bits != PMQ_CANDIDATE_BITS:
+    if bits not in PMQ_SUPPORTED_CANDIDATE_BITS:
         raise argparse.ArgumentTypeError(
-            "Source-faithful PMQ requires --bit_candidates 1,2,3."
+            "PMQ --bit_candidates must be 1,2,3 or 2,3."
         )
     return bits
 
@@ -83,11 +87,11 @@ def run(args):
                 f"metadata has {stats_metadata.get('model_name')!r}, "
                 f"CLI requested {args.model_name!r}."
             )
-        if tuple(stats_metadata.get("candidate_bits", ())) != tuple(args.bit_candidates):
+        stats_bits = stats_metadata.get("candidate_bits", [])
+        if not set(args.bit_candidates).issubset(stats_bits):
             raise ValueError(
-                "PMQ statistics candidate-bit mismatch: "
-                f"metadata has {stats_metadata.get('candidate_bits')!r}, "
-                f"CLI requested {args.bit_candidates!r}."
+                f"PMQ statistics candidate-bit mismatch: metadata {stats_bits!r} "
+                f"does not cover requested candidates {args.bit_candidates!r}."
             )
     stats = {key: _load_pickle(path) for key, path in stat_paths.items()}
     solver = PMQSolver(
@@ -142,6 +146,7 @@ def run(args):
             stats_metadata_path if stats_metadata is not None else None
         ),
         "statistics_metadata": stats_metadata,
+        "statistics_candidate_bits": solver.statistics_candidate_bits,
         "candidate_bits": list(args.bit_candidates),
         "target_bits_per_expert": args.bits_per_expert,
         "actual_bits_per_expert": actual_bpe,
