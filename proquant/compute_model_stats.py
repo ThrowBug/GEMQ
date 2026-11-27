@@ -106,8 +106,10 @@ def compute_layer_grads(model, dataloader, args):
         )
         handles.append(handle)
 
-    is_glm = NAME_TO_MODEL[args.model_name] == ModelType.GLM4MOELITE
-    if is_glm:
+    model_type = NAME_TO_MODEL[args.model_name]
+    freeze_weights = model_type in LAYER_RE_EXTENSION_TYPES
+    loss_kwargs = {"output_router_logits": False} if model_type == ModelType.MIXTRAL else {}
+    if freeze_weights:
         # Only activation gradients enter Layer-RE. Keep the weights frozen
         # and give autograd an input activation to differentiate through.
         params = [(p, p.requires_grad) for p in model.parameters()]
@@ -121,12 +123,12 @@ def compute_layer_grads(model, dataloader, args):
         model.zero_grad()
         for data in tqdm(dataloader, desc="Computing gradients"):
             x = data[0].to(input_device)
-            outputs = model(input_ids=x, labels=x)
+            outputs = model(input_ids=x, labels=x, **loss_kwargs)
             outputs.loss.backward()
     finally:
         for handle in handles:
             handle.remove()
-        if is_glm:
+        if freeze_weights:
             model.disable_input_require_grads()
             for param, requires_grad in params:
                 param.requires_grad_(requires_grad)
@@ -139,7 +141,7 @@ def compute_layer_grads(model, dataloader, args):
     os.makedirs(osp.dirname(osp.abspath(args.layer_grads_path)), exist_ok=True)
     print(f"Saving layer output gradients to: {args.layer_grads_path} ... ", end="")
     start = time.time()
-    torch.save(dict(layer_output_grads) if is_glm else layer_output_grads, args.layer_grads_path)
+    torch.save(dict(layer_output_grads) if freeze_weights else layer_output_grads, args.layer_grads_path)
     print(f"Done in {(time.time() - start)/60:.2f} minutes")
     print("Layer output gradients saved to:", args.layer_grads_path)
 
@@ -170,7 +172,7 @@ def compute_faster_layer_re(model, dataloader, args, *, device="cuda"):
     model_name = args.model_name
     model_type = NAME_TO_MODEL[model_name]
     layer_output_grads = torch.load(
-        args.layer_grads_path, weights_only=model_type == ModelType.GLM4MOELITE, map_location="cpu"
+        args.layer_grads_path, weights_only=model_type in LAYER_RE_EXTENSION_TYPES, map_location="cpu"
     )
     print(f"Done in {(time.time() - start)/60:.2f} minutes")
     # {0: (nsamples, 1, seqlen, hidden_size), 1: ...}
@@ -188,8 +190,8 @@ def compute_faster_layer_re(model, dataloader, args, *, device="cuda"):
     # Capture the first-layer activations. Qwen3.5 additionally needs the
     # per-layer masks produced by the model because attention types alternate.
     if model_type in PACKED_MOE_TYPES:
-        if model_type == ModelType.GLM4MOELITE and (fwd_bsz <= 0 or num_samples % fwd_bsz):
-            raise ValueError("For GLM Layer-RE, forward_batch_size must divide the number of calibration sequences.")
+        if model_type in LAYER_RE_EXTENSION_TYPES and (fwd_bsz <= 0 or num_samples % fwd_bsz):
+            raise ValueError("For Layer-RE, forward_batch_size must divide the number of calibration sequences.")
         calibration_batches = [
             enc[start:start + fwd_bsz, 0]
             for start in range(0, num_samples, fwd_bsz)
@@ -469,16 +471,16 @@ if __name__ == "__main__":
     model_type = NAME_TO_MODEL[args.model_name]
     if model_type == ModelType.TRINITY:
         raise ValueError("Trinity-Mini uses PoP statistics.")
-    if model_type == ModelType.GLM4MOELITE:
+    if model_type in LAYER_RE_EXTENSION_TYPES:
         if args.batch_size != 1:
-            raise ValueError("GLM Layer-RE requires calibration batch_size=1.")
+            raise ValueError("Layer-RE requires calibration batch_size=1.")
         if args.mode == "layer_re" and any(not 1 <= int(bit) <= 16 for bit in args.wbits.split(",")):
-            raise ValueError("GLM Layer-RE requires positive candidate bit-widths in [1, 16].")
+            raise ValueError("Layer-RE requires positive candidate bit-widths in [1, 16].")
 
     # load pre-trained model
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=args.use_fast)
     device_map = "auto" if args.mode == "layer_grads" else "cpu"
-    if model_type == ModelType.GLM4MOELITE:
+    if model_type in LAYER_RE_EXTENSION_TYPES:
         model = load_causal_lm_checkpoint(
             args.model, model_dtype=args.model_dtype, attn_implementation=args.attn_impl,
             device_map=device_map, model_name=args.model_name,

@@ -12,7 +12,7 @@ from proquant.expert_costs import compute_qwen3_expert_costs
 from proquant.utils.data_utils import get_calib_loader
 from proquant.utils.expert_cost_utils import impute_zero_frequency_costs
 from proquant.utils.hf_loading import load_causal_lm_checkpoint
-from proquant.utils.model_utils import EXTENDED_MOE_TYPES, RELEASE_MOE_TYPES, NAME_TO_MODEL, get_model_info
+from proquant.utils.model_utils import EXTENDED_MOE_TYPES, RELEASE_MOE_TYPES, ModelType, NAME_TO_MODEL, get_model_info
 
 
 logging.set_verbosity_error()
@@ -110,7 +110,7 @@ def _validate_args(args):
     if args.model_name not in NAME_TO_MODEL:
         raise ValueError(f"Unknown --model_name: {args.model_name}")
     if NAME_TO_MODEL[args.model_name] not in RELEASE_MOE_TYPES:
-        raise ValueError("PoP expert-cost collection supports Qwen3.5, GLM-4.7-Flash and Trinity-Mini.")
+        raise ValueError(f"PoP expert-cost collection is unsupported for {args.model_name!r}.")
     if args.average_bits > 16:
         raise ValueError("--average_bits must be at most 16.")
     if args.seed < 0:
@@ -137,7 +137,8 @@ def main(argv=None):
     if not torch.cuda.is_available():
         raise RuntimeError("Expert-cost collection requires a CUDA-capable PyTorch.")
 
-    extended_model = NAME_TO_MODEL[args.model_name] in EXTENDED_MOE_TYPES
+    model_type = NAME_TO_MODEL[args.model_name]
+    extended_model = model_type in EXTENDED_MOE_TYPES
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, use_fast=args.use_fast, trust_remote_code=not extended_model
     )
@@ -199,7 +200,7 @@ def main(argv=None):
             "counts_definition": "number of tokens whose Top-K contains expert i",
             "routing_weight_definition": (
                 "native sigmoid Top-K weight after renormalization and route scaling"
-                if extended_model else
+                if model_type in {ModelType.GLM4MOELITE, ModelType.TRINITY} else
                 "softmax router probability after optional Top-K renormalization"
             ),
             "quantizer": "MCMoeRTN block-wise weight-only fake quantization",

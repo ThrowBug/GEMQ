@@ -11,7 +11,7 @@ from proquant.allocation.ilp_solvers import (
     PoPSolver,
     GEMQSolver,
 )
-from proquant.utils.model_utils import ModelType, NAME_TO_MODEL, get_model_info
+from proquant.utils.model_utils import LAYER_RE_EXTENSION_TYPES, ModelType, NAME_TO_MODEL, get_model_info
 
 
 ALLOCATION_METRICS = ("layer_re", "pop")
@@ -60,7 +60,7 @@ def parse_bit_candidates(value):
 def compute_total_bits(model_name, bpe, bit_cands):
     """Compute the Layer-RE global budget for each model's expert convention."""
     m = get_model_info(model_name)
-    if NAME_TO_MODEL[model_name] == ModelType.GLM4MOELITE:
+    if NAME_TO_MODEL[model_name] in LAYER_RE_EXTENSION_TYPES:
         return math.floor(bpe * m.num_routed_experts_per_layer * (m.num_layers - m.first_k_dense_layers) + 1e-12)
     bpl = (
         bpe * (m.num_routed_experts_per_layer + m.num_shared_experts_per_layer)
@@ -112,8 +112,8 @@ def run_solver(args):
         model_type = NAME_TO_MODEL[args.model_name]
         if model_type == ModelType.TRINITY:
             raise ValueError("Trinity-Mini uses PoP allocation.")
-        if model_type == ModelType.GLM4MOELITE and 0 in bit_cands:
-            raise ValueError("GLM Layer-RE uses positive bit-widths. Use PoP for zero-bit pruning.")
+        if model_type in LAYER_RE_EXTENSION_TYPES and 0 in bit_cands:
+            raise ValueError("Layer-RE uses positive bit-widths. Use PoP for zero-bit pruning.")
         if not args.layer_re_path:
             raise ValueError("--layer_re_path is required when --allocation_metric=layer_re")
         if args.pop_cost_path:
@@ -127,13 +127,13 @@ def run_solver(args):
             start_layer_idx=m.first_k_dense_layers,
             backend=args.ilp_backend,
         )
-        if model_type == ModelType.GLM4MOELITE:
+        if model_type in LAYER_RE_EXTENSION_TYPES:
             expected_layers = set(range(m.first_k_dense_layers, m.num_layers))
             expected_experts = set(range(m.num_routed_experts_per_layer))
             if set(global_solver.coef) != expected_layers or any(
                 set(costs) != expected_experts for costs in global_solver.coef.values()
             ):
-                raise ValueError("GLM Layer-RE cost file must cover all routed experts in layers 1–46.")
+                raise ValueError(f"Layer-RE cost file must cover all routed experts for {args.model_name}.")
     else:
         if not args.pop_cost_path:
             raise ValueError(

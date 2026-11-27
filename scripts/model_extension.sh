@@ -9,6 +9,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 case "$model_name" in
     zai-org/GLM-4.7-Flash) service_name=glm-4.7-flash ;;
     arcee-ai/Trinity-Mini) service_name=trinity-mini ;;
+    mistralai/Mixtral-8x7B-v0.1) service_name=mixtral-8x7b-v0.1 ;;
     *) echo "Unsupported model: $model_name" >&2; exit 2 ;;
 esac
 
@@ -58,11 +59,11 @@ if [[ "$stage" == allocate || "$stage" == quantize ||
             max_prune_ratio="${MAX_PRUNE_RATIO:-0.25}"
             ;;
         layer_re)
-            [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "Trinity-Mini uses PoP allocation."
+            [[ "$model_name" != arcee-ai/Trinity-Mini ]] || die "Trinity-Mini uses PoP allocation."
             wbits="${WBITS:-1,2,3}"
             extra_constr="${EXTRA_CONSTR:-c2c3}"
             [[ "$extra_constr" == none || "$extra_constr" == c2c3 ]] || die "EXTRA_CONSTR must be none or c2c3."
-            [[ ",$wbits," != *,0,* ]] || die "GLM Layer-RE requires positive candidate bit-widths."
+            [[ ",$wbits," != *,0,* ]] || die "Layer-RE requires positive candidate bit-widths."
             ;;
         *) die "ALLOCATION_METRIC must be pop or layer_re." ;;
     esac
@@ -134,10 +135,13 @@ if [[ "$stage" == quantize ||
         true)
             case "$rft_trainer" in
                 roco) ;;
-                direct_rmsnorm|router_ft)
+                router_ft)
+                    [[ "$model_name" != arcee-ai/Trinity-Mini ]] || die "Trinity-Mini supports only RoCo fine-tuning."
+                    ;;
+                direct_rmsnorm)
                     [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "$rft_trainer requires GLM-4.7-Flash."
                     ;;
-                *) die "Unknown RFT_TRAINER=$rft_trainer. Use roco, or direct_rmsnorm/router_ft for GLM." ;;
+                *) die "Unknown RFT_TRAINER=$rft_trainer." ;;
             esac
             lr_tag="$(python -c 'from decimal import Decimal; import sys; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "$lr")"
             rft_tag="_RFT-${rft_trainer}-lr${lr_tag}"
@@ -151,9 +155,9 @@ fi
 
 case "$stage" in
     compute_stats)
-        [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "Trinity-Mini uses PoP statistics."
+        [[ "$model_name" != arcee-ai/Trinity-Mini ]] || die "Trinity-Mini uses PoP statistics."
         wbits="${WBITS:-1,2,3}"
-        [[ ",$wbits," != *,0,* ]] || die "GLM Layer-RE requires positive candidate bit-widths."
+        [[ ",$wbits," != *,0,* ]] || die "Layer-RE requires positive candidate bit-widths."
         gpus="${CUDA_VISIBLE_DEVICES:-0,1,2}"
         layer_grads_path="${LAYER_GRADS_PATH:-cache/${model_name}/LayerGrads_${sample_tag}.pt}"
         layer_re_path="${LAYER_RE_PATH:-cache/${model_name}/LayerRE_${sample_tag}_B${wbits}_fast.pkl}"

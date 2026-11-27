@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from proquant.quantizers.rtn import MCMoeRTNWeightQuantizer
-from proquant.utils.extended_moe import glm_topk_routes, trinity_topk_routes
+from proquant.utils.extended_moe import glm_topk_routes, mixtral_topk_routes, trinity_topk_routes
 from proquant.utils.model_utils import (
     ModelType,
     NAME_TO_MODEL,
@@ -563,6 +563,7 @@ def compute_qwen3_expert_costs(
     counts = torch.zeros((len(moe_layer_ids), num_experts), dtype=torch.long)
     route_tokens = {
         ModelType.GLM4MOELITE: glm_topk_routes,
+        ModelType.MIXTRAL: mixtral_topk_routes,
         ModelType.TRINITY: trinity_topk_routes,
     }.get(model_type, _qwen3_topk_routes)
 

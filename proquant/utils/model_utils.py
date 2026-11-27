@@ -65,9 +65,10 @@ class ModelType(Enum):
     TRINITY = auto()
 
 
-EXTENDED_MOE_TYPES = {ModelType.GLM4MOELITE, ModelType.TRINITY}
+EXTENDED_MOE_TYPES = {ModelType.GLM4MOELITE, ModelType.TRINITY, ModelType.MIXTRAL}
 RELEASE_MOE_TYPES = EXTENDED_MOE_TYPES | {ModelType.QWEN35MOE}
-PACKED_MOE_TYPES = {ModelType.QWEN35MOE, ModelType.GLM4MOELITE}
+PACKED_MOE_TYPES = {ModelType.QWEN35MOE, ModelType.GLM4MOELITE, ModelType.MIXTRAL}
+LAYER_RE_EXTENSION_TYPES = {ModelType.GLM4MOELITE, ModelType.MIXTRAL}
     
 
 class LinearModuleType(Enum):
@@ -259,6 +260,7 @@ def dispatch_model_to_all_devices(model, cuda_diagnostics=False):
     native_decoder = {
         "glm4_moe_lite": "Glm4MoeLiteDecoderLayer",
         "afmoe": "AfmoeDecoderLayer",
+        "mixtral": "MixtralDecoderLayer",
     }.get(model.config.model_type)
     balance_kwargs = {"no_split_module_classes": [native_decoder]} if native_decoder else {}
     device_map = infer_auto_device_map(
@@ -425,9 +427,7 @@ def get_moe_block(layer, model_name):
     Get the MoE block from a decoder layer.
     """
     model_type = NAME_TO_MODEL[model_name]
-    if model_type == ModelType.MIXTRAL:
-        moe_block = layer.block_sparse_moe
-    elif model_type == ModelType.DEEPSEEKV2:
+    if model_type == ModelType.DEEPSEEKV2:
         moe_block = layer.mlp
     elif model_type == ModelType.OLMOE:
         moe_block = layer.mlp
@@ -445,7 +445,7 @@ def get_shared_expert_block(moe_block, model_name):
     Get the shared expert FFN from a moe block.
     """
     model_type = NAME_TO_MODEL[model_name]
-    if model_type == ModelType.DEEPSEEKV2 or model_type in EXTENDED_MOE_TYPES:
+    if model_type in {ModelType.DEEPSEEKV2, ModelType.GLM4MOELITE, ModelType.TRINITY}:
         shared_expert = moe_block.shared_experts
     elif model_type == ModelType.QWEN35MOE:
         shared_expert = moe_block.shared_expert
@@ -486,6 +486,7 @@ def get_module_type(module_name, model_name):
                 "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
             },
             ModelType.TRINITY: {"q_proj", "k_proj", "v_proj", "o_proj"},
+            ModelType.MIXTRAL: {"q_proj", "k_proj", "v_proj", "o_proj"},
         }[model_type]
         if module_name.startswith("self_attn.") and module_name.removeprefix("self_attn.") in attention_targets:
             return LinearModuleType.SOFTMAX_ATTN
@@ -508,16 +509,6 @@ def get_module_type(module_name, model_name):
             mtype = LinearModuleType.ATTN
         else:
             mtype = LinearModuleType.DENSE
-
-    elif model_type == ModelType.MIXTRAL:
-        if "attn" in module_name:
-            mtype = LinearModuleType.ATTN
-        elif "gate" in module_name:
-            mtype = LinearModuleType.GATE
-        elif "experts" in module_name:
-            mtype = LinearModuleType.EXPERT
-        else:
-            mtype = LinearModuleType.OTHERS
 
     elif model_type == ModelType.DEEPSEEKV2:
         if "attn" in module_name:
@@ -596,9 +587,7 @@ def get_all_expert_names(model_name):
     """
     model_type = NAME_TO_MODEL[model_name]
     model_info = get_model_info(model_name)
-    if model_type == ModelType.MIXTRAL:
-        all_expert_names = [f"block_sparse_moe.experts.{i}" for i in range(model_info.num_routed_experts_per_layer)]
-    elif model_type == ModelType.DEEPSEEKV2:
+    if model_type == ModelType.DEEPSEEKV2:
         all_expert_names = [f"mlp.experts.{i}" for i in range(model_info.num_routed_experts_per_layer)] + ["mlp.shared_experts"]
     elif model_type == ModelType.OLMOE:
         all_expert_names = [f"mlp.experts.{i}" for i in range(model_info.num_routed_experts_per_layer)]
@@ -726,8 +715,8 @@ def capture_qwen35_decoder_context(model, batches, model_name, device="cuda"):
             # embeddings and a 2048x2048 causal mask for every sample/layer would
             # otherwise consume many gigabytes of host memory.
             context_key = getattr(self, "layer_type", getattr(self, "attention_type", self.layer_idx))
-            if model_type == ModelType.GLM4MOELITE:
-                context_key = "full_attention"
+            if model_type in {ModelType.GLM4MOELITE, ModelType.MIXTRAL}:
+                context_key = "uniform_attention"
             if context_key not in context_by_layer_type:
                 context_by_layer_type[context_key] = (
                     _tree_to_cpu(args),
@@ -856,30 +845,24 @@ def compute_gate_stats_hook_mixtral(m, x, y, inps, outs, weights, counts):
     """
     assert isinstance(m, MixtralSparseMoeBlock)
 
-    hidden_states = x[0]  # (bsz, seqlen, hidden_size)
-    final_hidden_states = y[0]  # (bsz, seqlen, hidden_size)
-    router_logits = y[1]  # (bsz * sequence_length, n_experts)
-    
-    # compute gate outputs
-    # routing_weights:  (batch * sequence_length, topk)
-    # selected_experts: (batch * sequence_length, topk)
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, m.top_k, dim=-1)
+    router_probs, _, selected_experts = m.gate(x[0])
+    # This legacy frequency statistic uses weights before Top-K renormalization.
+    routing_weights = router_probs.gather(1, selected_experts)
 
     # compute weights
-    actw = torch.zeros(m.num_experts, device=router_logits.device)
+    actw = torch.zeros(m.gate.num_experts, device=router_probs.device)
     actw.scatter_add_(0, selected_experts.view(-1), routing_weights.view(-1))
     weights.append(actw.to("cpu"))
 
     # compute counts
-    actc = torch.zeros(m.num_experts, dtype=torch.long, device=router_logits.device)
-    ones = torch.ones_like(selected_experts.view(-1), device=router_logits.device)
+    actc = torch.zeros(m.gate.num_experts, dtype=torch.long, device=router_probs.device)
+    ones = torch.ones_like(selected_experts.view(-1))
     actc.scatter_add_(0, selected_experts.view(-1), ones)
     counts.append(actc.to("cpu"))
 
     # save inputs and outputs
     inps.append(x[0])  # (bsz, seqlen, hidden_size)
-    outs.append(y[0])  # (bsz, seqlen, hidden_size)
+    outs.append(y)  # (bsz, seqlen, hidden_size)
 
 
 def compute_gate_stats_hook_deepseekmoe(m, x, y, inps, outs, weights, counts):

@@ -1,4 +1,4 @@
-"""Native Transformers routing and precision rules for GLM and Trinity."""
+"""Native Transformers routing and precision rules for model extensions."""
 
 import torch
 
@@ -6,6 +6,7 @@ import torch
 NATIVE_MODEL_TYPES = {
     "zai-org/GLM-4.7-Flash": "glm4_moe_lite",
     "arcee-ai/Trinity-Mini": "afmoe",
+    "mistralai/Mixtral-8x7B-v0.1": "mixtral",
 }
 
 
@@ -18,10 +19,15 @@ def trinity_topk_routes(moe, hidden_states):
     return indices, weights
 
 
+def mixtral_topk_routes(moe, hidden_states):
+    _, weights, indices = moe.gate(hidden_states)
+    return indices, weights
+
+
 def routing_biases(model):
     """Yield the frozen correction biases, skipping dense decoder layers."""
     model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type not in NATIVE_MODEL_TYPES.values():
+    if model_type not in {"afmoe", "glm4_moe_lite"}:
         return
     for layer in model.model.layers:
         if not hasattr(layer.mlp, "experts"):

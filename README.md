@@ -1,6 +1,6 @@
 # ProQuant
 
-This branch supports ProQuant on **Qwen3.5-35B-A3B**, **GLM-4.7-Flash**, and **Trinity-Mini** with Transformers 5.2.0. To reproduce Qwen3-30B-A3B-Instruct-2507, use the Qwen3 release branch and a separate Conda environment.
+This branch supports ProQuant on **Qwen3.5-35B-A3B**, **GLM-4.7-Flash**, **Trinity-Mini**, and **Mixtral-8x7B-v0.1** with Transformers 5.2.0. To reproduce Qwen3-30B-A3B-Instruct-2507, use the Qwen3 release branch and a separate Conda environment.
 
 ## Setup
 
@@ -115,12 +115,12 @@ VLLM_HOST=127.0.0.1 \
   bash scripts/Qwen3.5-35B-A3B/eval_vllm.sh
 ```
 
-## GLM-4.7-Flash and Trinity-Mini
+## GLM-4.7-Flash, Trinity-Mini, and Mixtral-8x7B-v0.1
 
-Use the same quantization environment and C4 calibration file. Select `GLM-4.7-Flash` or `Trinity-Mini` below. The launchers use the Qwen3.5 PoP and RoCo parameters and infer the paths for each stage. Set `MODEL` consistently if you use a local checkpoint.
+Use the same quantization environment and C4 calibration file. Select a model's script directory below. The launchers use the Qwen3.5 PoP and RoCo parameters and infer the paths for each stage. Set `MODEL` consistently if you use a local checkpoint.
 
 ```bash
-SCRIPTS=scripts/GLM-4.7-Flash  # or scripts/Trinity-Mini
+SCRIPTS=scripts/GLM-4.7-Flash  # or scripts/Trinity-Mini or scripts/Mixtral-8x7B-v0.1
 
 AVERAGE_BITS=2 CANDIDATE_BITS=0,2,3 \
   bash "$SCRIPTS/compute_pop_costs.sh"
@@ -137,7 +137,9 @@ CUDA_VISIBLE_DEVICES=0,1 MAX_PRUNE_RATIO=0.15 BPE=2.0 WBITS=0,2,3 \
 bash "$SCRIPTS/eval_ppl.sh" /path/to/quantized/model
 ```
 
-Use `POP_COST_PATH`, `BIT_CFG_PATH`, and `GPTQ_CHECKPOINT_PATH` to select specific files. `SOFTMAX_ATTN_WBITS` and `DENSE_WBITS` default to 4. Trinity's attention gate and both models' router weights retain their original precision. Routing correction biases are used in FP32. GLM is exported for standard generation without MTP speculative decoding.
+Use `POP_COST_PATH`, `BIT_CFG_PATH`, and `GPTQ_CHECKPOINT_PATH` to select specific files. Attention projections default to 4 bits. `DENSE_WBITS` defaults to 4 for models with a dense FFN or shared experts. Trinity's attention gate and router weights retain their original precision. Routing correction biases are used in FP32. GLM is exported for standard generation without MTP speculative decoding.
+
+Mixtral has eight routed experts per layer. For PoP with `WBITS=0,2,3` at `BPE=1.5`, set `MAX_PRUNE_RATIO=0.25` or higher in allocation, quantization, and serving.
 
 For GLM, `RFT_TRAINER=direct_rmsnorm` updates only the decoder `input_layernorm` and `post_attention_layernorm` weights with the same teacher loss. You can reuse the GPTQ checkpoint from above:
 
@@ -161,23 +163,25 @@ DATASETS="math_500" bash "$SCRIPTS/eval_vllm.sh"
 
 Use the same `RFT_TRAINER` and `RFT_LR` as in quantization for automatic model lookup. Set `FQ_MODEL_PATH` to serve a specific saved model, including one written to a custom `SAVE_PATH`.
 
-### GLM Layer-RE and Legacy CE
+### GLM and Mixtral Layer-RE and Legacy CE
 
-Layer-RE defaults to `WBITS=1,2,3` and applies the budget to the 64 routed experts in each of GLM's 46 MoE layers. `DENSE_WBITS` controls the shared experts and the first dense FFN separately. The stats script writes both the activation gradients and the Layer-RE coefficients.
+Layer-RE defaults to `WBITS=1,2,3` and `EXTRA_CONSTR=c2c3`. The budget applies to 64 routed experts in each of GLM's 46 MoE layers, or eight in each of Mixtral's 32 layers. The stats script writes both the activation gradients and the Layer-RE coefficients.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/GLM-4.7-Flash/compute_stats.sh
-ALLOCATION_METRIC=layer_re BITS_PER_EXPERT=2.0 bash scripts/GLM-4.7-Flash/allocate.sh
+SCRIPTS=scripts/Mixtral-8x7B-v0.1  # or scripts/GLM-4.7-Flash
+
+CUDA_VISIBLE_DEVICES=0,1,2 bash "$SCRIPTS/compute_stats.sh"
+ALLOCATION_METRIC=layer_re BITS_PER_EXPERT=2.0 bash "$SCRIPTS/allocate.sh"
 
 CUDA_VISIBLE_DEVICES=0,1 ALLOCATION_METRIC=layer_re BPE=2.0 \
-  FINETUNE=false SAVE_GPTQ_CHECKPOINT=true bash scripts/GLM-4.7-Flash/quantize.sh
+  FINETUNE=false SAVE_GPTQ_CHECKPOINT=true bash "$SCRIPTS/quantize.sh"
 
 CUDA_VISIBLE_DEVICES=0,1 ALLOCATION_METRIC=layer_re BPE=2.0 \
   FINETUNE=true RFT_TRAINER=router_ft RFT_LR=1e-4 \
-  LOAD_GPTQ_CHECKPOINT=true bash scripts/GLM-4.7-Flash/quantize.sh
+  LOAD_GPTQ_CHECKPOINT=true bash "$SCRIPTS/quantize.sh"
 
 CUDA_VISIBLE_DEVICES=0,1 MODEL_VARIANT=FQ ALLOCATION_METRIC=layer_re BPE=2.0 \
-  FINETUNE=true RFT_TRAINER=router_ft RFT_LR=1e-4 bash scripts/GLM-4.7-Flash/serve_vllm.sh
+  FINETUNE=true RFT_TRAINER=router_ft RFT_LR=1e-4 bash "$SCRIPTS/serve_vllm.sh"
 ```
 
 `router_ft` uses autoregressive CE without a teacher. You can also run it on a PoP GPTQ checkpoint by using `ALLOCATION_METRIC=pop` and the settings that produced that checkpoint.
