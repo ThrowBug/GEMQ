@@ -10,11 +10,17 @@ NORM_DISTILL_MODES = {
         "optimize_input_norm": True,
         "router_compensated": True,
     },
+    "direct_rmsnorm": {
+        "optimize_input_norm": True,
+        "router_compensated": False,
+        "direct_rmsnorm": True,
+    },
 }
 RFT_TRAINERS = (
     "router_ft",
     "norm_ft",
     "roco",
+    "direct_rmsnorm",
 )
 
 

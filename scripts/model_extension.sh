@@ -108,13 +108,20 @@ if [[ "$stage" == quantize ||
     legacy_allocation_name="$(basename "${BIT_CFG_PATH:-$legacy_bit_cfg}" .pkl)"
 
     finetune="${FINETUNE:-true}"
+    rft_trainer="${RFT_TRAINER:-roco}"
     lr="${RFT_LR:-1e-4}"
     rft_tag=""
     case "$finetune" in
         true)
-            [[ "${RFT_TRAINER:-roco}" == roco ]] || die "Only RoCo fine-tuning is supported."
+            case "$rft_trainer" in
+                roco) ;;
+                direct_rmsnorm)
+                    [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "direct_rmsnorm requires GLM-4.7-Flash."
+                    ;;
+                *) die "Unknown RFT_TRAINER=$rft_trainer. Use roco, or direct_rmsnorm for GLM." ;;
+            esac
             lr_tag="$(python -c 'from decimal import Decimal; import sys; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "$lr")"
-            rft_tag="_RFT-roco-lr${lr_tag}"
+            rft_tag="_RFT-${rft_trainer}-lr${lr_tag}"
             ;;
         false) ;;
         *) die "FINETUNE must be true or false." ;;
@@ -167,7 +174,7 @@ case "$stage" in
             *) die "Set at most one of SAVE_GPTQ_CHECKPOINT and LOAD_GPTQ_CHECKPOINT to true." ;;
         esac
         if [[ "$finetune" == true ]]; then
-            args+=(--finetune --rft_trainer roco --rft_lr "$lr" --rft_epochs "${RFT_EPOCHS:-1}"
+            args+=(--finetune --rft_trainer "$rft_trainer" --rft_lr "$lr" --rft_epochs "${RFT_EPOCHS:-1}"
                 --rft_batch_size "${RFT_BATCH_SIZE:-1}" --rft_wd "${RFT_WD:-0.0}"
                 --rft_teacher_cache_dir "${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}")
             if [[ "${RFT_REBUILD_TEACHER_CACHE:-false}" == true ]]; then

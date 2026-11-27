@@ -3,6 +3,7 @@
 import time
 
 import torch
+from torch.nn.utils import parametrize
 
 from proquant.router_finetune.losses import compute_causal_output_distill_ce
 from proquant.utils.extended_moe import cast_model_preserving_fp32
@@ -79,6 +80,17 @@ class ZeroCenteredNormScale(NormScale):
             )
         self.norm.weight.copy_(new_weight)
         return realized_scale
+
+
+class DirectRMSNormWeight(torch.nn.Module):
+    """Train gamma itself in FP32 and use the native weight dtype for forward."""
+
+    def __init__(self, weight):
+        super().__init__()
+        self.gamma = torch.nn.Parameter(weight.detach().to(dtype=torch.float32, copy=True))
+
+    def forward(self, original_weight):
+        return self.gamma.to(dtype=original_weight.dtype)
 
 
 class RouterCompensatedNorm(NormScale):
@@ -256,18 +268,11 @@ def finetune_norms_distill_ce(
     *,
     optimize_input_norm=False,
     router_compensated=True,
+    direct_rmsnorm=False,
 ):
-    """Tune selected norm scales jointly with teacher soft-label CE."""
+    """Tune selected norm scales or weights with teacher soft-label CE."""
     if teacher_targets.final_hidden_states is None:
         raise RuntimeError("Norm distillation requires teacher final hidden states.")
-
-    original_use_cache = model.config.use_cache
-    original_dtype = next(model.parameters()).dtype
-    model.config.use_cache = False
-    model.train()
-    cast_model_preserving_fp32(model, torch.bfloat16)
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
 
     input_ids = teacher_targets.input_ids
     attention_mask = teacher_targets.attention_mask
@@ -277,10 +282,29 @@ def finetune_norms_distill_ce(
         )
 
     model_type = NAME_TO_MODEL[args.model_name]
+    if direct_rmsnorm and (
+        model_type != ModelType.GLM4MOELITE or router_compensated or not optimize_input_norm
+    ):
+        raise ValueError("Direct RMSNorm tuning requires GLM with both decoder norms and no router compensation.")
+
+    original_use_cache = model.config.use_cache
+    original_dtype = next(model.parameters()).dtype
+    model.config.use_cache = False
+    model.train()
+    if not direct_rmsnorm:
+        cast_model_preserving_fp32(model, torch.bfloat16)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
     zero_centered = model_type == ModelType.QWEN35MOE
     controllers = []
     controller_groups = {"input": [], "post": []}
+    direct_weights = []
     for layer in get_blocks(model, args.model_name):
+        if direct_rmsnorm:
+            for norm in (layer.input_layernorm, layer.post_attention_layernorm):
+                direct_weights.append((norm, DirectRMSNormWeight(norm.weight)))
+            continue
         if optimize_input_norm:
             input_controller = (
                 ZeroCenteredNormScale(layer.input_layernorm)
@@ -309,19 +333,24 @@ def finetune_norms_distill_ce(
             )
         controllers.append(post_controller)
         controller_groups["post"].append(post_controller)
-    for controller in controllers:
-        controller.install()
-
     optimizer = torch.optim.AdamW(
-        [controller.delta for controller in controllers],
+        [weight.gamma for _, weight in direct_weights] if direct_rmsnorm
+        else [controller.delta for controller in controllers],
         lr=args.rft_lr,
         weight_decay=args.rft_wd,
     )
     input_device = model.get_input_embeddings().weight.device
     head_parameter = next(model.lm_head.parameters())
+    log_label = "direct rmsnorm" if direct_rmsnorm else "norm distill"
 
     completed = False
+    installed_norms = []
     try:
+        for controller in controllers:
+            controller.install()
+        for norm, weight in direct_weights:
+            parametrize.register_parametrization(norm, "weight", weight)
+            installed_norms.append(norm)
         for epoch in range(args.rft_epochs):
             started = time.time()
             loss_sum = 0.0
@@ -357,20 +386,26 @@ def finetune_norms_distill_ce(
                 steps += 1
                 if steps == 1 or steps % 32 == 0:
                     print(
-                        f"[norm distill | epoch {epoch} | step {steps - 1}] "
+                        f"[{log_label} | epoch {epoch} | step {steps - 1}] "
                         f"loss={loss_sum / steps:.6f}"
                     )
             print(
-                f"[norm distill | epoch {epoch}] loss={loss_sum / steps:.6f}, "
+                f"[{log_label} | epoch {epoch}] loss={loss_sum / steps:.6f}, "
                 f"elapsed={time.time() - started:.2f}s"
             )
+        if any(not torch.isfinite(norm.weight).all() for norm in installed_norms):
+            raise FloatingPointError("Direct RMSNorm tuning produced a non-finite weight.")
         completed = True
     finally:
         optimizer.zero_grad(set_to_none=True)
         for controller in controllers:
             controller.remove()
+        for norm in installed_norms:
+            parametrize.remove_parametrizations(norm, "weight", leave_parametrized=completed)
         model.config.use_cache = original_use_cache
 
+    if direct_rmsnorm:
+        return
     if completed:
         learned_scales = {
             id(controller): controller.delta.detach().exp()

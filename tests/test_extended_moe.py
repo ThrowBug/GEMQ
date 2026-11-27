@@ -8,6 +8,7 @@ from proquant.allocation.ilp_solvers import PoPSolver
 from proquant.expert_costs import compute_qwen3_expert_costs
 from proquant.pruning import kept_expert_ids_from_pruning_metadata, prune_zero_bit_experts
 from proquant.quantize import quantize_weights_gptq, save_quantized_model
+from proquant.router_finetune.config import NORM_DISTILL_MODES
 from proquant.router_finetune.norm_distill import RouterCompensatedNorm, finetune_norms_distill_ce
 from proquant.router_finetune.targets import TeacherTargets
 from proquant.utils.expert_cost_utils import impute_zero_frequency_costs
@@ -155,3 +156,39 @@ def test_roco_compensates_ffn_input_norm(tiny_model):
         controller.fold()
         after = router(known_norm(x).reshape(-1, 16))
     torch.testing.assert_close(after, before, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_direct_rmsnorm_only_changes_decoder_gamma(tiny_model, dtype, tmp_path):
+    name, model, _ = tiny_model
+    args = SimpleNamespace(
+        model_name=name, nsamples=2, rft_batch_size=1, rft_epochs=1, rft_lr=0.05, rft_wd=0.0,
+    )
+    mode = NORM_DISTILL_MODES["direct_rmsnorm"]
+    input_ids = torch.tensor([[2, 3, 5, 7], [3, 2, 8, 6]])
+    teacher = TeacherTargets(input_ids, None, None, torch.randn(2, 4, 16), {})
+    if name == "arcee-ai/Trinity-Mini":
+        with pytest.raises(ValueError, match="requires GLM"):
+            finetune_norms_distill_ce(model, teacher, args, **mode)
+        return
+
+    cast_model_preserving_fp32(model, dtype)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    finetune_norms_distill_ce(model, teacher, args, **mode)
+    after = model.state_dict()
+    assert before.keys() == after.keys()
+    assert all(before[key].dtype == after[key].dtype for key in before)
+    changed = {key for key in before if not torch.equal(before[key], after[key])}
+    expected = {
+        f"model.layers.{i}.{norm}.weight"
+        for i in range(model.config.num_hidden_layers)
+        for norm in ("input_layernorm", "post_attention_layernorm")
+    }
+    assert changed == expected
+
+    model.eval()
+    if dtype == torch.bfloat16:
+        tokenizer = SimpleNamespace(save_pretrained=lambda path: None)
+        save_quantized_model(model, tokenizer, tmp_path, "bfloat16", real_quant=False)
+        loaded = load_causal_lm_checkpoint(tmp_path, model_name=name)
+        torch.testing.assert_close(model(input_ids).logits, loaded(input_ids).logits, rtol=0, atol=0)

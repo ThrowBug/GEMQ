@@ -139,6 +139,14 @@ bash "$SCRIPTS/eval_ppl.sh" /path/to/quantized/model
 
 Use `POP_COST_PATH`, `BIT_CFG_PATH`, and `GPTQ_CHECKPOINT_PATH` to select specific files. `SOFTMAX_ATTN_WBITS` and `DENSE_WBITS` default to 4. Trinity's attention gate and both models' router weights retain their original precision. Routing correction biases are used in FP32. GLM is exported for standard generation without MTP speculative decoding.
 
+For GLM, `RFT_TRAINER=direct_rmsnorm` updates only the decoder `input_layernorm` and `post_attention_layernorm` weights with the same teacher loss. You can reuse the GPTQ checkpoint from above:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 MAX_PRUNE_RATIO=0.15 BPE=2.0 WBITS=0,2,3 \
+  FINETUNE=true RFT_TRAINER=direct_rmsnorm RFT_LR=3e-3 LOAD_GPTQ_CHECKPOINT=true \
+  bash scripts/GLM-4.7-Flash/quantize.sh
+```
+
 In the separate vLLM and EvalScope environments, use the matching script directory in both terminals:
 
 ```bash
@@ -151,7 +159,7 @@ CUDA_VISIBLE_DEVICES=0,1 TENSOR_PARALLEL_SIZE=2 MODEL_VARIANT=FQ \
 DATASETS="math_500" bash "$SCRIPTS/eval_vllm.sh"
 ```
 
-Set `FQ_MODEL_PATH` to serve a specific saved model, including one written to a custom `SAVE_PATH`.
+Use the same `RFT_TRAINER` and `RFT_LR` as in quantization for automatic model lookup. Set `FQ_MODEL_PATH` to serve a specific saved model, including one written to a custom `SAVE_PATH`.
 
 ## License
 

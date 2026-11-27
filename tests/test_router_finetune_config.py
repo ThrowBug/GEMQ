@@ -23,10 +23,15 @@ def _args(**overrides):
 
 
 def test_release_trainers_and_norm_modes():
-    assert RFT_TRAINERS == ("router_ft", "norm_ft", "roco")
+    assert RFT_TRAINERS == ("router_ft", "norm_ft", "roco", "direct_rmsnorm")
     assert NORM_DISTILL_MODES == {
         "norm_ft": {"optimize_input_norm": True, "router_compensated": False},
         "roco": {"optimize_input_norm": True, "router_compensated": True},
+        "direct_rmsnorm": {
+            "optimize_input_norm": True,
+            "router_compensated": False,
+            "direct_rmsnorm": True,
+        },
     }
 
 

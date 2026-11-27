@@ -663,7 +663,7 @@ def parse_args():
     parser.add_argument(
         "--rft_trainer", type=str, default="roco",
         choices=RFT_TRAINERS,
-        help="Post-quantization training: router CE, dual-norm distillation, or RoCo"
+        help="Post-quantization training: router CE, dual-norm distillation, RoCo, or direct GLM RMSNorm tuning"
     )
     parser.add_argument(
         "--rft_epochs", type=int, default=1,
@@ -746,8 +746,11 @@ if __name__ == "__main__":
     if model_type not in RELEASE_MOE_TYPES:
         raise ValueError("This release supports Qwen3.5, GLM-4.7-Flash and Trinity-Mini.")
     extended_model = model_type in EXTENDED_MOE_TYPES
-    if extended_model and args.finetune and args.rft_trainer != "roco":
-        raise ValueError("GLM-4.7-Flash and Trinity-Mini support only RoCo fine-tuning.")
+    if args.finetune:
+        if args.rft_trainer == "direct_rmsnorm" and model_type != ModelType.GLM4MOELITE:
+            raise ValueError("direct_rmsnorm fine-tuning is available for GLM-4.7-Flash only.")
+        if extended_model and args.rft_trainer not in {"roco", "direct_rmsnorm"}:
+            raise ValueError("Use roco for GLM-4.7-Flash or Trinity-Mini, or direct_rmsnorm for GLM only.")
     if args.real_quant:
         raise ValueError("This release supports pseudo-quantization only.")
     if args.gate_wbits != 16:
@@ -962,7 +965,7 @@ if __name__ == "__main__":
             print("Evaluating quantized model before norm distillation ...")
             if args.cuda_diagnostics:
                 report_cuda_diagnostics(
-                    "before router-compensated norm distillation", model=model
+                    f"before {args.rft_trainer} norm distillation", model=model
                 )
             evaluate_perplexity(
                 model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
@@ -978,8 +981,7 @@ if __name__ == "__main__":
                 model,
                 teacher_targets,
                 args,
-                optimize_input_norm=norm_mode["optimize_input_norm"],
-                router_compensated=norm_mode["router_compensated"],
+                **norm_mode,
             )
 
     # evaluate model
