@@ -11,7 +11,7 @@ from proquant.allocation.ilp_solvers import (
     PoPSolver,
     GEMQSolver,
 )
-from proquant.utils.model_utils import EXTENDED_MOE_TYPES, NAME_TO_MODEL, get_model_info
+from proquant.utils.model_utils import ModelType, NAME_TO_MODEL, get_model_info
 
 
 ALLOCATION_METRICS = ("layer_re", "pop")
@@ -58,8 +58,10 @@ def parse_bit_candidates(value):
 
 
 def compute_total_bits(model_name, bpe, bit_cands):
-    """Compute the legacy Layer-RE global budget, including shared experts."""
+    """Compute the Layer-RE global budget for each model's expert convention."""
     m = get_model_info(model_name)
+    if NAME_TO_MODEL[model_name] == ModelType.GLM4MOELITE:
+        return math.floor(bpe * m.num_routed_experts_per_layer * (m.num_layers - m.first_k_dense_layers) + 1e-12)
     bpl = (
         bpe * (m.num_routed_experts_per_layer + m.num_shared_experts_per_layer)
         - (max(0, m.num_shared_experts_per_layer - 1)) * max(bit_cands)
@@ -80,8 +82,6 @@ def _auto_save_path(args, source_path, bit_cands, solver):
     bc_str = ",".join(map(str, bit_cands))
     common = f"{calib_str}_Metric-{args.allocation_metric}"
     if args.allocation_metric == "layer_re":
-        if NAME_TO_MODEL[args.model_name] in EXTENDED_MOE_TYPES:
-            raise ValueError("GLM-4.7-Flash and Trinity-Mini use PoP allocation.")
         constraint_tag = "" if args.extra_constr == "none" else f"_{args.extra_constr}"
         filename = (
             f"{common}_E{args.bit_budget:.1f}_B{bc_str}"
@@ -109,6 +109,11 @@ def run_solver(args):
     bit_cands = parse_bit_candidates(args.bit_candidates)
 
     if args.allocation_metric == "layer_re":
+        model_type = NAME_TO_MODEL[args.model_name]
+        if model_type == ModelType.TRINITY:
+            raise ValueError("Trinity-Mini uses PoP allocation.")
+        if model_type == ModelType.GLM4MOELITE and 0 in bit_cands:
+            raise ValueError("GLM Layer-RE uses positive bit-widths. Use PoP for zero-bit pruning.")
         if not args.layer_re_path:
             raise ValueError("--layer_re_path is required when --allocation_metric=layer_re")
         if args.pop_cost_path:
@@ -122,6 +127,13 @@ def run_solver(args):
             start_layer_idx=m.first_k_dense_layers,
             backend=args.ilp_backend,
         )
+        if model_type == ModelType.GLM4MOELITE:
+            expected_layers = set(range(m.first_k_dense_layers, m.num_layers))
+            expected_experts = set(range(m.num_routed_experts_per_layer))
+            if set(global_solver.coef) != expected_layers or any(
+                set(costs) != expected_experts for costs in global_solver.coef.values()
+            ):
+                raise ValueError("GLM Layer-RE cost file must cover all routed experts in layers 1–46.")
     else:
         if not args.pop_cost_path:
             raise ValueError(

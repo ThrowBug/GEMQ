@@ -161,6 +161,27 @@ DATASETS="math_500" bash "$SCRIPTS/eval_vllm.sh"
 
 Use the same `RFT_TRAINER` and `RFT_LR` as in quantization for automatic model lookup. Set `FQ_MODEL_PATH` to serve a specific saved model, including one written to a custom `SAVE_PATH`.
 
+### GLM Layer-RE and Legacy CE
+
+Layer-RE defaults to `WBITS=1,2,3` and applies the budget to the 64 routed experts in each of GLM's 46 MoE layers. `DENSE_WBITS` controls the shared experts and the first dense FFN separately. The stats script writes both the activation gradients and the Layer-RE coefficients.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2 bash scripts/GLM-4.7-Flash/compute_stats.sh
+ALLOCATION_METRIC=layer_re BITS_PER_EXPERT=2.0 bash scripts/GLM-4.7-Flash/allocate.sh
+
+CUDA_VISIBLE_DEVICES=0,1 ALLOCATION_METRIC=layer_re BPE=2.0 \
+  FINETUNE=false SAVE_GPTQ_CHECKPOINT=true bash scripts/GLM-4.7-Flash/quantize.sh
+
+CUDA_VISIBLE_DEVICES=0,1 ALLOCATION_METRIC=layer_re BPE=2.0 \
+  FINETUNE=true RFT_TRAINER=router_ft RFT_LR=1e-4 \
+  LOAD_GPTQ_CHECKPOINT=true bash scripts/GLM-4.7-Flash/quantize.sh
+
+CUDA_VISIBLE_DEVICES=0,1 MODEL_VARIANT=FQ ALLOCATION_METRIC=layer_re BPE=2.0 \
+  FINETUNE=true RFT_TRAINER=router_ft RFT_LR=1e-4 bash scripts/GLM-4.7-Flash/serve_vllm.sh
+```
+
+`router_ft` uses autoregressive CE without a teacher. You can also run it on a PoP GPTQ checkpoint by using `ALLOCATION_METRIC=pop` and the settings that produced that checkpoint.
+
 ## License
 
 This repository is derived from [GEMQ](https://github.com/jndeng/GEMQ). The original copyright notice and MIT license are retained in [LICENSE](LICENSE), alongside the notice for Jiaqi Chen's additions. See [third-party notices](THIRD_PARTY_NOTICES.md) for inherited source attribution.

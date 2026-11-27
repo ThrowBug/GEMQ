@@ -4,10 +4,12 @@ import pytest
 import torch
 from transformers import AfmoeConfig, AfmoeForCausalLM, Glm4MoeLiteConfig, Glm4MoeLiteForCausalLM
 
+from proquant import allocate_bits
 from proquant.allocation.ilp_solvers import PoPSolver
+from proquant.compute_model_stats import compute_faster_layer_re, compute_layer_grads
 from proquant.expert_costs import compute_qwen3_expert_costs
 from proquant.pruning import kept_expert_ids_from_pruning_metadata, prune_zero_bit_experts
-from proquant.quantize import quantize_weights_gptq, save_quantized_model
+from proquant.quantize import finetune_routers, quantize_weights_gptq, save_quantized_model
 from proquant.router_finetune.config import NORM_DISTILL_MODES
 from proquant.router_finetune.norm_distill import RouterCompensatedNorm, finetune_norms_distill_ce
 from proquant.router_finetune.targets import TeacherTargets
@@ -15,7 +17,7 @@ from proquant.utils.expert_cost_utils import impute_zero_frequency_costs
 from proquant.utils.extended_moe import cast_model_preserving_fp32, routing_biases
 from proquant.utils.gptq_checkpoint import save_gptq_checkpoint
 from proquant.utils.hf_loading import load_causal_lm_checkpoint
-from proquant.utils.model_utils import capture_qwen35_decoder_context, get_router_module
+from proquant.utils.model_utils import ModelInfo, capture_qwen35_decoder_context, get_router_module
 
 
 @pytest.fixture(params=["zai-org/GLM-4.7-Flash", "arcee-ai/Trinity-Mini"])
@@ -56,6 +58,54 @@ def test_native_decoder_replay_matches_full_forward(tiny_model):
             x = layer(x, *args[0], **kwargs[0])
         actual = model.lm_head(model.model.norm(x))
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("tiny_model", ["zai-org/GLM-4.7-Flash"], indirect=True)
+def test_glm_layer_re_then_gptq_and_legacy_ce(tiny_model, tmp_path, monkeypatch):
+    name, model, first_moe = tiny_model
+    tokens = torch.tensor([[2, 3, 5, 7], [3, 2, 8, 6]])
+    batches = [(sample.unsqueeze(0), None) for sample in tokens]
+    cast_model_preserving_fp32(model, torch.bfloat16)
+    stats_args = SimpleNamespace(
+        model_name=name, layer_grads_path=str(tmp_path / "gradients.pt"),
+        layer_re_path=str(tmp_path / "LayerRE_c4-Seed0.pkl"), forward_batch_size=2,
+        wbits="1,2,3", blocksize=4,
+    )
+    compute_layer_grads(model, batches, stats_args)
+    grads = torch.load(stats_args.layer_grads_path)
+    assert set(grads) == {0, 1, 2}
+    assert all(grad.isfinite().all() and grad.count_nonzero() for grad in grads.values())
+    assert all(param.grad is None for param in model.parameters())
+    compute_faster_layer_re(model, batches, stats_args, device="cpu")
+
+    assert allocate_bits.compute_total_bits(name, 2.0, [1, 2, 3]) == 46 * 64 * 2
+    monkeypatch.setattr(allocate_bits, "get_model_info", lambda _: ModelInfo(3, 1, 6, 1, 2, False))
+    allocation, _ = allocate_bits.run_solver(SimpleNamespace(
+        model_name=name, allocation_metric="layer_re", bit_candidates="1,2,3",
+        layer_re_path=stats_args.layer_re_path, pop_cost_path=None, bit_budget=2.0,
+        extra_constr="c2c3", ilp_backend="highs", max_prune_ratio=0.25,
+        save_path=str(tmp_path / "allocation.pkl"),
+    ))
+    assert set(allocation) == {1, 2}
+    assert all(set(bits) == set(range(6)) and set(bits.values()) <= {1, 2, 3} for bits in allocation.values())
+    args = SimpleNamespace(
+        model_name=name, groupsize=4, blocksize=4, percdamp=0.01, mse=False,
+        actorder=False, static_groups=False, reproduce_mcmoe=False, verbose=False,
+        gate_wbits=16, softmax_attn_wbits=4, dense_wbits=4,
+        nsamples=2, rft_batch_size=2, rft_epochs=1, rft_lr=1e-2, rft_wd=0.0,
+    )
+    quantize_weights_gptq(model, batches, args, allocation, device="cpu")
+    with torch.no_grad():
+        for module, attr in routing_biases(model):
+            getattr(module, attr).add_(0.000123)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    finetune_routers(model, batches, args)
+    after = model.state_dict()
+    changed = {key for key in before if not torch.equal(before[key], after[key])}
+    expected = {f"model.layers.{i}.mlp.gate.weight" for i in range(first_moe, 3)}
+    assert changed and changed <= expected
+    for module, attr in routing_biases(model):
+        assert getattr(module, attr).dtype == torch.float32
 
 
 def test_pop_dense_prefix_and_pruned_checkpoint_round_trip(tiny_model, tmp_path):

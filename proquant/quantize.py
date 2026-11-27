@@ -256,8 +256,10 @@ def finetune_routers(model, dataloader, args):
     model.config.use_cache = False
     org_dtype = next(model.parameters()).dtype
 
+    is_glm = NAME_TO_MODEL[args.model_name] == ModelType.GLM4MOELITE
     model.train()
-    model = model.to(torch.bfloat16)
+    model = cast_model_preserving_fp32(model, torch.bfloat16) if is_glm else model.to(torch.bfloat16)
+    input_device = model.get_input_embeddings().weight.device if is_glm else "cuda"
 
     # prepare dataset
     input_ids = []
@@ -274,27 +276,38 @@ def finetune_routers(model, dataloader, args):
 
     # sanity check
     org_pmean, org_gmean = 0.0, 0.0
-    for name, param in model.named_parameters():
-        if get_module_type(name, args.model_name) == LinearModuleType.GATE:
-            org_gmean += param.mean().item()
-        else:
-            org_pmean += param.mean().item()
+    if is_glm:
+        # The native router is a module with one weight and a frozen FP32 buffer.
+        # Track parameters by identity instead of interpreting fully qualified names.
+        if not router_params:
+            raise RuntimeError("GLM legacy CE found no router weights to train.")
+        original_router_weights = [param.detach().to(device="cpu", copy=True) for param in router_params]
+    else:
+        for name, param in model.named_parameters():
+            if get_module_type(name, args.model_name) == LinearModuleType.GATE:
+                org_gmean += param.mean().item()
+            else:
+                org_pmean += param.mean().item()
     if args.verbose:
         print("Router stats before fine-tuning:", org_gmean)
 
     # start fine-tuning
     optimizer = torch.optim.AdamW(router_params, lr=args.rft_lr, weight_decay=args.rft_wd)
+    if is_glm and (args.rft_batch_size <= 0 or args.nsamples % args.rft_batch_size):
+        raise ValueError("GLM router_ft requires RFT_BATCH_SIZE to divide NSAMPLES.")
     for epoch in range(args.rft_epochs):
         loss_sum = 0.
         start = time.time()
         for i in range(args.nsamples // args.rft_batch_size):
             idx = i * args.rft_batch_size
-            data = input_ids[idx: idx + args.rft_batch_size].to("cuda")  # (bsz, seqlen)
+            data = input_ids[idx: idx + args.rft_batch_size].to(input_device)  # (bsz, seqlen)
             outputs = model(input_ids=data, labels=data)
             loss = outputs.loss
 
             optimizer.zero_grad()
             loss.backward()
+            if is_glm and epoch == 0 and i == 0 and any(p.grad is None for p in router_params):
+                raise RuntimeError("GLM legacy CE did not backpropagate to every router weight.")
             optimizer.step()
 
             loss_sum += loss.item()
@@ -304,7 +317,13 @@ def finetune_routers(model, dataloader, args):
         print(f"epoch {epoch:>2} loss: {loss_sum / len(dataloader):.6f}, elapse: {elapse:.2f} seconds")
 
         # sanity check
-        if epoch == 0:
+        if epoch == 0 and is_glm:
+            changed = sum(
+                not torch.equal(param.detach().cpu(), original)
+                for param, original in zip(router_params, original_router_weights)
+            )
+            print(f"GLM router weights updated: {changed}/{len(router_params)}")
+        elif epoch == 0:
             pmean, gmean = 0., 0.
             for name, param in model.named_parameters():
                 if get_module_type(name, args.model_name) == LinearModuleType.GATE:
@@ -319,7 +338,7 @@ def finetune_routers(model, dataloader, args):
                 print("Sum of routers params after finetuning:", gmean)
 
     # restore
-    model = model.to(org_dtype)
+    model = cast_model_preserving_fp32(model, org_dtype) if is_glm else model.to(org_dtype)
     model.config.use_cache = use_cache
 
 
@@ -747,10 +766,12 @@ if __name__ == "__main__":
         raise ValueError("This release supports Qwen3.5, GLM-4.7-Flash and Trinity-Mini.")
     extended_model = model_type in EXTENDED_MOE_TYPES
     if args.finetune:
+        if model_type == ModelType.GLM4MOELITE and args.rft_trainer not in {"roco", "direct_rmsnorm", "router_ft"}:
+            raise ValueError("Use roco, direct_rmsnorm or router_ft for GLM-4.7-Flash.")
+        if model_type == ModelType.TRINITY and args.rft_trainer != "roco":
+            raise ValueError("Trinity-Mini supports only RoCo fine-tuning.")
         if args.rft_trainer == "direct_rmsnorm" and model_type != ModelType.GLM4MOELITE:
             raise ValueError("direct_rmsnorm fine-tuning is available for GLM-4.7-Flash only.")
-        if extended_model and args.rft_trainer not in {"roco", "direct_rmsnorm"}:
-            raise ValueError("Use roco for GLM-4.7-Flash or Trinity-Mini, or direct_rmsnorm for GLM only.")
     if args.real_quant:
         raise ValueError("This release supports pseudo-quantization only.")
     if args.gate_wbits != 16:

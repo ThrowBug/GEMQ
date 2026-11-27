@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, logging
 from proquant.utils.data_utils import get_calib_loader
 from proquant.utils.model_utils import *
 from proquant.quantizers.rtn import MCMoeRTNWeightQuantizer
-from proquant.utils.hf_loading import align_deepseek_softmax_scale
+from proquant.utils.hf_loading import align_deepseek_softmax_scale, load_causal_lm_checkpoint
 from proquant.utils.qwen35 import (
     clone_packed_expert_weights,
     copy_packed_expert_weights_,
@@ -106,33 +106,46 @@ def compute_layer_grads(model, dataloader, args):
         )
         handles.append(handle)
 
-    # accumulate gradients
-    model.zero_grad()
-    for data in tqdm(dataloader, desc="Computing gradients"):
-        x = data[0].cuda()
-        outputs = model(input_ids=x, labels=x)
-        loss = outputs.loss
-        loss.backward()
+    is_glm = NAME_TO_MODEL[args.model_name] == ModelType.GLM4MOELITE
+    if is_glm:
+        # Only activation gradients enter Layer-RE. Keep the weights frozen
+        # and give autograd an input activation to differentiate through.
+        params = [(p, p.requires_grad) for p in model.parameters()]
+        model.requires_grad_(False)
+        model.enable_input_require_grads()
+        input_device = model.get_input_embeddings().weight.device
+    else:
+        input_device = "cuda"
 
-    # remove hooks
-    for handle in handles:
-        handle.remove()
+    try:
+        model.zero_grad()
+        for data in tqdm(dataloader, desc="Computing gradients"):
+            x = data[0].to(input_device)
+            outputs = model(input_ids=x, labels=x)
+            outputs.loss.backward()
+    finally:
+        for handle in handles:
+            handle.remove()
+        if is_glm:
+            model.disable_input_require_grads()
+            for param, requires_grad in params:
+                param.requires_grad_(requires_grad)
 
     # combine results of each layer
     for i in range(len(layers)):
         layer_output_grads[i] = torch.stack(layer_output_grads[i], dim=0)  # (num_batches, bsz, seqlen, hidden_size)
     
     # save gradients
-    os.makedirs(osp.dirname(args.layer_grads_path), exist_ok=True)
+    os.makedirs(osp.dirname(osp.abspath(args.layer_grads_path)), exist_ok=True)
     print(f"Saving layer output gradients to: {args.layer_grads_path} ... ", end="")
     start = time.time()
-    torch.save(layer_output_grads, args.layer_grads_path)
+    torch.save(dict(layer_output_grads) if is_glm else layer_output_grads, args.layer_grads_path)
     print(f"Done in {(time.time() - start)/60:.2f} minutes")
     print("Layer output gradients saved to:", args.layer_grads_path)
 
 
 @torch.inference_mode()
-def compute_faster_layer_re(model, dataloader, args):
+def compute_faster_layer_re(model, dataloader, args, *, device="cuda"):
     """
     Compute layer reconstruction errors (perturbations) caused by quantization of
     each expert from that layer, weighted by the squared gradients of the layer
@@ -154,7 +167,11 @@ def compute_faster_layer_re(model, dataloader, args):
     print(f"Loading layer output gradients from: {args.layer_grads_path} ... ", end="", flush=True)
     start = time.time()
     # NOTE: this might take a while for large models like Mixtral-8x7B
-    layer_output_grads = torch.load(args.layer_grads_path, weights_only=False, map_location="cpu")
+    model_name = args.model_name
+    model_type = NAME_TO_MODEL[model_name]
+    layer_output_grads = torch.load(
+        args.layer_grads_path, weights_only=model_type == ModelType.GLM4MOELITE, map_location="cpu"
+    )
     print(f"Done in {(time.time() - start)/60:.2f} minutes")
     # {0: (nsamples, 1, seqlen, hidden_size), 1: ...}
     assert num_samples == layer_output_grads[0].shape[0], \
@@ -162,8 +179,6 @@ def compute_faster_layer_re(model, dataloader, args):
 
 
     # get model-specific info
-    model_name = args.model_name
-    model_type = NAME_TO_MODEL[model_name]
     sublinear_names = get_sublinear_names(model_name)  # e.g., ["gate_proj", "up_proj", "down_proj"]
     fwd_bsz = args.forward_batch_size
 
@@ -172,20 +187,22 @@ def compute_faster_layer_re(model, dataloader, args):
 
     # Capture the first-layer activations. Qwen3.5 additionally needs the
     # per-layer masks produced by the model because attention types alternate.
-    if model_type == ModelType.QWEN35MOE:
+    if model_type in PACKED_MOE_TYPES:
+        if model_type == ModelType.GLM4MOELITE and (fwd_bsz <= 0 or num_samples % fwd_bsz):
+            raise ValueError("For GLM Layer-RE, forward_batch_size must divide the number of calibration sequences.")
         calibration_batches = [
             enc[start:start + fwd_bsz, 0]
             for start in range(0, num_samples, fwd_bsz)
         ]
         hidden_batches, positional_batches, keyword_batches = (
             capture_qwen35_decoder_context(
-                model, calibration_batches, model_name, "cuda"
+                model, calibration_batches, model_name, device
             )
         )
         if any(any(args for args in layer_args) for layer_args in positional_batches):
-            raise RuntimeError("Unexpected positional decoder arguments for Qwen3.5.")
+            raise RuntimeError("Unexpected positional arguments in decoder replay.")
         inps = torch.cat(hidden_batches, dim=0).to(
-            device="cuda", non_blocking=True
+            device=device, non_blocking=True
         )
         layer_kwargs = [items[0] for items in keyword_batches]
     else:
@@ -230,14 +247,14 @@ def compute_faster_layer_re(model, dataloader, args):
     quant_loss = {}
     outs = torch.zeros_like(inps)
     for i in tqdm(range(len(layers)), desc="Computing rec errors"):
-        layer = layers[i].to("cuda")
+        layer = layers[i].to(device)
         current_layer_kwargs = move_tree_to_device(
             layer_kwargs[i] if isinstance(layer_kwargs, list) else layer_kwargs,
-            torch.device("cuda"),
+            torch.device(device),
         )
 
-        # NOTE: we skip computing stats for the first dense layer of deepseekv2
-        if model_type == ModelType.DEEPSEEKV2 and i == 0:
+        moe_block = get_moe_block(layer, model_name)
+        if moe_block is None or (model_type == ModelType.DEEPSEEKV2 and i == 0):
             # still need to forward it to get inputs for the next layer
             for j in range(num_samples // fwd_bsz):
                 outs[j * fwd_bsz:(j + 1) * fwd_bsz] = _first_tensor(
@@ -254,7 +271,6 @@ def compute_faster_layer_re(model, dataloader, args):
 
 
         named_linears = get_named_linears(layer)
-        moe_block = get_moe_block(layer, model_name)
 
         # get unquantized layer outputs and moe block in/outs
         block_inps, block_outs = [], []
@@ -270,10 +286,10 @@ def compute_faster_layer_re(model, dataloader, args):
         block_outs = torch.cat(block_outs, dim=0)  # (num_samples, seqlen, hidden_size)
         handle.remove()
 
-        if model_type == ModelType.QWEN35MOE:
+        if model_type in PACKED_MOE_TYPES:
             bit_cfg = list(map(int, args.wbits.split(",")))
             layer_sq_grads = (
-                layer_output_grads[i].squeeze(1).double().pow(2).to("cuda")
+                layer_output_grads[i].squeeze(1).double().pow(2).to(device)
             )
             quant_loss[i] = _compute_qwen35_layer_re_losses(
                 moe_block,
@@ -351,7 +367,7 @@ def compute_faster_layer_re(model, dataloader, args):
         
 
     # save results
-    os.makedirs(osp.dirname(args.layer_re_path), exist_ok=True)
+    os.makedirs(osp.dirname(osp.abspath(args.layer_re_path)), exist_ok=True)
     with open(args.layer_re_path, "wb") as f:
         pickle.dump(quant_loss, f)
     print("Weighted reconstruction errors saved to:", args.layer_re_path)
@@ -450,18 +466,29 @@ if __name__ == "__main__":
     print(json.dumps(vars(args), indent=4))
     if args.expert_batch_size <= 0:
         raise ValueError("--expert_batch_size must be positive.")
+    model_type = NAME_TO_MODEL[args.model_name]
+    if model_type == ModelType.TRINITY:
+        raise ValueError("Trinity-Mini uses PoP statistics.")
+    if model_type == ModelType.GLM4MOELITE:
+        if args.batch_size != 1:
+            raise ValueError("GLM Layer-RE requires calibration batch_size=1.")
+        if args.mode == "layer_re" and any(not 1 <= int(bit) <= 16 for bit in args.wbits.split(",")):
+            raise ValueError("GLM Layer-RE requires positive candidate bit-widths in [1, 16].")
 
     # load pre-trained model
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=args.use_fast)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map=("auto" if args.mode == "layer_grads" else "cpu"),
-        # NOTE: hardcoded True, unlike quantize.py which exposes it as a flag. Either way
-        # align_deepseek_softmax_scale below keeps the two implementations equivalent.
-        torch_dtype=args.model_dtype, attn_implementation=args.attn_impl, trust_remote_code=True,
-    )
-    # HF's built-in DeepSeek-V2 omits the YaRN mscale on the attention scale; no-op on
-    # the official implementation, which already applies it.
-    align_deepseek_softmax_scale(model)
+    device_map = "auto" if args.mode == "layer_grads" else "cpu"
+    if model_type == ModelType.GLM4MOELITE:
+        model = load_causal_lm_checkpoint(
+            args.model, model_dtype=args.model_dtype, attn_implementation=args.attn_impl,
+            device_map=device_map, model_name=args.model_name,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, device_map=device_map, torch_dtype=args.model_dtype,
+            attn_implementation=args.attn_impl, trust_remote_code=True,
+        )
+        align_deepseek_softmax_scale(model)
 
     model.seqlen = args.seqlen
     

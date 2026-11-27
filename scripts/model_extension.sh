@@ -21,12 +21,13 @@ sample_tag="${dataset}-N${nsamples}-L${seqlen}-Seed${seed}"
 model="${MODEL:-$model_name}"
 model_dtype="${MODEL_DTYPE:-bfloat16}"
 attn_impl="${ATTN_IMPL:-eager}"
+allocation_metric="${ALLOCATION_METRIC:-pop}"
 
 variant="${MODEL_VARIANT:-FQ}"
 variant="${variant^^}"
 served_model_name="${SERVED_MODEL_NAME:-${service_name}-${variant,,}}"
 
-if [[ "$stage" == compute_pop_costs || "$stage" == allocate || "$stage" == quantize ||
+if [[ "$stage" == compute_stats || "$stage" == compute_pop_costs || "$stage" == allocate || "$stage" == quantize ||
       ( "$stage" == serve_vllm && "$variant" == FQ && -z "${FQ_MODEL_PATH:-}" ) ]]; then
     context_mode="${CONTEXT_MODE:-uniform_bit}"
     context_bit="${POP_CONTEXT_BIT:-${AVERAGE_BITS:-2}}"
@@ -50,16 +51,27 @@ fi
 
 if [[ "$stage" == allocate || "$stage" == quantize ||
       ( "$stage" == serve_vllm && "$variant" == FQ && -z "${FQ_MODEL_PATH:-}" ) ]]; then
-    [[ "${ALLOCATION_METRIC:-pop}" == pop ]] || die "This model uses PoP allocation."
-    [[ "${EXTRA_CONSTR:-none}" == none ]] || die "EXTRA_CONSTR is only supported by Layer-RE."
+    case "$allocation_metric" in
+        pop)
+            [[ "${EXTRA_CONSTR:-none}" == none ]] || die "EXTRA_CONSTR is only supported by Layer-RE."
+            wbits="${WBITS:-0,2,3}"
+            max_prune_ratio="${MAX_PRUNE_RATIO:-0.25}"
+            ;;
+        layer_re)
+            [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "Trinity-Mini uses PoP allocation."
+            wbits="${WBITS:-1,2,3}"
+            extra_constr="${EXTRA_CONSTR:-c2c3}"
+            [[ "$extra_constr" == none || "$extra_constr" == c2c3 ]] || die "EXTRA_CONSTR must be none or c2c3."
+            [[ ",$wbits," != *,0,* ]] || die "GLM Layer-RE requires positive candidate bit-widths."
+            ;;
+        *) die "ALLOCATION_METRIC must be pop or layer_re." ;;
+    esac
     [[ -z "${MIXED_PREC+x}" ]] || die "MIXED_PREC is no longer supported. A bit-allocation file is required."
     if [[ "$stage" == allocate ]]; then
         bpe="${BITS_PER_EXPERT:-${BPE:-2.0}}"
     else
         bpe="${BPE:-${BITS_PER_EXPERT:-2.0}}"
     fi
-    wbits="${WBITS:-0,2,3}"
-    max_prune_ratio="${MAX_PRUNE_RATIO:-0.25}"
     allocation_seed="$seed"
     [[ "$stage" != serve_vllm ]] || allocation_seed="${CALIB_SEED:-$seed}"
     allocation_tag="${ALLOCATION_TAG:-}"
@@ -72,15 +84,22 @@ if [[ "$stage" == allocate || "$stage" == quantize ||
         esac
     fi
     bpe_tag="$(LC_ALL=C printf '%.1f' "$bpe")"
-    policy_tag="${allocation_tag}_Metric-pop-${allocation_context_tag}${allocation_count_tag}_E${bpe_tag}_B${wbits}"
-    legacy_sample_tag="${dataset}-N${nsamples}-L${seqlen}-Seed${allocation_seed}"
-    legacy_policy_tag="${legacy_sample_tag}_D${model_dtype}-${attn_impl}_Metric-pop-${context_tag}${count_tag}_E${bpe}_B${wbits}"
-    if [[ ",$wbits," == *,0,* ]]; then
-        policy_tag+="_Pmax$(LC_ALL=C printf '%g' "$max_prune_ratio")_EqPrune"
-        legacy_policy_tag+="_Pmax${max_prune_ratio}_EqPrune"
+    if [[ "$allocation_metric" == layer_re ]]; then
+        constraint_tag=""
+        [[ "$extra_constr" == none ]] || constraint_tag="_${extra_constr}"
+        default_bit_cfg="configs/${model_name}/GEMQ/${allocation_tag}_Metric-layer_re_E${bpe_tag}_B${wbits}${constraint_tag}.pkl"
+        legacy_bit_cfg="$default_bit_cfg"
+    else
+        policy_tag="${allocation_tag}_Metric-pop-${allocation_context_tag}${allocation_count_tag}_E${bpe_tag}_B${wbits}"
+        legacy_sample_tag="${dataset}-N${nsamples}-L${seqlen}-Seed${allocation_seed}"
+        legacy_policy_tag="${legacy_sample_tag}_D${model_dtype}-${attn_impl}_Metric-pop-${context_tag}${count_tag}_E${bpe}_B${wbits}"
+        if [[ ",$wbits," == *,0,* ]]; then
+            policy_tag+="_Pmax$(LC_ALL=C printf '%g' "$max_prune_ratio")_EqPrune"
+            legacy_policy_tag+="_Pmax${max_prune_ratio}_EqPrune"
+        fi
+        default_bit_cfg="configs/${model_name}/ProQuant/${policy_tag}.pkl"
+        legacy_bit_cfg="configs/${model_name}/ProQuant/${legacy_policy_tag}.pkl"
     fi
-    default_bit_cfg="configs/${model_name}/ProQuant/${policy_tag}.pkl"
-    legacy_bit_cfg="configs/${model_name}/ProQuant/${legacy_policy_tag}.pkl"
     bit_cfg="${BIT_CFG_PATH:-$default_bit_cfg}"
     if [[ "$stage" == quantize && -z "${BIT_CFG_PATH:-}" && ! -f "$bit_cfg" && -f "$legacy_bit_cfg" ]]; then
         bit_cfg="$legacy_bit_cfg"
@@ -115,10 +134,10 @@ if [[ "$stage" == quantize ||
         true)
             case "$rft_trainer" in
                 roco) ;;
-                direct_rmsnorm)
-                    [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "direct_rmsnorm requires GLM-4.7-Flash."
+                direct_rmsnorm|router_ft)
+                    [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "$rft_trainer requires GLM-4.7-Flash."
                     ;;
-                *) die "Unknown RFT_TRAINER=$rft_trainer. Use roco, or direct_rmsnorm for GLM." ;;
+                *) die "Unknown RFT_TRAINER=$rft_trainer. Use roco, or direct_rmsnorm/router_ft for GLM." ;;
             esac
             lr_tag="$(python -c 'from decimal import Decimal; import sys; print(format(Decimal(sys.argv[1]).normalize(), "E").lower().replace("e+", "e"))' "$lr")"
             rft_tag="_RFT-${rft_trainer}-lr${lr_tag}"
@@ -131,6 +150,20 @@ if [[ "$stage" == quantize ||
 fi
 
 case "$stage" in
+    compute_stats)
+        [[ "$model_name" == zai-org/GLM-4.7-Flash ]] || die "Trinity-Mini uses PoP statistics."
+        wbits="${WBITS:-1,2,3}"
+        [[ ",$wbits," != *,0,* ]] || die "GLM Layer-RE requires positive candidate bit-widths."
+        gpus="${CUDA_VISIBLE_DEVICES:-0,1,2}"
+        layer_grads_path="${LAYER_GRADS_PATH:-cache/${model_name}/LayerGrads_${sample_tag}.pt}"
+        layer_re_path="${LAYER_RE_PATH:-cache/${model_name}/LayerRE_${sample_tag}_B${wbits}_fast.pkl}"
+        CUDA_VISIBLE_DEVICES="$gpus" python -m proquant.compute_model_stats \
+            "${model_args[@]}" "${data_args[@]}" --mode layer_grads --layer_grads_path "$layer_grads_path"
+        CUDA_VISIBLE_DEVICES="$gpus" exec python -m proquant.compute_model_stats \
+            "${model_args[@]}" "${data_args[@]}" --mode layer_re --layer_grads_path "$layer_grads_path" \
+            --layer_re_path "$layer_re_path" --wbits "$wbits" --blocksize "${BLOCKSIZE:-128}" \
+            --forward_batch_size "${FORWARD_BATCH_SIZE:-1}" "$@"
+        ;;
     compute_pop_costs)
         output="${OUTPUT_PATH:-${pop_prefix}${candidate_bits}${count_tag}.pt}"
         printf 'Model: %s\nPoP output: %s\n' "$model_name" "$output"
@@ -141,12 +174,18 @@ case "$stage" in
             --output_path "$output" "$@"
         ;;
     allocate)
-        pop_cost="${POP_COST_PATH:-${pop_prefix}${POP_COST_BITS:-$candidate_bits}${count_tag}.pt}"
-        [[ -f "$pop_cost" ]] || die "PoP cost file not found: $pop_cost. Run compute_pop_costs.sh or set POP_COST_PATH."
+        if [[ "$allocation_metric" == layer_re ]]; then
+            layer_re_path="${LAYER_RE_PATH:-cache/${model_name}/LayerRE_${sample_tag}_B${wbits}_fast.pkl}"
+            [[ -f "$layer_re_path" ]] || die "Layer-RE file not found: $layer_re_path. Run compute_stats.sh or set LAYER_RE_PATH."
+            stat_args=(--layer_re_path "$layer_re_path" --extra_constr "$extra_constr")
+        else
+            pop_cost="${POP_COST_PATH:-${pop_prefix}${POP_COST_BITS:-$candidate_bits}${count_tag}.pt}"
+            [[ -f "$pop_cost" ]] || die "PoP cost file not found: $pop_cost. Run compute_pop_costs.sh or set POP_COST_PATH."
+            stat_args=(--pop_cost_path "$pop_cost" --max_prune_ratio "$max_prune_ratio")
+        fi
         output="${ALLOCATION_OUTPUT_PATH:-$bit_cfg}"
-        exec python -m proquant.allocate_bits --model_name "$model_name" --allocation_metric pop \
-            --pop_cost_path "$pop_cost" --bit_budget "$bpe" --bit_candidates "$wbits" \
-            --max_prune_ratio "$max_prune_ratio" --ilp_backend "${ILP_BACKEND:-highs}" \
+        exec python -m proquant.allocate_bits --model_name "$model_name" --allocation_metric "$allocation_metric" \
+            "${stat_args[@]}" --bit_budget "$bpe" --bit_candidates "$wbits" --ilp_backend "${ILP_BACKEND:-highs}" \
             --save_path "$output" "$@"
         ;;
     quantize)
@@ -163,7 +202,7 @@ case "$stage" in
                 args+=(--save_gptq_checkpoint --gptq_checkpoint_path "$checkpoint")
                 ;;
             false:true)
-                if [[ -z "${GPTQ_CHECKPOINT_PATH:-}" && ! -f "$checkpoint/_SUCCESS" ]]; then
+                if [[ "$allocation_metric" == pop && -z "${GPTQ_CHECKPOINT_PATH:-}" && ! -f "$checkpoint/_SUCCESS" ]]; then
                     legacy_checkpoint="${checkpoint_root}/ProQuant/${legacy_allocation_name}${legacy_suffix}"
                     [[ ! -f "$legacy_checkpoint/_SUCCESS" ]] || checkpoint="$legacy_checkpoint"
                 fi
@@ -175,10 +214,12 @@ case "$stage" in
         esac
         if [[ "$finetune" == true ]]; then
             args+=(--finetune --rft_trainer "$rft_trainer" --rft_lr "$lr" --rft_epochs "${RFT_EPOCHS:-1}"
-                --rft_batch_size "${RFT_BATCH_SIZE:-1}" --rft_wd "${RFT_WD:-0.0}"
-                --rft_teacher_cache_dir "${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}")
-            if [[ "${RFT_REBUILD_TEACHER_CACHE:-false}" == true ]]; then
-                args+=(--rft_rebuild_teacher_cache)
+                --rft_batch_size "${RFT_BATCH_SIZE:-1}" --rft_wd "${RFT_WD:-0.0}")
+            if [[ "$rft_trainer" != router_ft ]]; then
+                args+=(--rft_teacher_cache_dir "${RFT_TEACHER_CACHE_DIR:-cache/router_finetune}")
+                if [[ "${RFT_REBUILD_TEACHER_CACHE:-false}" == true ]]; then
+                    args+=(--rft_rebuild_teacher_cache)
+                fi
             fi
         fi
         [[ "${CUDA_DIAGNOSTICS:-false}" != true ]] || args+=(--cuda_diagnostics)
@@ -210,7 +251,7 @@ case "$stage" in
             FP) model_path="${FP_MODEL_PATH:-$model}" ;;
             FQ)
                 model_path="${FQ_MODEL_PATH:-${default_fq_path:-}}"
-                if [[ -z "${FQ_MODEL_PATH:-}" && ! -d "$model_path" && -d "$legacy_fq_path" ]]; then
+                if [[ "$allocation_metric" == pop && -z "${FQ_MODEL_PATH:-}" && ! -d "$model_path" && -d "$legacy_fq_path" ]]; then
                     model_path="$legacy_fq_path"
                 fi
                 [[ -d "$model_path" ]] || die "Fake-quant checkpoint not found: $model_path. Run quantize.sh or set FQ_MODEL_PATH."
