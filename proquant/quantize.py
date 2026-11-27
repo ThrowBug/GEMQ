@@ -22,7 +22,7 @@ from proquant.utils.gptq_checkpoint import (
 )
 from proquant.utils.model_utils import *
 from proquant.utils.quant_utils import *
-from proquant.utils.eval_utils import evaluate_perplexity, run_lm_eval
+from proquant.utils.eval_utils import run_lm_eval
 from proquant.utils.extended_moe import cast_model_preserving_fp32, glm_topk_routes
 from proquant.utils.hf_loading import load_causal_lm_checkpoint
 from proquant.router_finetune.config import (
@@ -617,7 +617,7 @@ def parse_args():
     # quantization args
     parser.add_argument(
         "--eval_fp", action="store_true",
-        help="Whether to skip quantization and evaluate the full-precision model"
+        help="Skip quantization for full-precision downstream evaluation; run evaluate_ppl separately for PPL."
     )
     parser.add_argument(
         "--quantizer", type=str, default="gptq",
@@ -968,13 +968,6 @@ if __name__ == "__main__":
         if args.rft_trainer == "router_ft":
             model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
-            print("Evaluating quantized model before fine-tuning ...")
-            if args.cuda_diagnostics:
-                report_cuda_diagnostics("before pre-finetune evaluation", model=model)
-            evaluate_perplexity(
-                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
-            )
-
             print("Fine-tuning routers with legacy autoregressive CE ...")
             if args.cuda_diagnostics:
                 report_cuda_diagnostics("before legacy router fine-tuning", model=model)
@@ -983,14 +976,10 @@ if __name__ == "__main__":
             norm_mode = NORM_DISTILL_MODES[args.rft_trainer]
             model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
-            print("Evaluating quantized model before norm distillation ...")
             if args.cuda_diagnostics:
                 report_cuda_diagnostics(
                     f"before {args.rft_trainer} norm distillation", model=model
                 )
-            evaluate_perplexity(
-                model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False
-            )
 
             norm_scope = (
                 "input and post-attention norms"
@@ -1005,30 +994,25 @@ if __name__ == "__main__":
                 **norm_mode,
             )
 
-    # evaluate model
-    print("Evaluating model ...")
+    # Perplexity is measured separately through proquant.evaluate_ppl.
     model.eval()
-    if args.cuda_diagnostics:
-        report_cuda_diagnostics("before final evaluation", model=model)
-    if args.eval_downstream or args.finetune:
+    if args.eval_downstream:
+        print("Evaluating downstream tasks ...")
+        if args.cuda_diagnostics:
+            report_cuda_diagnostics("before downstream evaluation", model=model)
         # move all model weights onto gpus and use model() for forwarding
         if not args.finetune:
             model = dispatch_model_to_all_devices(model, args.cuda_diagnostics)
 
-        evaluate_perplexity(model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=False)
-        if args.eval_downstream:
-            if args.disable_cache:
-                model.config.use_cache = False
-            try:
-                run_lm_eval(
-                    model, tokenizer, tasks=args.downstream_tasks.split(","),
-                    batch_size=args.lm_eval_batchsize, num_fewshot=args.num_fewshot
-                )
-            except:
-                print("Downstream evaluation failed. Skipping ...")
-    else:
-        # memory-efficient evaluation with layer offloading
-        evaluate_perplexity(model, tokenizer, ["wikitext2", "c4"], args.model_name, offload=True)
+        if args.disable_cache:
+            model.config.use_cache = False
+        try:
+            run_lm_eval(
+                model, tokenizer, tasks=args.downstream_tasks.split(","),
+                batch_size=args.lm_eval_batchsize, num_fewshot=args.num_fewshot
+            )
+        except Exception:
+            print("Downstream evaluation failed. Skipping ...")
 
     # save model
     if args.save_path:
